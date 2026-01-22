@@ -67,7 +67,7 @@ export function WasmUploadZone() {
         {...getRootProps()}
         className={cn(
           "relative flex flex-col items-center justify-center w-full h-72 border-2 border-dashed rounded-xl cursor-pointer transition-all duration-300 ease-in-out bg-slate-50",
-          "border-slate-300 hover:bg-slate-100",
+          "border-slate-700 bg-slate-900/50 hover:bg-slate-800/50 text-slate-20",
 
           isDragActive && !isDragReject && "border-indigo-500 bg-indigo-50 ring-2 ring-indigo-200 ring-offset-2",
           isDragReject && "border-red-500 bg-red-50",
