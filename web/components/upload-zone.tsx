@@ -39,7 +39,6 @@ export function WasmUploadZone() {
       setFile(uploadedFile);
       setStatus('scanning');
 
-      // 3. Simulate Scanning (Mocking the API call)
       setTimeout(() => {
         setStatus('success');
       }, 2000);
@@ -74,6 +73,7 @@ export function WasmUploadZone() {
           status === 'success' && "border-green-500 bg-green-50/50"
         )}
       >
+
         <input {...getInputProps()} />
 
         <div className="flex flex-col items-center justify-center pt-5 pb-6 text-center space-y-3">
