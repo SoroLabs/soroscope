@@ -2,6 +2,7 @@
  * @jest-environment jsdom
  */
 
+
 import React from 'react';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
@@ -9,11 +10,13 @@ import { WasmUploadZone } from '../upload-zone';
 
 describe('WasmUploadZone', () => {
 
+
   it('renders the initial idle state correctly', () => {
     render(<WasmUploadZone />);
     expect(screen.getByText(/Click to upload/i)).toBeInTheDocument();
     expect(screen.getByText(/Soroban WebAssembly \(\.wasm\) only/i)).toBeInTheDocument();
   });
+
 
   it('shows error state when a non-wasm file is dropped', async () => {
     const { container } = render(<WasmUploadZone />);
@@ -31,6 +34,7 @@ describe('WasmUploadZone', () => {
     });
   });
 
+
   it('shows scanning state when a valid .wasm file is dropped', async () => {
     const { container } = render(<WasmUploadZone />);
     
@@ -45,6 +49,7 @@ describe('WasmUploadZone', () => {
     await waitFor(() => {
       expect(screen.getByText(/Scanning Contract.../i)).toBeInTheDocument();
     });
+    
 
     await waitFor(() => {
       expect(screen.getByText(/Ready for Analysis/i)).toBeInTheDocument();
