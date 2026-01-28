@@ -1,0 +1,187 @@
+[00:00:00.887] Server  LOG     ✓ Ready in 617ms
+[00:00:19.799] Browser WARN    Lit is in dev mode. Not recommended for production! See https://lit.dev/msg/dev-mode for more information.
+[00:39:06.312] Browser ERROR   %s a style property during rerender (%s) when a conflicting property is set (%s) can lead to styling bugs. To avoid this, don't mix shorthand and non-shorthand properties for the same value; instead, replace the shorthand with separate values. Updating borderLeft border
+[00:40:25.191] Server  LOG     ✓ Compiled in 527ms
+[00:40:25.779] Browser ERROR   %o
+
+%s
+
+%s
+ {} The above error occurred in the <Home> component. React will try to recreate this component tree from scratch using the error boundary you provided, PagesDevOverlayErrorBoundary.
+[00:40:27.091] Server  LOG     ✓ Compiled in 161ms
+[00:40:27.778] Browser ERROR   %o
+
+%s
+
+%s
+ {} The above error occurred in the <Home> component. React will try to recreate this component tree from scratch using the error boundary you provided, PagesDevOverlayErrorBoundary.
+[00:40:28.712] Server  LOG     ✓ Compiled in 73ms
+[00:40:28.773] Browser ERROR   %o
+
+%s
+
+%s
+ {} The above error occurred in the <Home> component. React will try to recreate this component tree from scratch using the error boundary you provided, PagesDevOverlayErrorBoundary.
+[00:40:30.594] Server  LOG     ✓ Compiled in 90ms
+[00:40:30.774] Browser ERROR   %o
+
+%s
+
+%s
+ {} The above error occurred in the <Home> component. React will try to recreate this component tree from scratch using the error boundary you provided, PagesDevOverlayErrorBoundary.
+[00:40:38.224] Server  LOG     ✓ Compiled in 67ms
+[00:40:38.783] Browser LOG     Refreshing page data due to server-side change
+[00:40:38.784] Browser ERROR   %o
+
+%s
+
+%s
+ {} The above error occurred in the <Home> component. React will try to recreate this component tree from scratch using the error boundary you provided, PagesDevOverlayErrorBoundary.
+[00:40:41.678] Server  LOG     ✓ Compiled in 946ms
+[00:40:42.854] Browser LOG     Refreshing page data due to server-side change
+[00:40:59.831] Server  LOG     ✓ Compiled in 199ms
+[00:41:00.794] Browser ERROR   %o
+
+%s
+
+%s
+ {} The above error occurred in the <Home> component. React will try to recreate this component tree from scratch using the error boundary you provided, PagesDevOverlayErrorBoundary.
+[00:41:02.042] Server  LOG     ✓ Compiled in 62ms
+[00:41:02.779] Browser LOG     Refreshing page data due to server-side change
+[00:41:02.779] Browser ERROR   ./pages/index.tsx:126:76
+Parsing ecmascript source code failed
+  124 |
+  125 |   return (
+> 126 |     <div style={{ minHeight: '100vh', backgroundColor: '#0f1117', display: }}>
+      |                                                                            ^
+  127 |       {/* Header */}
+  128 |       <header
+  129 |         style={{
+
+Expression expected
+[00:41:02.779] Browser ERROR   ./pages/index.tsx
+Code generation for chunk item errored
+An error occurred while generating the chunk item [project]/pages/index.tsx [ssr] (ecmascript)
+
+Caused by:
+- CJS module can't be async.
+
+Debug info:
+- An error occurred while generating the chunk item [project]/pages/index.tsx [ssr] (ecmascript)
+- Execution of <ModuleChunkItem as EcmascriptChunkItem>::content_with_async_module_info failed
+- Execution of EcmascriptChunkItemContent::new failed
+- CJS module can't be async.
+[00:41:04.413] Server  LOG     ✓ Compiled in 56ms
+[00:41:04.783] Browser LOG     Refreshing page data due to server-side change
+[00:41:06.096] Server  LOG     ✓ Compiled in 29ms
+[00:41:20.391] Server  LOG     ✓ Compiled in 54ms
+[00:41:23.238] Server  LOG     ✓ Compiled in 40ms
+[00:41:24.336] Server  LOG     ✓ Compiled in 47ms
+[00:41:24.790] Browser LOG     Refreshing page data due to server-side change
+[00:41:24.791] Browser ERROR   ./pages/index.tsx:136:11
+Parsing ecmascript source code failed
+  134 |           top: 0,
+  135 |           zIndex: 100,
+> 136 |           , display:'flex'
+      |           ^
+  137 |         }}
+  138 |       >
+  139 |         <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '0 24px' }}>
+
+Expected '</', got ','
+[00:41:24.791] Browser ERROR   ./pages/index.tsx
+Code generation for chunk item errored
+An error occurred while generating the chunk item [project]/pages/index.tsx [ssr] (ecmascript)
+
+Caused by:
+- CJS module can't be async.
+
+Debug info:
+- An error occurred while generating the chunk item [project]/pages/index.tsx [ssr] (ecmascript)
+- Execution of <ModuleChunkItem as EcmascriptChunkItem>::content_with_async_module_info failed
+- Execution of EcmascriptChunkItemContent::new failed
+- CJS module can't be async.
+[00:41:26.000] Server  LOG     ✓ Compiled in 144ms
+[00:41:26.784] Browser LOG     Refreshing page data due to server-side change
+[00:41:51.898] Server  LOG     ✓ Compiled in 79ms
+[00:41:52.776] Browser ERROR   %o
+
+%s
+
+%s
+ {} The above error occurred in the <Home> component. React will try to recreate this component tree from scratch using the error boundary you provided, PagesDevOverlayErrorBoundary.
+[00:41:53.791] Server  LOG     ✓ Compiled in 74ms
+[00:41:54.786] Browser LOG     Refreshing page data due to server-side change
+[00:41:54.786] Browser ERROR   ./pages/index.tsx:138:9
+Parsing ecmascript source code failed
+  136 |           display:'flex',
+  137 |           justifyContent:
+> 138 |         }}
+      |         ^
+  139 |       >
+  140 |         <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '0 24px' }}>
+  141 |           <h1 style={{ margin: '0 0 12px 0', fontSize: '28px', fontWeight: '700', color: '#00d9ff', letterSpacing: '0.5px' }}>
+
+Expected '</', got '}'
+[00:41:54.786] Browser ERROR   ./pages/index.tsx
+Code generation for chunk item errored
+An error occurred while generating the chunk item [project]/pages/index.tsx [ssr] (ecmascript)
+
+Caused by:
+- CJS module can't be async.
+
+Debug info:
+- An error occurred while generating the chunk item [project]/pages/index.tsx [ssr] (ecmascript)
+- Execution of <ModuleChunkItem as EcmascriptChunkItem>::content_with_async_module_info failed
+- Execution of EcmascriptChunkItemContent::new failed
+- CJS module can't be async.
+[00:41:55.972] Server  LOG     ✓ Compiled in 31ms
+[00:41:56.796] Browser LOG     Refreshing page data due to server-side change
+[00:42:00.266] Server  LOG     ✓ Compiled in 67ms
+[00:42:16.976] Server  LOG     ✓ Compiled in 74ms
+[00:42:19.383] Server  LOG     ✓ Compiled in 361ms
+[00:42:21.977] Browser WARN    Lit is in dev mode. Not recommended for production! See https://lit.dev/msg/dev-mode for more information.
+[00:42:34.443] Server  LOG     ✓ Compiled in 60ms
+[00:42:37.640] Browser WARN    Lit is in dev mode. Not recommended for production! See https://lit.dev/msg/dev-mode for more information.
+[00:42:38.396] Browser WARN    Lit is in dev mode. Not recommended for production! See https://lit.dev/msg/dev-mode for more information.
+[00:42:38.969] Browser WARN    Lit is in dev mode. Not recommended for production! See https://lit.dev/msg/dev-mode for more information.
+[00:42:39.473] Browser WARN    Lit is in dev mode. Not recommended for production! See https://lit.dev/msg/dev-mode for more information.
+[00:43:02.872] Server  LOG     ✓ Compiled in 89ms
+[00:43:08.627] Server  LOG     ✓ Compiled in 36ms
+[00:43:13.093] Server  LOG     ✓ Compiled in 155ms
+[00:43:28.331] Server  LOG     ✓ Compiled in 53ms
+[00:43:28.776] Browser ERROR   %o
+
+%s
+
+%s
+ {} The above error occurred in the <Home> component. React will try to recreate this component tree from scratch using the error boundary you provided, PagesDevOverlayErrorBoundary.
+[00:43:35.556] Server  LOG     ✓ Compiled in 56ms
+[00:43:39.102] Server  LOG     ✓ Compiled in 39ms
+[00:43:48.393] Server  LOG     ✓ Compiled in 43ms
+[00:44:21.044] Server  LOG     ✓ Compiled in 92ms
+[00:44:22.594] Server  LOG     ✓ Compiled in 56ms
+[00:44:27.232] Server  LOG     ✓ Compiled in 46ms
+[00:44:30.639] Server  LOG     ✓ Compiled in 178ms
+[00:44:33.332] Server  LOG     ✓ Compiled in 41ms
+[00:44:40.401] Server  LOG     ✓ Compiled in 66ms
+[00:44:43.931] Server  LOG     ✓ Compiled in 45ms
+[00:44:46.310] Server  LOG     ✓ Compiled in 32ms
+[00:51:26.437] Server  LOG     ✓ Compiled in 482ms
+[00:51:26.779] Browser ERROR   %o
+
+%s
+
+%s
+ {} The above error occurred in the <Home> component. React will try to recreate this component tree from scratch using the error boundary you provided, PagesDevOverlayErrorBoundary.
+[00:51:29.948] Server  LOG     ✓ Compiled in 163ms
+[00:51:30.784] Browser ERROR   %o
+
+%s
+
+%s
+ {} The above error occurred in the <Home> component. React will try to recreate this component tree from scratch using the error boundary you provided, PagesDevOverlayErrorBoundary.
+[00:52:07.457] Server  LOG     ✓ Compiled in 445ms
+[00:53:06.800] Server  LOG     ✓ Compiled in 505ms
+[00:53:06.808] Browser LOG     Refreshing page data due to server-side change
+[00:53:08.683] Server  LOG     ✓ Compiled in 39ms
