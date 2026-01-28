@@ -22,3 +22,7 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 utoipa = { version = "4", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "7", features = ["axum"] }
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
+hex = "0.4"
+stellar-strkey = "0.0.9"
