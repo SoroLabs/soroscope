@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "core",
     "contracts/token",
+    "contracts/liquidity_pool",
 ]
