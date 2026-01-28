@@ -1,4 +1,4 @@
-use soroban_sdk::{testutils::Address as _, xdr::ScVal, Address, Bytes, Env, IntoVal, String, Symbol, Val, Vec};
+use soroban_sdk::{testutils::Address as _, Address, Env, IntoVal, String, Symbol, Val, Vec};
 use std::fs;
 use std::path::PathBuf;
 
@@ -10,8 +10,7 @@ pub fn run_token_benchmark(wasm_path: PathBuf) -> Result<(), Box<dyn std::error:
     env.mock_all_auths();
 
     // Register contract
-    let wasm_bytes = Bytes::from_slice(&env, &wasm);
-    let contract_id = env.register_contract_wasm(None, wasm_bytes);
+    let contract_id = env.register(&*wasm, ());
     
     // Initialize
     let admin = Address::generate(&env);

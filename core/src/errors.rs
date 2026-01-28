@@ -7,6 +7,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum AppError {
     #[error("Internal server error")]
     Internal(String),

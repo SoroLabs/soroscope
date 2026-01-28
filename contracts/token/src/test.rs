@@ -8,7 +8,7 @@ fn test_mint_and_transfer() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register_contract(None, Token);
+    let contract_id = env.register(Token, ());
     let client = TokenClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
@@ -35,7 +35,7 @@ fn test_allowance() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register_contract(None, Token);
+    let contract_id = env.register(Token, ());
     let client = TokenClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);

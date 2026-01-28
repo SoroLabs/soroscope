@@ -18,6 +18,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct AppConfig {
     server_port: u16,
     rust_log: String,
