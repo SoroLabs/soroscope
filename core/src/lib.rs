@@ -1,5 +1,8 @@
 use serde::Serialize;
 
+// Export simulation module for RPC-based contract simulation
+pub mod simulation;
+
 /// Resource report containing profiling information for a Soroban contract
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceReport {
