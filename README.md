@@ -136,6 +136,50 @@ Contributions are welcome via:
 - Pull Requests (code, docs, tests)
 - Feedback on UX and developer experience
 
+### Contribution Workflow
+
+1.  **Fork and Clone**:
+    Fork the repository to your own GitHub account and clone it locally:
+    ```bash
+    git clone https://github.com/YOUR_USERNAME/soroscope
+    cd soroscope
+    ```
+
+2.  **Create a Branch**:
+    Create a new branch for your changes. Use a descriptive name, such as `feature/issue-number-description` or `fix/bug-description`.
+    ```bash
+    git checkout -b feature/issue-44-description
+    ```
+
+3.  **Set Upstream**:
+    Ensure your branch is tracking the correct upstream repository/branch if needed, or simply set the origin as upstream for your new branch as per project specific workflow:
+    ```bash
+    git push -u origin feature/issue-44-description
+    ```
+    *(Note: To keep your fork in sync with the main repository, consider adding the main repo as a remote named `upstream`)*:
+    ```bash
+    git remote add upstream https://github.com/SoroLabs/soroscope.git
+    ```
+
+4.  **Make Changes**:
+    Implement your changes, adhering to the project's coding standards.
+
+5.  **Test and Format**:
+    Run tests and format your code before committing:
+    ```bash
+    # Rust
+    cargo test
+    cargo fmt
+
+    # Web/Frontend
+    cd web
+    npm run lint
+    ```
+
+6.  **Submit a Pull Request**:
+    Push your branch and open a Pull Request against the `main` branch of the upstream repository.
+
+
 Please:
 - Keep changes small and focused
 - Add or update documentation when you change behavior
