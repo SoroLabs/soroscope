@@ -1,5 +1,5 @@
-use soroban_sdk::{Env, String};
 use crate::storage_types::DataKey;
+use soroban_sdk::{Env, String};
 
 pub fn read_decimal(e: &Env) -> u32 {
     let key = DataKey::Decimals;

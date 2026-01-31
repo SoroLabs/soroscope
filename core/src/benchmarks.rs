@@ -11,20 +11,24 @@ pub fn run_token_benchmark(wasm_path: PathBuf) -> Result<(), Box<dyn std::error:
 
     // Register contract
     let contract_id = env.register(&*wasm, ());
-    
+
     // Initialize
     let admin = Address::generate(&env);
     let token_name = String::from_str(&env, "Benchmark Token");
     let token_symbol = String::from_str(&env, "BNCH");
-    
+
     println!("Invoking initialize...");
-    let args: Vec<Val> = Vec::from_array(&env, [admin.to_val(), 7u32.into_val(&env), token_name.to_val(), token_symbol.to_val()]);
-    let _res: Val = env.invoke_contract(
-        &contract_id, 
-        &Symbol::new(&env, "initialize"), 
-        args
+    let args: Vec<Val> = Vec::from_array(
+        &env,
+        [
+            admin.to_val(),
+            7u32.into_val(&env),
+            token_name.to_val(),
+            token_symbol.to_val(),
+        ],
     );
-    
+    let _res: Val = env.invoke_contract(&contract_id, &Symbol::new(&env, "initialize"), args);
+
     // Create users
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
@@ -37,11 +41,7 @@ pub fn run_token_benchmark(wasm_path: PathBuf) -> Result<(), Box<dyn std::error:
     let start_mem = env.cost_estimate().budget().memory_bytes_cost();
 
     let args: Vec<Val> = Vec::from_array(&env, [user1.to_val(), 1000i128.into_val(&env)]);
-    let _res: Val = env.invoke_contract(
-        &contract_id,
-        &Symbol::new(&env, "mint"),
-        args
-    );
+    let _res: Val = env.invoke_contract(&contract_id, &Symbol::new(&env, "mint"), args);
 
     let end_cpu = env.cost_estimate().budget().cpu_instruction_cost();
     let end_mem = env.cost_estimate().budget().memory_bytes_cost();
@@ -56,12 +56,11 @@ pub fn run_token_benchmark(wasm_path: PathBuf) -> Result<(), Box<dyn std::error:
     let start_cpu = env.cost_estimate().budget().cpu_instruction_cost();
     let start_mem = env.cost_estimate().budget().memory_bytes_cost();
 
-    let args: Vec<Val> = Vec::from_array(&env, [user1.to_val(), user2.to_val(), 200i128.into_val(&env)]);
-    let _res: Val = env.invoke_contract(
-        &contract_id,
-        &Symbol::new(&env, "transfer"),
-        args
+    let args: Vec<Val> = Vec::from_array(
+        &env,
+        [user1.to_val(), user2.to_val(), 200i128.into_val(&env)],
     );
+    let _res: Val = env.invoke_contract(&contract_id, &Symbol::new(&env, "transfer"), args);
 
     let end_cpu = env.cost_estimate().budget().cpu_instruction_cost();
     let end_mem = env.cost_estimate().budget().memory_bytes_cost();

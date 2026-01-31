@@ -98,7 +98,7 @@ mod tests {
             memory_usage: 2048,
             ledger_footprint: 512,
         };
-        
+
         // Verify ResourceReport can be serialized to JSON (required for API responses)
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"cpu_usage\":1000"));

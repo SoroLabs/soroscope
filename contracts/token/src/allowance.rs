@@ -12,7 +12,13 @@ pub fn read_allowance(e: &Env, from: Address, spender: Address) -> AllowanceValu
     }
 }
 
-pub fn write_allowance(e: &Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
+pub fn write_allowance(
+    e: &Env,
+    from: Address,
+    spender: Address,
+    amount: i128,
+    expiration_ledger: u32,
+) {
     let key = DataKey::Allowance(AllowanceDataKey { from, spender });
     let allowance = AllowanceValue {
         amount,
@@ -36,5 +42,11 @@ pub fn spend_allowance(e: &Env, from: Address, spender: Address, amount: i128) {
     if allowance.expiration_ledger < e.ledger().sequence() {
         panic!("allowance expired");
     }
-    write_allowance(e, from, spender, allowance.amount - amount, allowance.expiration_ledger);
+    write_allowance(
+        e,
+        from,
+        spender,
+        allowance.amount - amount,
+        allowance.expiration_ledger,
+    );
 }

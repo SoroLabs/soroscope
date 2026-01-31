@@ -1,7 +1,9 @@
 use crate::admin::{has_administrator, read_administrator, write_administrator};
 use crate::allowance::{read_allowance, spend_allowance, write_allowance};
 use crate::balance::{read_balance, receive_balance, spend_balance};
-use crate::metadata::{read_decimal, read_name, read_symbol, write_decimal, write_name, write_symbol};
+use crate::metadata::{
+    read_decimal, read_name, read_symbol, write_decimal, write_name, write_symbol,
+};
 use soroban_sdk::{contract, contractimpl, Address, Env, String};
 
 pub trait TokenTrait {
@@ -47,7 +49,7 @@ impl TokenTrait for Token {
         let admin = read_administrator(&e);
         admin.require_auth();
         e.storage().instance().extend_ttl(100, 100);
-        
+
         write_administrator(&e, &new_admin);
     }
 
@@ -59,7 +61,7 @@ impl TokenTrait for Token {
     fn approve(e: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
         from.require_auth();
         e.storage().instance().extend_ttl(100, 100);
-        
+
         write_allowance(&e, from, spender, amount, expiration_ledger);
     }
 
@@ -71,7 +73,7 @@ impl TokenTrait for Token {
     fn transfer(e: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
         e.storage().instance().extend_ttl(100, 100);
-        
+
         spend_balance(&e, from, amount);
         receive_balance(&e, to, amount);
     }
@@ -79,7 +81,7 @@ impl TokenTrait for Token {
     fn transfer_from(e: Env, spender: Address, from: Address, to: Address, amount: i128) {
         spender.require_auth();
         e.storage().instance().extend_ttl(100, 100);
-        
+
         spend_allowance(&e, from.clone(), spender, amount);
         spend_balance(&e, from, amount);
         receive_balance(&e, to, amount);
@@ -88,14 +90,14 @@ impl TokenTrait for Token {
     fn burn(e: Env, from: Address, amount: i128) {
         from.require_auth();
         e.storage().instance().extend_ttl(100, 100);
-        
+
         spend_balance(&e, from, amount);
     }
 
     fn burn_from(e: Env, spender: Address, from: Address, amount: i128) {
         spender.require_auth();
         e.storage().instance().extend_ttl(100, 100);
-        
+
         spend_allowance(&e, from.clone(), spender, amount);
         spend_balance(&e, from, amount);
     }

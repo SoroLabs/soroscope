@@ -10,5 +10,5 @@ mod storage_types;
 #[cfg(test)]
 mod test;
 
-pub use crate::contract::TokenClient;
 pub use crate::contract::Token;
+pub use crate::contract::TokenClient;

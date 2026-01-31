@@ -162,7 +162,12 @@ async fn main() {
 
     let app = Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
-        .route("/", get(|| async { "Hello from SoroScope! Usage: cargo run -p soroscope-core -- benchmark" }))
+        .route(
+            "/",
+            get(|| async {
+                "Hello from SoroScope! Usage: cargo run -p soroscope-core -- benchmark"
+            }),
+        )
         .route("/health", get(health_check))
         .route(
             "/error",
@@ -180,8 +185,14 @@ async fn main() {
         .await
         .expect("Failed to bind to address");
 
-    tracing::info!("Server listening on http://{}", listener.local_addr().unwrap());
-    tracing::info!("Swagger UI available at http://{}/swagger-ui", listener.local_addr().unwrap());
+    tracing::info!(
+        "Server listening on http://{}",
+        listener.local_addr().unwrap()
+    );
+    tracing::info!(
+        "Swagger UI available at http://{}/swagger-ui",
+        listener.local_addr().unwrap()
+    );
 
     axum::serve(listener, app)
         .await
