@@ -523,6 +523,7 @@ export function UploadZone({
           />
         )}
 
+<<<<<<< Updated upstream
         {(uploadState === 'idle' || uploadState === 'hover') && (
           <div className="flex flex-col items-center text-center gap-4 transition-all duration-300">
             <WasmIcon state={uploadState} />
@@ -533,6 +534,19 @@ export function UploadZone({
                 }`}
               >
                 {uploadState === 'hover'
+=======
+        {/* ── IDLE / HOVER STATE ── */}
+        {(displayState === 'idle' || displayState === 'hover') && (
+          <div className="flex flex-col items-center text-center gap-4 transition-all duration-300">
+            <WasmIcon state={displayState} />
+            <div>
+              <p
+                className={`text-base font-semibold transition-colors duration-300 ${
+                  displayState === 'hover' ? 'text-sky-300' : 'text-slate-300'
+                }`}
+              >
+                {displayState === 'hover'
+>>>>>>> Stashed changes
                   ? 'Release to upload your .wasm file'
                   : 'Drag & drop your compiled .wasm file'}
               </p>
@@ -554,6 +568,10 @@ export function UploadZone({
           </div>
         )}
 
+<<<<<<< Updated upstream
+=======
+        {/* ── SCANNING STATE ── */}
+>>>>>>> Stashed changes
         {uploadState === 'scanning' && (
           <div className="flex flex-col items-center text-center gap-3 w-full px-4">
             <WasmIcon state="scanning" />
@@ -574,6 +592,7 @@ export function UploadZone({
           </div>
         )}
 
+<<<<<<< Updated upstream
         {uploadState === 'submitting' && (
           <div className="flex flex-col items-center text-center gap-3 w-full px-4">
             <WasmIcon state="scanning" />
@@ -594,6 +613,9 @@ export function UploadZone({
           </div>
         )}
 
+=======
+        {/* ── SUCCESS STATE ── */}
+>>>>>>> Stashed changes
         {uploadState === 'success' && droppedFile && (
           <div className="flex flex-col items-center text-center gap-4">
             <WasmIcon state="success" />
@@ -607,6 +629,10 @@ export function UploadZone({
               </p>
             </div>
 
+<<<<<<< Updated upstream
+=======
+            {/* File info card */}
+>>>>>>> Stashed changes
             <div className="flex items-center gap-3 bg-slate-800/80 border border-emerald-700/40 rounded-xl px-5 py-3">
               <div className="w-9 h-9 rounded-lg bg-emerald-900/50 border border-emerald-700 flex items-center justify-center flex-shrink-0">
                 <span className="text-emerald-400 text-xs font-bold font-mono">WA</span>
@@ -630,6 +656,10 @@ export function UploadZone({
           </div>
         )}
 
+<<<<<<< Updated upstream
+=======
+        {/* ── ERROR STATE ── */}
+>>>>>>> Stashed changes
         {uploadState === 'error' && (
           <div className="flex flex-col items-center text-center gap-4">
             <WasmIcon state="error" />
@@ -660,6 +690,10 @@ export function UploadZone({
         )}
       </div>
 
+<<<<<<< Updated upstream
+=======
+      {/* Caption hint */}
+>>>>>>> Stashed changes
       <p className="text-xs text-slate-600 text-center mt-3 font-mono">
         WASM Resource Analyzer · Soroscope · compiled Soroban contracts only
       </p>
