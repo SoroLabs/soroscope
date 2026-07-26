@@ -193,13 +193,8 @@ export default function WasmUpload({
         }
       });
 
-      if (invalidFiles.length > 0) {
-        alert(invalidFiles[0].error || "Validation Error: Invalid non-WASM file uploaded.");
-      }
-
       const totalFiles = [...files, ...validFiles, ...invalidFiles];
       if (totalFiles.length > maxFiles) {
-        alert(`Maximum ${maxFiles} files allowed`);
         return;
       }
 
