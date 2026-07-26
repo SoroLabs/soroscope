@@ -172,34 +172,76 @@ fn mul_div(a: i128, b: i128, d: i128) -> Option<i128> {
     }
 }
 
+/// Represents a 256-bit unsigned integer as high and low 128-bit parts
+#[derive(Debug, Clone, Copy, Default)]
+struct U256 {
+    high: u128,
+    low: u128,
+}
+
+impl U256 {
+    const ZERO: U256 = U256 { high: 0, low: 0 };
+    
+    /// Multiplies two u128 values to produce a 256-bit result
+    fn from_mul(a: u128, b: u128) -> Self {
+        let a_low = a & 0xFFFFFFFFFFFFFFFF;
+        let a_high = a >> 64;
+        let b_low = b & 0xFFFFFFFFFFFFFFFF;
+        let b_high = b >> 64;
+        
+        let p0 = a_low * b_low;
+        let p1 = a_low * b_high;
+        let p2 = a_high * b_low;
+        let p3 = a_high * b_high;
+        
+        let mid = (p1 & 0xFFFFFFFFFFFFFFFF) + (p2 & 0xFFFFFFFFFFFFFFFF) + (p0 >> 64);
+        let high = p3 + (p1 >> 64) + (p2 >> 64) + (mid >> 64);
+        let low = (mid << 64) | (p0 & 0xFFFFFFFFFFFFFFFF);
+        
+        U256 { high, low }
+    }
+    
+    /// Divides this 256-bit number by a 128-bit divisor
+    /// Returns (quotient, overflow) where overflow is true if result doesn't fit in u128
+    fn div_u128(self, d: u128) -> (u128, bool) {
+        if d == 0 {
+            return (0, true);
+        }
+        
+        // If high part is >= divisor, result would overflow u128
+        if self.high >= d {
+            return (0, true);
+        }
+        
+        // Binary long division: divide 256-bit by 128-bit
+        let mut quotient = 0u128;
+        let mut remainder = self.high;
+        
+        for i in (0..128).rev() {
+            remainder = (remainder << 1) | ((self.low >> i) & 1);
+            if remainder >= d {
+                remainder -= d;
+                quotient |= 1 << i;
+            }
+        }
+        
+        (quotient, false)
+    }
+}
+
 fn mul_div_u128(a: u128, b: u128, d: u128) -> (u128, bool) {
+    if d == 0 {
+        return (0, true);
+    }
+    
+    // Try simple multiplication first for small values
     if let Some(prod) = a.checked_mul(b) {
         return (prod / d, false);
     }
-    let a_low = a & 0xFFFFFFFFFFFFFFFF;
-    let a_high = a >> 64;
-    let b_low = b & 0xFFFFFFFFFFFFFFFF;
-    let b_high = b >> 64;
-    let p0 = a_low * b_low;
-    let p1 = a_low * b_high;
-    let p2 = a_high * b_low;
-    let p3 = a_high * b_high;
-    let mid = (p1 & 0xFFFFFFFFFFFFFFFF) + (p2 & 0xFFFFFFFFFFFFFFFF) + (p0 >> 64);
-    let high = p3 + (p1 >> 64) + (p2 >> 64) + (mid >> 64);
-    let low = (mid << 64) | (p0 & 0xFFFFFFFFFFFFFFFF);
-    if high >= d {
-        return (0, true);
-    }
-    let mut quotient = 0u128;
-    let mut remainder = high;
-    for i in (0..128).rev() {
-        remainder = (remainder << 1) | ((low >> i) & 1);
-        if remainder >= d {
-            remainder -= d;
-            quotient |= 1 << i;
-        }
-    }
-    (quotient, false)
+    
+    // Use 256-bit intermediate for large values
+    let product = U256::from_mul(a, b);
+    product.div_u128(d)
 }
 
 #[contract]
@@ -260,5 +302,127 @@ mod test {
         // Advanced ops (no raw equivalent easily)
         let fixed_exp = Fixed(SCALE).exp().unwrap();
         assert!(fixed_exp.0 > 2 * SCALE);
+    }
+
+    #[test]
+    fn test_mul_div_basic() {
+        // Test basic multiplication/division
+        assert_eq!(mul_div(100, 200, 50), Some(400));
+        assert_eq!(mul_div(100, 200, 100), Some(200));
+        assert_eq!(mul_div(0, 100, 50), Some(0));
+        assert_eq!(mul_div(100, 0, 50), Some(0));
+    }
+
+    #[test]
+    fn test_mul_div_division_by_zero() {
+        assert_eq!(mul_div(100, 200, 0), None);
+    }
+
+    #[test]
+    fn test_mul_div_negative_numbers() {
+        // Test negative number handling
+        assert_eq!(mul_div(-100, 200, 50), Some(-400));
+        assert_eq!(mul_div(100, -200, 50), Some(-400));
+        assert_eq!(mul_div(100, 200, -50), Some(-400));
+        assert_eq!(mul_div(-100, -200, 50), Some(400));
+        assert_eq!(mul_div(-100, 200, -50), Some(400));
+        assert_eq!(mul_div(100, -200, -50), Some(400));
+        assert_eq!(mul_div(-100, -200, -50), Some(-400));
+    }
+
+    #[test]
+    fn test_mul_div_large_values() {
+        // Test with large values that would overflow i128 multiplication
+        let large = i128::MAX / 2;
+        let result = mul_div(large, 2, SCALE);
+        assert!(result.is_some());
+        
+        // Test with values near i128::MAX
+        let max = i128::MAX;
+        let result = mul_div(max, 1, SCALE);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_mul_div_overflow_detection() {
+        // Test cases that should overflow
+        let max = i128::MAX;
+        assert_eq!(mul_div(max, max, 1), None); // Would overflow
+        assert_eq!(mul_div(max, 2, SCALE), None); // Would overflow after division
+    }
+
+    #[test]
+    fn test_mul_div_precision() {
+        // Test precision preservation
+        assert_eq!(mul_div(SCALE, SCALE, SCALE), Some(SCALE));
+        assert_eq!(mul_div(SCALE * 2, SCALE * 3, SCALE), Some(SCALE * 6));
+        
+        // Test fractional precision
+        let result = mul_div(SCALE, SCALE / 2, SCALE);
+        assert_eq!(result, Some(SCALE / 2));
+    }
+
+    #[test]
+    fn test_u256_from_mul() {
+        // Test U256 multiplication
+        let a = 0xFFFFFFFFFFFFFFFFu128;
+        let b = 0xFFFFFFFFFFFFFFFFu128;
+        let product = U256::from_mul(a, b);
+        
+        // a * b should be (2^64 - 1)^2 = 2^128 - 2^65 + 1
+        assert_eq!(product.high, 0xFFFFFFFFFFFFFFFE);
+        assert_eq!(product.low, 0x0000000000000001);
+    }
+
+    #[test]
+    fn test_u256_div_u128() {
+        // Test U256 division
+        let product = U256 { high: 1, low: 0 };
+        let (quotient, overflow) = product.div_u128(2);
+        assert!(!overflow);
+        assert_eq!(quotient, (1u128 << 127) / 2);
+        
+        // Test overflow case
+        let (quotient, overflow) = product.div_u128(1);
+        assert!(overflow);
+        assert_eq!(quotient, 0);
+    }
+
+    #[test]
+    fn test_mul_div_edge_cases() {
+        // Test edge case: divisor equals one of the operands
+        assert_eq!(mul_div(100, 50, 50), Some(100));
+        assert_eq!(mul_div(50, 100, 50), Some(100));
+        
+        // Test edge case: result is zero
+        assert_eq!(mul_div(1, 1, i128::MAX as i128), Some(0));
+    }
+
+    #[test]
+    fn test_fixed_mul_div_integration() {
+        // Test that Fixed operations correctly use mul_div
+        let a = Fixed::from_int(2).unwrap();
+        let b = Fixed::from_int(3).unwrap();
+        let result = a.mul(b).unwrap();
+        assert_eq!(result.to_int(), 6);
+        
+        // Test division
+        let c = Fixed::from_int(6).unwrap();
+        let d = Fixed::from_int(2).unwrap();
+        let result = c.div(d).unwrap();
+        assert_eq!(result.to_int(), 3);
+    }
+
+    #[test]
+    fn test_mul_div_u128_overflow_protection() {
+        // Test that mul_div_u128 correctly handles overflow
+        let a = u128::MAX;
+        let b = u128::MAX;
+        let d = 2u128;
+        
+        let (result, overflow) = mul_div_u128(a, b, d);
+        // Should not overflow since we're dividing by 2
+        assert!(!overflow);
+        assert!(result > 0);
     }
 }
