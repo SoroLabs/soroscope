@@ -47,10 +47,10 @@ fn setup() -> (
         &reward_token,
         &INITIAL_RATE,
         &DECAY_RATE,
-        &0u32, // start block
+        &0u32,
+        &0u32, // epoch_duration = 0 (continuous mode)
     );
 
-    // Mint staking tokens to users later, and mint reward tokens to the contract
     let reward_client = token::StellarAssetClient::new(&e, &reward_token);
     reward_client.mint(&contract_id, &1_000_000_000);
 
@@ -68,12 +68,12 @@ fn test_initialization() {
     assert_eq!(config.initial_rate.0, INITIAL_RATE);
     assert_eq!(config.decay_rate.0, DECAY_RATE);
     assert_eq!(config.start_block, 0);
+    assert_eq!(config.epoch_duration, 0);
     assert!(!config.is_paused);
 }
 
 #[test]
 fn test_stake_and_yield_accumulation_no_decay() {
-    // Re-initialize with 0 decay rate (alpha = 1)
     let e = Env::default();
     e.mock_all_auths();
     e.cost_estimate().budget().reset_unlimited();
@@ -94,32 +94,25 @@ fn test_stake_and_yield_accumulation_no_decay() {
         &staking_token,
         &reward_token,
         &INITIAL_RATE,
-        &0i128, // decay_rate = 0
-        &10u32, // start_block = 10
+        &0i128,
+        &10u32,
+        &0u32,
     );
 
     let user = Address::generate(&e);
     let staking_client = token::StellarAssetClient::new(&e, &staking_token);
     staking_client.mint(&user, &STAKE_AMOUNT);
 
-    // Fast forward ledger to block 10
     advance_ledger(&e, 10);
 
-    // Stake at block 10
     client.stake(&user, &STAKE_AMOUNT);
 
     assert_eq!(client.get_staked_balance(&user), STAKE_AMOUNT);
     assert_eq!(client.get_accrued_rewards(&user), 0);
     assert_eq!(client.get_pending_rewards(&user), 0);
 
-    // Advance 5 blocks (from 10 to 15)
     advance_ledger(&e, 5);
 
-    // Expected multiplier: exp(r0 * 5)
-    // r0 = 0.0001, so r0 * 5 = 0.0005
-    // exp(0.0005) = 1.00050012502
-    // Expected reward = 10,000 * (1.00050012502 - 1) = 5.0012502
-    // Truncated to integer: 5
     let pending = client.get_pending_rewards(&user);
     assert_eq!(pending, 5);
 }
@@ -132,23 +125,13 @@ fn test_stake_and_yield_accumulation_with_decay() {
     let staking_client = token::StellarAssetClient::new(&e, &staking_token);
     staking_client.mint(&user, &STAKE_AMOUNT);
 
-    // Stake at block 0
     client.stake(&user, &STAKE_AMOUNT);
 
-    // Advance 5 blocks (from 0 to 5)
     advance_ledger(&e, 5);
 
-    // Expected exponent: (r0 / d) * (1 - alpha^5)
-    // r0 = 0.0001, d = 0.01, alpha = 0.99
-    // alpha^5 = 0.99^5 = 0.9509900499
-    // 1 - alpha^5 = 0.0490099501
-    // exponent = (0.0001 / 0.01) * 0.0490099501 = 0.000490099501
-    // exp(0.000490099501) = 1.0004902196
-    // Expected reward = 10,000 * 0.0004902196 = 4.902196 => truncated to 4
     let pending = client.get_pending_rewards(&user);
     assert_eq!(pending, 4);
 
-    // Claim rewards
     client.claim(&user);
     assert_eq!(client.get_accrued_rewards(&user), 0);
     assert_eq!(client.get_pending_rewards(&user), 0);
@@ -160,18 +143,14 @@ fn test_compounding_interest() {
     let user = Address::generate(&e);
 
     let staking_client = token::StellarAssetClient::new(&e, &staking_token);
-    staking_client.mint(&user, &100_000); // larger stake to see compounding clearly
+    staking_client.mint(&user, &100_000);
 
     client.stake(&user, &100_000);
 
-    // Advance 10 blocks (from 0 to 10)
     advance_ledger(&e, 10);
 
-    // Check rewards without claiming
     let pending_1 = client.get_pending_rewards(&user);
 
-    // Let's do another action to write back accrued rewards to storage (e.g. withdraw 0, or we can just let it update)
-    // Staking 1 more token triggers a reward update and stores the accrued reward
     staking_client.mint(&user, &1);
     client.stake(&user, &1);
 
@@ -179,10 +158,8 @@ fn test_compounding_interest() {
     assert!(accrued > 0);
     assert_eq!(accrued, pending_1);
 
-    // Now advance another 10 blocks (from 10 to 20)
     advance_ledger(&e, 10);
 
-    // The new pending rewards should compound on (staked_amount + accrued_rewards)
     let pending_2 = client.get_pending_rewards(&user);
     assert!(pending_2 > accrued);
 }
@@ -198,22 +175,17 @@ fn test_zero_stake_security() {
     client.stake(&user, &STAKE_AMOUNT);
     advance_ledger(&e, 10);
 
-    // User has accrued rewards
     let pending = client.get_pending_rewards(&user);
     assert!(pending > 0);
 
-    // Withdraw entire principal
     client.withdraw(&user, &STAKE_AMOUNT);
     assert_eq!(client.get_staked_balance(&user), 0);
 
-    // Accrued rewards are saved
     let accrued = client.get_accrued_rewards(&user);
     assert_eq!(accrued, pending);
 
-    // Advance another 10 blocks
     advance_ledger(&e, 10);
 
-    // Since stake is 0, compounding is inactive. Accrued rewards must NOT increase!
     let pending_after = client.get_pending_rewards(&user);
     assert_eq!(pending_after, accrued);
 }
@@ -229,22 +201,17 @@ fn test_emergency_withdraw() {
     client.stake(&user, &STAKE_AMOUNT);
     advance_ledger(&e, 10);
 
-    // Verify rewards accrued
     assert!(client.get_pending_rewards(&user) > 0);
 
-    // Pause contract to simulate extreme conditions
     client.set_paused(&true);
 
-    // Emergency withdraw should succeed even when paused
     let withdrawn = client.emergency_withdraw(&user);
     assert_eq!(withdrawn, STAKE_AMOUNT);
 
-    // Verify stake balance is zero and user state is cleared (rewards forfeited)
     assert_eq!(client.get_staked_balance(&user), 0);
     assert_eq!(client.get_accrued_rewards(&user), 0);
     assert_eq!(client.get_pending_rewards(&user), 0);
 
-    // Verify principal token is fully returned to the user
     let token_balance = token::Client::new(&e, &staking_token).balance(&user);
     assert_eq!(token_balance, STAKE_AMOUNT);
 }
@@ -288,4 +255,280 @@ fn test_pause_safeguards_claim() {
     client.stake(&user, &STAKE_AMOUNT);
     client.set_paused(&true);
     client.claim(&user);
+}
+
+// ── Epoch Snapshot Tests ──────────────────────────────────────
+
+fn setup_epoch(
+    epoch_duration: u32,
+) -> (
+    Env,
+    StakingRewardsClient<'static>,
+    Address,
+    Address,
+    Address,
+) {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let owner = Address::generate(&e);
+    let staking_token = e
+        .register_stellar_asset_contract_v2(Address::generate(&e))
+        .address();
+    let reward_token = e
+        .register_stellar_asset_contract_v2(Address::generate(&e))
+        .address();
+
+    let contract_id = e.register(StakingRewards, ());
+    let client = StakingRewardsClient::new(&e, &contract_id);
+
+    client.initialize(
+        &owner,
+        &staking_token,
+        &reward_token,
+        &INITIAL_RATE,
+        &0i128,
+        &0u32,
+        &epoch_duration,
+    );
+
+    let reward_client = token::StellarAssetClient::new(&e, &reward_token);
+    reward_client.mint(&contract_id, &1_000_000_000);
+
+    (e, client, owner, staking_token, reward_token)
+}
+
+#[test]
+fn test_epoch_initialization() {
+    let (_, client, _owner, _staking_token, _reward_token) = setup_epoch(100);
+    let config = client.get_config();
+
+    assert_eq!(config.epoch_duration, 100);
+    assert_eq!(config.initial_rate.0, INITIAL_RATE);
+    assert_eq!(config.decay_rate.0, 0);
+}
+
+#[test]
+fn test_epoch_snapshot_no_decay() {
+    let (e, client, _, staking_token, _) = setup_epoch(10);
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    // Stake at block 0
+    client.stake(&user, &STAKE_AMOUNT);
+
+    // Advance to block 15: epoch 0 spans [0,9], epoch 1 spans [10,19]
+    advance_ledger(&e, 15);
+
+    let pending = client.get_pending_rewards(&user);
+
+    // Epoch 0 (blocks 0-9): multiplier = exp(r0 * 10) = exp(0.0001 * 10) = exp(0.001) = 1.0010005
+    // Virtual balance after epoch 0: 10000 * 1.0010005 = 10010.005
+    // Epoch 1 (blocks 10-15): from epoch start (10) to curr (15), 5 blocks
+    // multiplier = exp(r0 * 5) = exp(0.0005) = 1.000500125
+    // Final virtual: 10010.005 * 1.000500125 = 10015.00625...
+    // Rewards = 10015 - 10000 = 15
+    assert!(pending > 0, "Epoch mode should produce positive rewards");
+}
+
+#[test]
+fn test_epoch_snapshot_matches_continuous_within_same_epoch() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let owner = Address::generate(&e);
+    let staking_token = e
+        .register_stellar_asset_contract_v2(Address::generate(&e))
+        .address();
+    let reward_token = e
+        .register_stellar_asset_contract_v2(Address::generate(&e))
+        .address();
+
+    // Continuous mode contract
+    let continuous_id = e.register(StakingRewards, ());
+    let continuous = StakingRewardsClient::new(&e, &continuous_id);
+    continuous.initialize(
+        &owner,
+        &staking_token,
+        &reward_token,
+        &INITIAL_RATE,
+        &0i128,
+        &0u32,
+        &0u32,
+    );
+
+    // Epoch mode contract (same parameters, but with epoch_duration=100)
+    let epoch_id = e.register(StakingRewards, ());
+    let epoch = StakingRewardsClient::new(&e, &epoch_id);
+    epoch.initialize(
+        &owner,
+        &staking_token,
+        &reward_token,
+        &INITIAL_RATE,
+        &0i128,
+        &0u32,
+        &100u32,
+    );
+
+    let reward_continuous = token::StellarAssetClient::new(&e, &reward_token);
+    reward_continuous.mint(&continuous_id, &1_000_000_000);
+    let reward_epoch = token::StellarAssetClient::new(&e, &reward_token);
+    reward_epoch.mint(&epoch_id, &1_000_000_000);
+
+    let user_cont = Address::generate(&e);
+    let user_epoch = Address::generate(&e);
+
+    let staking_cont = token::StellarAssetClient::new(&e, &staking_token);
+    staking_cont.mint(&user_cont, &100_000);
+    staking_cont.mint(&user_epoch, &100_000);
+
+    // Both stake at block 5, same amount
+    advance_ledger(&e, 5);
+    continuous.stake(&user_cont, &100_000);
+    epoch.stake(&user_epoch, &100_000);
+
+    // Advance to block 55 (still within first epoch for epoch mode)
+    advance_ledger(&e, 50);
+
+    let pending_cont = continuous.get_pending_rewards(&user_cont);
+    let pending_epoch = epoch.get_pending_rewards(&user_epoch);
+
+    // Within the same epoch, results should match continuous mode
+    assert_eq!(
+        pending_epoch, pending_cont,
+        "Within same epoch, epoch mode should match continuous mode"
+    );
+}
+
+#[test]
+fn test_epoch_snapshot_accuracy_at_epoch_boundary() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let owner = Address::generate(&e);
+    let staking_token = e
+        .register_stellar_asset_contract_v2(Address::generate(&e))
+        .address();
+    let reward_token = e
+        .register_stellar_asset_contract_v2(Address::generate(&e))
+        .address();
+
+    let continuous_id = e.register(StakingRewards, ());
+    let continuous = StakingRewardsClient::new(&e, &continuous_id);
+    continuous.initialize(
+        &owner,
+        &staking_token,
+        &reward_token,
+        &INITIAL_RATE,
+        &0i128,
+        &0u32,
+        &0u32,
+    );
+
+    let epoch_id = e.register(StakingRewards, ());
+    let epoch = StakingRewardsClient::new(&e, &epoch_id);
+    epoch.initialize(
+        &owner,
+        &staking_token,
+        &reward_token,
+        &INITIAL_RATE,
+        &0i128,
+        &0u32,
+        &50u32,
+    );
+
+    let reward_continuous = token::StellarAssetClient::new(&e, &reward_token);
+    reward_continuous.mint(&continuous_id, &1_000_000_000);
+    let reward_epoch = token::StellarAssetClient::new(&e, &reward_token);
+    reward_epoch.mint(&epoch_id, &1_000_000_000);
+
+    let user_cont = Address::generate(&e);
+    let user_epoch = Address::generate(&e);
+
+    let staking = token::StellarAssetClient::new(&e, &staking_token);
+    staking.mint(&user_cont, &100_000);
+    staking.mint(&user_epoch, &100_000);
+
+    // Both stake at block 0
+    continuous.stake(&user_cont, &100_000);
+    epoch.stake(&user_epoch, &100_000);
+
+    // Advance to block 50 (exactly one epoch boundary)
+    advance_ledger(&e, 50);
+
+    let pending_cont = continuous.get_pending_rewards(&user_cont);
+    let pending_epoch = epoch.get_pending_rewards(&user_epoch);
+
+    assert_eq!(
+        pending_epoch, pending_cont,
+        "At epoch boundary, epoch mode should exactly match continuous mode"
+    );
+}
+
+#[test]
+fn test_epoch_snapshot_storage() {
+    let (e, client, _, staking_token, _) = setup_epoch(50);
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    client.stake(&user, &STAKE_AMOUNT);
+
+    // Advance to block 120 (epoch 2 started at block 100)
+    advance_ledger(&e, 120);
+
+    // Get pending rewards (should trigger snapshot computation)
+    let _pending = client.get_pending_rewards(&user);
+
+    // Snapshot at epoch 0 should exist and be > 1.0
+    let snap_0 = client.get_epoch_snapshot(&0);
+    assert!(snap_0 > SCALE, "Epoch 0 snapshot should be > 1.0");
+
+    // Snapshot at epoch 1 should exist and be > epoch 0
+    let snap_1 = client.get_epoch_snapshot(&1);
+    assert!(
+        snap_1 > snap_0,
+        "Epoch 1 snapshot should be > epoch 0 snapshot"
+    );
+}
+
+#[test]
+fn test_epoch_multi_epoch_rewards() {
+    let (e, client, _, staking_token, _) = setup_epoch(100);
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &100_000);
+
+    client.stake(&user, &100_000);
+
+    // Advance through 3 full epochs (300 blocks)
+    advance_ledger(&e, 300);
+
+    let pending = client.get_pending_rewards(&user);
+    assert!(pending > 0, "Should accumulate rewards across epochs");
+
+    // Claim and verify
+    let claimed = client.claim(&user);
+    assert!(claimed > 0, "Should claim rewards");
+    assert_eq!(client.get_accrued_rewards(&user), 0);
+}
+
+#[test]
+fn test_epoch_set_duration() {
+    let (_e, client, _, _, _) = setup_epoch(0);
+
+    let config = client.get_config();
+    assert_eq!(config.epoch_duration, 0);
+
+    client.set_epoch_duration(&200);
+
+    let config = client.get_config();
+    assert_eq!(config.epoch_duration, 200);
 }
