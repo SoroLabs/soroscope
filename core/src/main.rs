@@ -1528,7 +1528,7 @@ async fn fee_analytics(
     paths(
         analyze, analyze_wasm, optimize_limits, compare_handler,
         auth::challenge_handler, auth::verify_handler, auth::jwks_handler,
-        fee_recommend, fee_history, fee_analytics
+        fee_recommend, fee_history, fee_analytics, batch_contract_state
     ),
     components(schemas(
         AnalyzeRequest, AnalyzeWasmRequest, AnalyzeWasmBranchesRequest,
@@ -1549,7 +1549,8 @@ async fn fee_analytics(
         crate::fee_store::LedgerFeeSample,
         crate::fee_analytics::MarketConditions,
         crate::fee_analytics::ModelBreakdown,
-        crate::fee_analytics::TrendDirection
+        crate::fee_analytics::TrendDirection,
+        BatchStateItem, BatchStateRequest, ContractStateResult, BatchStateResponse
     )),
     tags(
         (name = "Analysis", description = "Soroban contract resource analysis endpoints"),
@@ -1564,6 +1565,120 @@ async fn fee_analytics(
     )
 )]
 struct ApiDoc;
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct BatchStateItem {
+    /// Contract identifier used to group the response.
+    contract_id: String,
+    /// Base64-encoded ledger key XDR values to fetch for this contract.
+    key_paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct BatchStateRequest {
+    contracts: Vec<BatchStateItem>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct ContractStateResult {
+    contract_id: String,
+    entries: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct BatchStateResponse {
+    contracts: Vec<ContractStateResult>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/contracts/batch-state",
+    request_body = BatchStateRequest,
+    responses((status = 200, description = "Contract state snapshot batch", body = BatchStateResponse)),
+    tag = "Contracts"
+)]
+async fn batch_contract_state(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<BatchStateRequest>,
+) -> Result<Json<BatchStateResponse>, AppError> {
+    if request.contracts.is_empty()
+        || request
+            .contracts
+            .iter()
+            .any(|item| item.contract_id.trim().is_empty() || item.key_paths.is_empty())
+    {
+        return Err(AppError::BadRequest(
+            "contracts must contain a contract_id and at least one key path".to_string(),
+        ));
+    }
+
+    let keys: Vec<String> = request
+        .contracts
+        .iter()
+        .flat_map(|item| item.key_paths.iter().cloned())
+        .collect();
+    let provider = state
+        .provider_registry
+        .healthy_providers()
+        .await
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::Internal("no healthy RPC provider available".to_string()))?;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getLedgerEntries",
+        "params": { "keys": keys }
+    });
+    let client = reqwest::Client::new();
+    let mut rpc_request = client.post(&provider.url).json(&body);
+    if let (Some(header), Some(value)) = (&provider.auth_header, &provider.auth_value) {
+        rpc_request = rpc_request.header(header, value);
+    }
+    let rpc_response: serde_json::Value = rpc_request
+        .send()
+        .await
+        .map_err(|error| AppError::Internal(format!("RPC request failed: {error}")))?
+        .error_for_status()
+        .map_err(|error| AppError::Internal(format!("RPC returned an error: {error}")))?
+        .json()
+        .await
+        .map_err(|error| AppError::Internal(format!("invalid RPC response: {error}")))?;
+    if let Some(error) = rpc_response.get("error") {
+        return Err(AppError::Internal(format!("RPC node error: {error}")));
+    }
+    let entries = rpc_response
+        .pointer("/result/entries")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(Json(group_batch_entries(&request.contracts, &entries)))
+}
+
+fn group_batch_entries(
+    requested: &[BatchStateItem],
+    entries: &[serde_json::Value],
+) -> BatchStateResponse {
+    BatchStateResponse {
+        contracts: requested
+            .iter()
+            .map(|item| ContractStateResult {
+                contract_id: item.contract_id.clone(),
+                entries: entries
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .get("key")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|key| item.key_paths.iter().any(|path| path == key))
+                    })
+                    .cloned()
+                    .collect(),
+            })
+            .collect(),
+    }
+}
 
 async fn health_check() -> &'static str {
     "OK"
@@ -2079,6 +2194,7 @@ async fn main() {
         )
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_handler))
+        .route("/api/v1/contracts/batch-state", post(batch_contract_state))
         .route("/auth/challenge", post(auth::challenge_handler))
         .route("/auth/verify", post(auth::verify_handler))
         .route("/auth/emergency-pause", post(auth::emergency_pause_handler))
@@ -2123,6 +2239,30 @@ async fn main() {
 mod tests {
     use super::*;
     use crate::simulation::{SimulationError, SorobanResources};
+
+    #[test]
+    fn batch_state_groups_entries_by_requested_contract() {
+        let requested = vec![
+            BatchStateItem {
+                contract_id: "CA".to_string(),
+                key_paths: vec!["key-a".to_string()],
+            },
+            BatchStateItem {
+                contract_id: "CB".to_string(),
+                key_paths: vec!["key-b".to_string()],
+            },
+        ];
+        let entries = vec![
+            serde_json::json!({"key": "key-b", "xdr": "value-b"}),
+            serde_json::json!({"key": "key-a", "xdr": "value-a"}),
+        ];
+
+        let response = group_batch_entries(&requested, &entries);
+        assert_eq!(response.contracts.len(), 2);
+        assert_eq!(response.contracts[0].contract_id, "CA");
+        assert_eq!(response.contracts[0].entries[0]["xdr"], "value-a");
+        assert_eq!(response.contracts[1].entries[0]["xdr"], "value-b");
+    }
 
     #[test]
     fn test_error_mapping_node_error() {
