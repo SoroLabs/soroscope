@@ -15,6 +15,7 @@ mod merkle_tree;
 mod parser;
 mod routing;
 pub mod rpc_provider;
+mod rpc_throttle;
 mod runner;
 mod simulation;
 mod simulation_service;

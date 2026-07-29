@@ -1039,6 +1039,7 @@ pub struct SimulationEngine {
     contract_cache: Option<Arc<crate::cache::ContractCache>>,
     mode: SimulationMode,
     local_runner: Option<Arc<crate::runner::LocalRunner>>,
+    rpc_throttle: crate::rpc_throttle::RpcThrottle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1081,6 +1082,7 @@ impl SimulationEngine {
             contract_cache: None,
             mode: SimulationMode::Failover,
             local_runner: None,
+            rpc_throttle: Default::default(),
         }
     }
 
@@ -1099,6 +1101,7 @@ impl SimulationEngine {
             contract_cache: None,
             mode,
             local_runner: None,
+            rpc_throttle: Default::default(),
         }
     }
 
@@ -1115,6 +1118,7 @@ impl SimulationEngine {
             contract_cache: Some(cache),
             mode: SimulationMode::Failover,
             local_runner: None,
+            rpc_throttle: Default::default(),
         }
     }
 
@@ -1140,6 +1144,7 @@ impl SimulationEngine {
             contract_cache: None,
             mode,
             local_runner: None,
+            rpc_throttle: Default::default(),
         }
     }
 
@@ -1225,9 +1230,10 @@ impl SimulationEngine {
         if let (Some(header), Some(value)) = (auth_header.as_deref(), auth_value.as_deref()) {
             req_builder = req_builder.header(header, value);
         }
-        let response: GetLedgerEntriesResponse = req_builder
-            .send()
-            .await?
+        self.rpc_throttle.wait().await;
+        let response = req_builder.send().await?;
+        self.rpc_throttle.observe(response.headers()).await;
+        let response: GetLedgerEntriesResponse = response
             .json()
             .await
             .map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
@@ -1290,12 +1296,10 @@ impl SimulationEngine {
             },
         };
 
-        let response2: GetLedgerEntriesResponse = self
-            .client
-            .post(&url)
-            .json(&req2)
-            .send()
-            .await?
+        self.rpc_throttle.wait().await;
+        let response2 = self.client.post(&url).json(&req2).send().await?;
+        self.rpc_throttle.observe(response2.headers()).await;
+        let response2: GetLedgerEntriesResponse = response2
             .json()
             .await
             .map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
@@ -2180,6 +2184,7 @@ impl SimulationEngine {
             req_builder = req_builder.header(header, value);
         }
 
+        self.rpc_throttle.wait().await;
         let response = tokio::time::timeout(self.request_timeout, req_builder.send())
             .await
             .map_err(|_| SimulationError::NodeTimeout)?
@@ -2192,6 +2197,7 @@ impl SimulationEngine {
                     SimulationError::RpcRequestFailed(format!("Network error: {}", e))
                 }
             })?;
+        self.rpc_throttle.observe(response.headers()).await;
 
         if !response.status().is_success() {
             return Err(SimulationError::RpcRequestFailed(format!(
@@ -2439,10 +2445,12 @@ impl SimulationEngine {
             req_builder = req_builder.header(header, value);
         }
 
+        self.rpc_throttle.wait().await;
         let response = tokio::time::timeout(self.request_timeout, req_builder.send())
             .await
             .map_err(|_| SimulationError::NodeTimeout)?
             .map_err(|e| SimulationError::RpcRequestFailed(format!("Network error: {}", e)))?;
+        self.rpc_throttle.observe(response.headers()).await;
 
         if !response.status().is_success() {
             return Err(SimulationError::RpcRequestFailed(format!(

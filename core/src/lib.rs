@@ -8,6 +8,7 @@ pub mod parser;
 pub mod routing;
 pub mod merkle_tree;
 pub mod rpc_provider;
+pub mod rpc_throttle;
 pub mod runner;
 pub mod simulation;
 pub mod wasm_branch_analysis;
