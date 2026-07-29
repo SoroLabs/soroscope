@@ -18,6 +18,7 @@ pub mod rpc_provider;
 mod runner;
 mod simulation;
 mod simulation_service;
+mod trace_propagation;
 mod wasm_branch_analysis;
 mod ws;
 
@@ -1591,6 +1592,9 @@ async fn registry_gossip(
 
 #[tokio::main]
 async fn main() {
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
     if env::var("RUST_LOG").is_err() {
         env::set_var("RUST_LOG", "info");
     }

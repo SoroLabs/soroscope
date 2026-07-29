@@ -46,6 +46,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::jobs::JobId;
+use crate::trace_propagation::TracedMessage;
 
 // ── Channel capacity ─────────────────────────────────────────────────────────
 
@@ -161,7 +162,7 @@ impl SimulationEvent {
 /// async context and [`SimulationBus::subscribe`] to get a receiver.
 #[derive(Clone)]
 pub struct SimulationBus {
-    sender: broadcast::Sender<SimulationEvent>,
+    sender: broadcast::Sender<TracedMessage<SimulationEvent>>,
 }
 
 impl SimulationBus {
@@ -174,12 +175,12 @@ impl SimulationBus {
     /// Publish an event.  Returns the number of active subscribers that
     /// received it (0 if nobody is listening, which is perfectly fine).
     pub fn publish(&self, event: SimulationEvent) -> usize {
-        self.sender.send(event).unwrap_or(0)
+        self.sender.send(TracedMessage::capture(event)).unwrap_or(0)
     }
 
     /// Subscribe to the bus.  The returned receiver will lag (and skip events)
     /// if it cannot keep up with the publication rate.
-    pub fn subscribe(&self) -> broadcast::Receiver<SimulationEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<TracedMessage<SimulationEvent>> {
         self.sender.subscribe()
     }
 
@@ -305,7 +306,11 @@ async fn handle_socket(mut socket: WebSocket, job_id: String, state: Arc<crate::
             // Receive next event from the bus
             result = rx.recv() => {
                 match result {
-                    Ok(event) => {
+                    Ok(message) => {
+                        let dispatch_span = tracing::info_span!("simulation_event_dispatch");
+                        message.set_parent(&dispatch_span);
+                        let _dispatch_guard = dispatch_span.enter();
+                        let event = message.payload;
                         // Only forward events belonging to the requested job
                         if event.job_id() != job_id {
                             continue;
@@ -383,8 +388,8 @@ mod tests {
         bus.publish(event);
 
         let received = rx.recv().await.expect("should receive event");
-        assert_eq!(received.job_id(), fake_id.to_string());
-        assert!(!received.is_terminal());
+        assert_eq!(received.payload.job_id(), fake_id.to_string());
+        assert!(!received.payload.is_terminal());
     }
 
     #[tokio::test]

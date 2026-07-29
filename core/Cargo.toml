@@ -27,6 +27,9 @@ config = "0.14"
 axum = { version = "0.7", features = ["multipart", "ws"] }
 tempfile = "3"
 tracing = "0.1"
+opentelemetry = "0.27"
+opentelemetry_sdk = "0.27"
+tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus = "0.14"
 tower = "0.4"
