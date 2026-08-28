@@ -52,7 +52,7 @@ use crate::trace_propagation::TracedMessage;
 
 /// Default number of events buffered per broadcast channel slot before slow
 /// consumers are forced to drop events via `RecvError::Lagged`.
-const BUS_CAPACITY: usize = 256;
+const BUS_CAPACITY: usize = 100;
 
 /// Minimum allowed channel capacity (prevents degenerate single-slot configs).
 const BUS_CAPACITY_MIN: usize = 16;
@@ -468,4 +468,21 @@ mod tests {
         let n = bus.publish(SimulationBus::progress(&fake_id, 10, "start"));
         assert_eq!(n, 0);
     }
+
+    #[tokio::test]
+    async fn slow_client_lagged_events_dropped() {
+        let bus = SimulationBus::with_capacity(16);
+        let mut rx = bus.subscribe();
+        let fake_id = JobId::new();
+
+        // Publish more events than capacity without consuming
+        for i in 0..30 {
+            bus.publish(SimulationBus::progress(&fake_id, i, format!("tick {}", i)));
+        }
+
+        // Slow consumer receives Lagged error when buffer capacity is exceeded
+        let res = rx.recv().await;
+        assert!(matches!(res, Err(broadcast::error::RecvError::Lagged(_))));
+    }
 }
+

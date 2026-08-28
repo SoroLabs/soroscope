@@ -4524,4 +4524,90 @@ mod tests {
         let count = result.unwrap().get_payload() >> 8;
         assert!(count > 0, "counter should be > 0, got {count}");
     }
+
+    #[test]
+    fn test_extract_soroban_budget_from_logs_v21_and_legacy() {
+        // v21+ format
+        let v21_logs = "INFO soroban_cli::run: Budget: cpu: 1234567, mem: 987654";
+        let parsed_v21 = extract_soroban_budget_from_logs(v21_logs);
+        assert_eq!(parsed_v21.cpu_instructions, 1234567);
+        assert_eq!(parsed_v21.memory_bytes, 987654);
+
+        // Legacy format
+        let legacy_logs = "Budget report:\nCpuCost: 500000\nMemCost: 250000";
+        let parsed_legacy = extract_soroban_budget_from_logs(legacy_logs);
+        assert_eq!(parsed_legacy.cpu_instructions, 500000);
+        assert_eq!(parsed_legacy.memory_bytes, 250000);
+    }
 }
+
+/// Parsed host budget consumption (CPU instructions, memory bytes) extracted from Soroban CLI log output.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExtractedSorobanBudget {
+    pub cpu_instructions: u64,
+    pub memory_bytes: u64,
+}
+
+/// Extract Soroban host budget limits from log output strings.
+/// Supports Soroban CLI v21+ format changes with fallbacks for legacy log output formats.
+pub fn extract_soroban_budget_from_logs(logs: &str) -> ExtractedSorobanBudget {
+    let mut result = ExtractedSorobanBudget::default();
+
+    for line in logs.lines() {
+        let line_lower = line.to_lowercase();
+
+        if line_lower.contains("cpu") || line_lower.contains("mem") || line_lower.contains("budget") {
+            if let Some(idx) = line_lower.find("cpu:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 4..]) {
+                    result.cpu_instructions = val;
+                }
+            } else if let Some(idx) = line_lower.find("cpu_instructions:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 17..]) {
+                    result.cpu_instructions = val;
+                }
+            } else if let Some(idx) = line_lower.find("cpu cost:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 9..]) {
+                    result.cpu_instructions = val;
+                }
+            } else if let Some(idx) = line_lower.find("cpucost:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 8..]) {
+                    result.cpu_instructions = val;
+                }
+            } else if let Some(idx) = line_lower.find("cpuinvocations:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 15..]) {
+                    result.cpu_instructions = val;
+                }
+            }
+
+            if let Some(idx) = line_lower.find("mem:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 4..]) {
+                    result.memory_bytes = val;
+                }
+            } else if let Some(idx) = line_lower.find("memory_bytes:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 13..]) {
+                    result.memory_bytes = val;
+                }
+            } else if let Some(idx) = line_lower.find("mem cost:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 9..]) {
+                    result.memory_bytes = val;
+                }
+            } else if let Some(idx) = line_lower.find("memcost:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 8..]) {
+                    result.memory_bytes = val;
+                }
+            }
+        }
+    }
+
+    result
+}
+
+fn parse_trailing_number(s: &str) -> Option<u64> {
+    let digits: String = s
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+

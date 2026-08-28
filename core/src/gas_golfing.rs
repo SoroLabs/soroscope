@@ -87,20 +87,22 @@ impl GasGolfingAnalyzer {
     fn analyze_memory_patterns(&self, wasm_bytes: &[u8]) -> Vec<GasGolfingSuggestion> {
         let mut suggestions = Vec::new();
 
-        // Look for excessive memory allocations
-        let alloc_count = wasm_bytes.windows(2).filter(|w| w == &[0x20, 0x00]).count();
-        if alloc_count > 10 {
+        // Look for memory grow instructions (0x40 0x00) or explicit allocations inside loops (0x03 0x40 .. 0x40 0x00)
+        let memory_grow_count = wasm_bytes.windows(2).filter(|w| w == &[0x40, 0x00]).count();
+        let in_loop_grow = wasm_bytes
+            .windows(6)
+            .any(|w| w[0] == 0x03 && w[1] == 0x40 && (w[2..].contains(&0x40)));
+
+        if memory_grow_count > 3 || in_loop_grow {
             suggestions.push(GasGolfingSuggestion {
                 pattern_type: "memory_allocation".to_string(),
-                description: format!("High memory allocation count: {}", alloc_count),
+                description: format!("Repeated memory growth/allocation detected in hot loop (count: {})", memory_grow_count),
                 location: None,
                 severity: "high".to_string(),
                 gas_saved_estimate: Some(1000),
-                suggested_fix: "Reuse memory buffers and minimize allocations in hot paths"
-                    .to_string(),
+                suggested_fix: "Pre-allocate memory buffers before entering loop body to avoid memory.grow overhead".to_string(),
                 code_example: Some(
-                    "Use a pre-allocated buffer instead of creating new vectors in loops"
-                        .to_string(),
+                    "Replace: loop { let mut v = Vec::with_capacity(100); ... }\nWith: let mut v = Vec::with_capacity(100); loop { v.clear(); ... }".to_string()
                 ),
             });
         }
@@ -212,7 +214,7 @@ mod tests {
         // Simple WASM-like bytecode for testing
         let wasm_bytes = vec![
             0x02, 0x40, 0x03, 0x40, // block/loop pattern
-            0x20, 0x00, 0x20, 0x00, // memory ops
+            0x40, 0x00, 0x40, 0x00, // memory grow ops
             0x6D, 0x6E, 0x6D, // divisions
             0x41, 0x02, 0x6C, // multiply by 2
         ];
@@ -223,4 +225,27 @@ mod tests {
         assert_eq!(report.contract_name, "test_contract");
         assert!(report.total_suggestions > 0);
     }
+
+    #[test]
+    fn test_no_false_positive_on_local_get() {
+        let analyzer = GasGolfingAnalyzer::new();
+        // 20 instances of local.get 0 [0x20, 0x00] without memory.grow
+        let mut wasm_bytes = Vec::new();
+        for _ in 0..20 {
+            wasm_bytes.extend_from_slice(&[0x20, 0x00]);
+        }
+
+        let report = analyzer.analyze_wasm(&wasm_bytes, "test_contract");
+        let mem_suggestions: Vec<_> = report
+            .suggestions
+            .into_iter()
+            .filter(|s| s.pattern_type == "memory_allocation")
+            .collect();
+
+        assert!(
+            mem_suggestions.is_empty(),
+            "local.get instructions must not trigger false positive memory allocation warnings"
+        );
+    }
 }
+

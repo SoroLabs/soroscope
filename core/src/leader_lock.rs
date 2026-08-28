@@ -10,7 +10,9 @@
 //! service already connects to for its job queue.
 
 use redis::{AsyncCommands, Client as RedisClient, ExistenceCheck, SetExpiry, SetOptions};
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 const RENEW_SCRIPT: &str = r#"
@@ -35,6 +37,7 @@ pub struct RedisLeaderLock {
     key: String,
     token: String,
     ttl_ms: usize,
+    last_acquired_at: StdMutex<Option<Instant>>,
 }
 
 impl RedisLeaderLock {
@@ -44,6 +47,21 @@ impl RedisLeaderLock {
             key: key.into(),
             token: Uuid::new_v4().to_string(),
             ttl_ms: ttl.as_millis() as usize,
+            last_acquired_at: StdMutex::new(None),
+        }
+    }
+
+    /// Returns the monotonic instant when the lease was last successfully acquired or renewed locally.
+    pub fn last_acquired_instant(&self) -> Option<Instant> {
+        *self.last_acquired_at.lock().unwrap()
+    }
+
+    /// Checks whether the lease is locally considered valid based on the monotonic system clock.
+    pub fn is_lease_locally_valid(&self) -> bool {
+        if let Some(acquired_at) = self.last_acquired_instant() {
+            acquired_at.elapsed() < Duration::from_millis(self.ttl_ms as u64)
+        } else {
+            false
         }
     }
 
@@ -70,6 +88,7 @@ impl RedisLeaderLock {
             .unwrap_or(0);
 
         if renewed == 1 {
+            *self.last_acquired_at.lock().unwrap() = Some(Instant::now());
             return true;
         }
 
@@ -78,9 +97,16 @@ impl RedisLeaderLock {
             .conditional_set(ExistenceCheck::NX)
             .with_expiration(SetExpiry::PX(self.ttl_ms));
 
-        conn.set_options::<_, _, bool>(&self.key, self.token.as_str(), opts)
+        let acquired = conn
+            .set_options::<_, _, bool>(&self.key, self.token.as_str(), opts)
             .await
-            .unwrap_or(false)
+            .unwrap_or(false);
+
+        if acquired {
+            *self.last_acquired_at.lock().unwrap() = Some(Instant::now());
+        }
+
+        acquired
     }
 
     /// Release the lease if still held by this instance. Best-effort — if
@@ -88,6 +114,7 @@ impl RedisLeaderLock {
     /// expires after `ttl` and another instance takes over.
     #[allow(dead_code)]
     pub async fn release(&self) {
+        *self.last_acquired_at.lock().unwrap() = None;
         let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
             return;
         };
@@ -96,5 +123,42 @@ impl RedisLeaderLock {
             .arg(&self.token)
             .invoke_async(&mut conn)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lease_local_validity_and_expiry() {
+        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        let lock = RedisLeaderLock::new(client, "test_key", Duration::from_millis(100));
+
+        assert!(!lock.is_lease_locally_valid());
+        assert!(lock.last_acquired_instant().is_none());
+
+        // Simulate acquisition
+        *lock.last_acquired_at.lock().unwrap() = Some(Instant::now());
+        assert!(lock.is_lease_locally_valid());
+        assert!(lock.last_acquired_instant().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_clock_jump_stability() {
+        tokio::time::pause();
+        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        let lock = RedisLeaderLock::new(client, "test_key", Duration::from_secs(5));
+
+        *lock.last_acquired_at.lock().unwrap() = Some(Instant::now());
+        assert!(lock.is_lease_locally_valid());
+
+        // Advance simulated monotonic time by 2 seconds — should still be valid
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(lock.is_lease_locally_valid());
+
+        // Advance simulated time past TTL — should expire
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(!lock.is_lease_locally_valid());
     }
 }

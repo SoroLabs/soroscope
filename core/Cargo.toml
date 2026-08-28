@@ -3,15 +3,6 @@ name = "soroscope-core"
 version = "0.1.0"
 edition = "2021"
 
-# The root workspace only lists the contract crates as members, so opt out
-# explicitly — without this, cargo refuses to build the package at all.
-[workspace]
-
-[lib]
-name = "soroscope_core"
-path = "src/lib.rs"
-crate-type = ["rlib"]
-
 [dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 # Used directly for the local WASM simulation runner. `testutils` exposes
@@ -38,12 +29,8 @@ opentelemetry = "0.27"
 opentelemetry_sdk = "0.27"
 tracing-opentelemetry = "0.28"
 prometheus = "0.14"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace", "request-id", "set-header"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "compression-full"] }
 tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
-url = "2"
+tower-http = { version = "0.5", features = ["cors", "trace", "request-id", "set-header", "compression-full"] }
 utoipa = { version = "4", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "7", features = ["axum", "vendored"] }
 base64 = "0.22"
@@ -54,7 +41,7 @@ ed25519-dalek = "2"
 rand = "0.8"
 moka = { version = "0.12", features = ["future", "sync"] }
 sled = "0.34"
-sqlx = { version = "0.7", features = ["runtime-tokio", "tls-native-tls", "postgres", "sqlite", "uuid", "chrono", "migrate"] }
+sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "uuid", "chrono", "migrate"] }
 redis = { version = "0.25", features = ["tokio-comp"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -87,4 +74,6 @@ tikv-jemallocator = { version = "0.5", optional = false }
 name = "merkle_bench"
 harness = false
 
+[[bench]]
 name = "memory_bench"
+harness = false
