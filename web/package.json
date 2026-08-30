@@ -7,8 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint . --ext .ts,.tsx,.js,.jsx",
-    "test": "node --test lib/__tests__/*.test.js"
-    "test": "node --test ./lib ./components ./hooks"
+    "test": "node --test"
   },
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "^1.9.5",
