@@ -38,7 +38,7 @@ use reqwest::Client;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
-use sysinfo::{Pid, ProcessExt, System, SystemExt};
+use sysinfo::{Pid, System};
 use tracing::{info, warn};
 
 /// Default alarm threshold, matching the spec from issue #592.

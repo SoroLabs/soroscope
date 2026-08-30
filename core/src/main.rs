@@ -1,11 +1,13 @@
-```rust
-#![allow(dead_code)]
+#![deny(warnings)]
 
 mod auth;
 mod benchmarks;
 mod cache;
 mod call_trace_parser;
 mod comparison;
+mod contract_registry;
+mod cors;
+mod engine;
 mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
@@ -24,6 +26,7 @@ mod rpc_throttle;
 mod runner;
 mod simulation;
 mod simulation_service;
+mod sys_alarms;
 mod task_queue;
 mod trace_propagation;
 mod wasm_branch_analysis;
@@ -64,16 +67,6 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-// CLI Argument Handling
-use crate::fee_analytics::{FeeAnalyticsEngine, MarketConditions, ModelBreakdown};
-use crate::fee_collector::{FeeCollector, FeeCollectorConfig};
-use crate::fee_store::FeeStore;
-use crate::gas_golfing::{GasGolfingAnalyzer, GasGolfingReport};
-use crate::insights::InsightsEngine;
-use crate::jobs::{JobQueue, JobQueueConfig, JobWorker};
-use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
-use crate::simulation::{SimulationEngine, SimulationMode, SimulationResult};
-use crate::ws::SimulationBus;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -3186,6 +3179,4 @@ async fn analyze_simulation(
 ) -> Result<Json<AnalysisResult>, AppError> {
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))
-}
-
-```
+}
