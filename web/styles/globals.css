@@ -2,6 +2,40 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --bg-page: #f6f8fa;
+  --bg-card: #ffffff;
+  --bg-elevated: #f6f8fa;
+  --bg-input: #ffffff;
+  --bg-header: rgba(255, 255, 255, 0.9);
+  --text-primary: #1f2328;
+  --text-secondary: #656d76;
+  --text-muted: #8b949e;
+  --border-default: #d0d7de;
+  --border-subtle: #e1e4e8;
+  --tab-inactive: #656d76;
+  --tab-hover: #1f2328;
+  --skeleton: #e1e4e8;
+}
+
+.dark {
+  --bg-page: #0d1117;
+  --bg-card: #161b22;
+  --bg-elevated: #0d1117;
+  --bg-input: #0d1117;
+  --bg-header: rgba(13, 17, 23, 0.9);
+  --text-primary: #c9d1d9;
+  --text-secondary: #8b949e;
+  --text-muted: #6e7681;
+  --border-default: #30363d;
+  --border-subtle: #21262d;
+  --tab-inactive: #8b949e;
+  --tab-hover: #c9d1d9;
+  --skeleton: #30363d;
+}
+
 body {
-  @apply bg-slate-950 text-slate-100;
+  background-color: var(--bg-page);
+  color: var(--text-primary);
+  transition: background-color 0.2s ease, color 0.2s ease;
 }

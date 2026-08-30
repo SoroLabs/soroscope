@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import type { InvocationResult } from '../lib/sorobantypes';
+import { getEncryptedLocalStorage } from '../lib/encryptedStorage';
 
 interface InvocationHistoryProps {
   onSelectResult: (result: InvocationResult) => void;
@@ -16,21 +17,36 @@ export function useInvocationHistory() {
 
   useEffect(() => {
     setMounted(true);
-    const saved = localStorage.getItem(HISTORY_KEY);
-    if (saved) {
+    let active = true;
+
+    async function restoreHistory() {
       try {
-        setHistory(JSON.parse(saved));
+        const saved = await getEncryptedLocalStorage()?.getItem(HISTORY_KEY);
+        if (active && saved) {
+          setHistory(JSON.parse(saved));
+        }
       } catch {
-        setHistory([]);
+        if (active) {
+          setHistory([]);
+        }
       }
     }
+
+    void restoreHistory();
+    return () => {
+      active = false;
+    };
   }, []);
 
   const addToHistory = (result: InvocationResult) => {
     setHistory((prev) => {
       const updated = [result, ...prev].slice(0, MAX_HISTORY);
       if (mounted) {
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(updated));
+        void getEncryptedLocalStorage()
+          ?.setItem(HISTORY_KEY, JSON.stringify(updated))
+          .catch((error: unknown) => {
+            console.warn('Failed to save invocation history:', error);
+          });
       }
       return updated;
     });
@@ -39,7 +55,7 @@ export function useInvocationHistory() {
   const clearHistory = () => {
     setHistory([]);
     if (mounted) {
-      localStorage.removeItem(HISTORY_KEY);
+      getEncryptedLocalStorage()?.removeItem(HISTORY_KEY);
     }
   };
 
@@ -54,11 +70,11 @@ export function InvocationHistory({ onSelectResult }: InvocationHistoryProps) {
       <div
         style={{
           padding: '24px',
-          backgroundColor: '#0d1117',
+          backgroundColor: 'var(--bg-elevated)',
           borderRadius: '8px',
           textAlign: 'center',
-          color: '#8b949e',
-          border: '1px solid #30363d',
+          color: 'var(--text-secondary)',
+          border: '1px solid var(--border-default)',
         }}
       >
         <p>No invocation history yet.</p>
@@ -76,19 +92,19 @@ export function InvocationHistory({ onSelectResult }: InvocationHistoryProps) {
           marginBottom: '12px',
         }}
       >
-        <h3 style={{ margin: '0', fontSize: '16px', fontWeight: '600', color: '#c9d1d9' }}>
+        <h3 style={{ margin: '0', fontSize: '16px', fontWeight: '600', color: 'var(--text-primary)' }}>
           Recent Invocations
         </h3>
         <button
           onClick={clearHistory}
           style={{
             padding: '6px 12px',
-            backgroundColor: '#161b22',
-            border: '1px solid #30363d',
+            backgroundColor: 'var(--bg-card)',
+            border: '1px solid var(--border-default)',
             borderRadius: '6px',
             fontSize: '12px',
             cursor: 'pointer',
-            color: '#8b949e',
+            color: 'var(--text-secondary)',
           }}
         >
           Clear History
@@ -102,8 +118,8 @@ export function InvocationHistory({ onSelectResult }: InvocationHistoryProps) {
             onClick={() => onSelectResult(item)}
             style={{
               padding: '12px',
-              backgroundColor: '#0d1117',
-              border: '1px solid #30363d',
+              backgroundColor: 'var(--bg-elevated)',
+              border: '1px solid var(--border-default)',
               borderRadius: '6px',
               textAlign: 'left',
               cursor: 'pointer',
@@ -126,7 +142,7 @@ export function InvocationHistory({ onSelectResult }: InvocationHistoryProps) {
               }}
             >
               <div>
-                <p style={{ margin: '0 0 4px 0', fontSize: '14px', fontWeight: '500', color: '#c9d1d9' }}>
+                <p style={{ margin: '0 0 4px 0', fontSize: '14px', fontWeight: '500', color: 'var(--text-primary)' }}>
                   <span
                     style={{
                       color: item.success ? '#00d9ff' : '#fb8500',
@@ -137,11 +153,11 @@ export function InvocationHistory({ onSelectResult }: InvocationHistoryProps) {
                   </span>
                   {item.functionName}
                 </p>
-                <p style={{ margin: '0', fontSize: '12px', color: '#8b949e' }}>
+                <p style={{ margin: '0', fontSize: '12px', color: 'var(--text-secondary)' }}>
                   {new Date(item.timestamp).toLocaleTimeString()}
                 </p>
               </div>
-              <div style={{ textAlign: 'right', fontSize: '12px', color: '#8b949e' }}>
+              <div style={{ textAlign: 'right', fontSize: '12px', color: 'var(--text-secondary)' }}>
                 {item.error ? (
                   <span style={{ color: '#fb8500' }}>Error</span>
                 ) : (

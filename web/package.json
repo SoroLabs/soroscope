@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint . --ext .ts,.tsx,.js,.jsx"
+    "lint": "eslint . --ext .ts,.tsx,.js,.jsx",
+    "test": "node --test lib/__tests__/*.test.js"
+    "test": "node --test ./lib ./components ./hooks"
   },
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "^1.9.5",
@@ -15,10 +17,14 @@
     "lucide-react": "^0.562.0",
     "mermaid": "^11.14.0",
     "next": "^16.1.6",
+    "next-themes": "^0.4.6",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-dropzone": "^15.0.0",
-    "tailwind-merge": "^3.4.0"
+    "reactflow": "^11.11.4",
+    "recharts": "^2.15.1",
+    "tailwind-merge": "^3.4.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.3",

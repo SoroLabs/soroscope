@@ -1,0 +1,16 @@
+[package]
+name = "liquidity_pool"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = "22.0.0"
+emergency_guard = { path = "../emergency_guard", default-features = false }
+
+[dev-dependencies]
+soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+emergency_guard = { path = "../emergency_guard", default-features = false }
+proptest = "1.0"

@@ -1,0 +1,60 @@
+[package]
+name = "soroscope-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "soroscope_core"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+# Used directly for the local WASM simulation runner. `testutils` exposes
+# the test Host + budget controls we need for in-process contract invocation.
+# Version aligned with the soroban-sdk 22 workspace pin.
+soroban-env-host = { version = "22", features = ["testutils"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+rusqlite = { version = "0.29", features = ["bundled"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "0.10"
+thiserror = "1.0"
+dotenvy = "0.15"
+config = "0.14"
+axum = { version = "0.7", features = ["multipart", "ws"] }
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prometheus = "0.14"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+utoipa = { version = "4", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "7", features = ["axum", "vendored"] }
+base64 = "0.22"
+hex = "0.4"
+stellar-strkey = "0.0.9"
+jsonwebtoken = "9"
+ed25519-dalek = "2"
+rand = "0.8"
+moka = { version = "0.12", features = ["future"] }
+sled = "0.34"
+sqlx = { version = "0.7", features = ["runtime-tokio", "tls-native-tls", "postgres", "sqlite", "uuid", "chrono", "migrate"] }
+redis = { version = "0.25", features = ["tokio-comp"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+rsa = "0.9"
+wasm-encoder = { version = "0.240", features = ["wasmparser"] }
+wasmparser = "0.240"
+rayon = "1.8"
+
+[dev-dependencies]
+proptest = "1.4.0"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "merkle_bench"
+harness = false

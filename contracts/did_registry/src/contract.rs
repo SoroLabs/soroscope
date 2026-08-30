@@ -1,13 +1,19 @@
 use crate::storage_types::{
-    Attestation, Claim, DIDDocument, Service, VerificationMethod, ATTESTATIONS, CLAIMS, DID_INDEX,
-    DID_DOCUMENT, OWNER,
+    Attestation, Claim, DIDDocument, DIDMetadata, DIDUpdated, Service, VerificationMethod,
+    ATTESTATIONS, CLAIMS, DID_DOCUMENT, DID_INDEX, DID_METADATA, OWNER,
 };
-use soroban_sdk::{contract, contractimpl, Address, Bytes, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, Address, Bytes, Env, String, Symbol, Vec};
 
 pub trait DIDRegistryTrait {
     fn initialize(e: Env, owner: Address);
 
-    fn register_did(e: Env, did: String, document: DIDDocument);
+    fn register_did(e: Env, did: String, document: DIDDocument, expiration_timestamp: Option<u64>);
+
+    fn revoke_did(e: Env, did: String);
+
+    fn set_expiration(e: Env, did: String, expiration_timestamp: Option<u64>);
+
+    fn is_did_valid(e: Env, did: String) -> bool;
 
     fn update_did_document(e: Env, did: String, document: DIDDocument);
 
@@ -52,6 +58,28 @@ impl DIDRegistry {
         owner.require_auth();
     }
 
+    fn validate_did_uri(e: &Env, did: &String) {
+        if did.len() < 4 {
+            panic!("invalid DID URI format");
+        }
+        let mut buf = [0u8; 4];
+        did.copy_into_slice(&mut buf[..4]);
+        if &buf != b"did:" {
+            panic!("invalid DID URI format");
+        }
+    }
+
+    fn emit_did_updated(e: &Env, did: &String, action: &str) {
+        e.events().publish(
+            (Symbol::new(e, "did_updated"), did.clone()),
+            DIDUpdated {
+                did: did.clone(),
+                action: String::from_str(e, action),
+                timestamp: e.ledger().timestamp(),
+            },
+        );
+    }
+
     fn append_did_index(e: &Env, did: &String) {
         let mut dids: Vec<String> = e.storage().persistent().get(&DID_INDEX).unwrap_or(Vec::new(&e));
         let mut i = 0;
@@ -88,6 +116,29 @@ impl DIDRegistry {
         }
         false
     }
+
+    fn _is_did_valid(e: &Env, did: String) -> bool {
+        let key = (DID_DOCUMENT, did.clone());
+        if !e.storage().persistent().has(&key) {
+            return false;
+        }
+
+        let metadata_key = (DID_METADATA, did.clone());
+        let metadata: DIDMetadata = e.storage().persistent().get(&metadata_key).unwrap();
+
+        if metadata.revocation_bitmap != 0 {
+            return false;
+        }
+
+        if let Some(expiration) = metadata.expiration_timestamp {
+            let current_ledger_time = e.ledger().timestamp();
+            if current_ledger_time >= expiration {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 #[contractimpl]
@@ -100,16 +151,59 @@ impl DIDRegistryTrait for DIDRegistry {
         e.storage().persistent().set(&DID_INDEX, &Vec::new(&e));
     }
 
-    fn register_did(e: Env, did: String, document: DIDDocument) {
+    fn register_did(e: Env, did: String, document: DIDDocument, expiration_timestamp: Option<u64>) {
         Self::require_owner_auth(&e);
+        Self::validate_did_uri(&e, &did);
 
         let key = (DID_DOCUMENT, did.clone());
         if e.storage().persistent().has(&key) {
             panic!("DID already registered");
         }
 
+        let metadata = DIDMetadata {
+            expiration_timestamp,
+            revocation_bitmap: 0,
+        };
+        let metadata_key = (DID_METADATA, did.clone());
+
         e.storage().persistent().set(&key, &document);
+        e.storage().persistent().set(&metadata_key, &metadata);
         Self::append_did_index(&e, &did);
+        Self::emit_did_updated(&e, &did, "register");
+    }
+
+    fn revoke_did(e: Env, did: String) {
+        Self::require_owner_auth(&e);
+
+        let key = (DID_DOCUMENT, did.clone());
+        if !e.storage().persistent().has(&key) {
+            panic!("DID not found");
+        }
+
+        let metadata_key = (DID_METADATA, did.clone());
+        let mut metadata: DIDMetadata = e.storage().persistent().get(&metadata_key).unwrap();
+        metadata.revocation_bitmap = 1;
+        e.storage().persistent().set(&metadata_key, &metadata);
+        Self::emit_did_updated(&e, &did, "revoke");
+    }
+
+    fn set_expiration(e: Env, did: String, expiration_timestamp: Option<u64>) {
+        Self::require_owner_auth(&e);
+
+        let key = (DID_DOCUMENT, did.clone());
+        if !e.storage().persistent().has(&key) {
+            panic!("DID not found");
+        }
+
+        let metadata_key = (DID_METADATA, did.clone());
+        let mut metadata: DIDMetadata = e.storage().persistent().get(&metadata_key).unwrap();
+        metadata.expiration_timestamp = expiration_timestamp;
+        e.storage().persistent().set(&metadata_key, &metadata);
+        Self::emit_did_updated(&e, &did, "set_expiration");
+    }
+
+    fn is_did_valid(e: Env, did: String) -> bool {
+        Self::_is_did_valid(&e, did)
     }
 
     fn update_did_document(e: Env, did: String, document: DIDDocument) {
@@ -121,6 +215,7 @@ impl DIDRegistryTrait for DIDRegistry {
         }
 
         e.storage().persistent().set(&key, &document);
+        Self::emit_did_updated(&e, &did, "update");
     }
 
     fn add_verification_method(e: Env, did: String, method: VerificationMethod) {
@@ -130,6 +225,7 @@ impl DIDRegistryTrait for DIDRegistry {
         let mut document: DIDDocument = e.storage().persistent().get(&key).unwrap();
         document.verification_method.push_back(method);
         e.storage().persistent().set(&key, &document);
+        Self::emit_did_updated(&e, &did, "add_verification_method");
     }
 
     fn remove_verification_method(e: Env, did: String, method_id: String) {
@@ -153,6 +249,7 @@ impl DIDRegistryTrait for DIDRegistry {
         }
 
         e.storage().persistent().set(&key, &document);
+        Self::emit_did_updated(&e, &did, "remove_verification_method");
     }
 
     fn rotate_verification_method(
@@ -184,6 +281,7 @@ impl DIDRegistryTrait for DIDRegistry {
         }
 
         e.storage().persistent().set(&key, &document);
+        Self::emit_did_updated(&e, &did, "rotate_verification_method");
     }
 
     fn add_service(e: Env, did: String, service: Service) {
@@ -244,6 +342,10 @@ impl DIDRegistryTrait for DIDRegistry {
     }
 
     fn get_did_document(e: Env, did: String) -> DIDDocument {
+        if !Self::_is_did_valid(&e, did.clone()) {
+            panic!("DID is invalid (expired or revoked)");
+        }
+
         let key = (DID_DOCUMENT, did.clone());
         e.storage().persistent().get(&key).unwrap()
     }

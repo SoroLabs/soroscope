@@ -2,15 +2,19 @@
 extern crate std;
 use super::*;
 
-use soroban_sdk::{testutils::Address as _, Env};
+use soroban_sdk::{
+    testutils::Address as _,
+    Address, BytesN, Env, IntoVal,
+};
 
-// Import the Liquidity Pool WASM for integration testing.
-// This requires running `cargo build --target wasm32-unknown-unknown --release`
-// before `cargo test` so the .wasm artifact exists on disk.
-mod liquidity_pool_contract {
+mod liquidity_pool {
     soroban_sdk::contractimport!(
-        file = "../../target/wasm32-unknown-unknown/release/liquidity_pool.wasm"
+        file = "../../target/wasm32v1-none/release/liquidity_pool.wasm"
     );
+}
+
+fn pool_wasm_hash(env: &Env) -> BytesN<32> {
+    env.deployer().upload_contract_wasm(liquidity_pool::WASM)
 }
 
 #[test]
@@ -35,46 +39,44 @@ fn test_initialization() {
 }
 
 #[test]
-fn test_pool_creation() {
+fn test_pause_create_pair() {
     let env = Env::default();
     env.mock_all_auths();
 
     let factory_id = env.register(LiquidityPoolFactory, ());
     let factory_client = LiquidityPoolFactoryClient::new(&env, &factory_id);
 
-    // Setup Tokens
-    let token_admin = Address::generate(&env);
+    let admin = Address::generate(&env);
     let token_a = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
+        .register_stellar_asset_contract_v2(admin.clone())
         .address();
     let token_b = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
+        .register_stellar_asset_contract_v2(admin.clone())
         .address();
 
-    // Upload the Liquidity Pool WASM and get its hash
-    let pool_hash = env
-        .deployer()
-        .upload_contract_wasm(liquidity_pool_contract::WASM);
+    let pool_hash = pool_wasm_hash(&env);
 
-    // Note: Due to a testutils handle mapping bug in the Soroban SDK mock environment,
-    // returning a newly deployed address from a native contract call corrupts the handle
-    // mapping in the Rust test space. Any `Address` representing the new pool will evaluate
-    // to the `factory_id` in Rust. However, the host engine state is correct.
-    // Therefore, we only assert that a value is returned and stored, bypassing strict equality.
-    let _pool_address = factory_client.create_pair(&token_a, &token_b, &pool_hash);
+    factory_client.initialize(&admin);
 
-    // Verify the pair is stored and retrievable
-    let stored_pair = factory_client.get_pair(&token_a, &token_b);
-    assert!(stored_pair.is_some());
+    const PAUSE_CREATE_PAIR_FLAG: u32 = 1 << 6;
 
-    // Reversed order should also resolve to the same pool (canonical ordering)
-    let stored_pair_rev = factory_client.get_pair(&token_b, &token_a);
-    assert!(stored_pair_rev.is_some());
+    // Pause create_pair operation
+    factory_client.set_guard_pause(&admin, &PAUSE_CREATE_PAIR_FLAG, &true);
+
+    // Attempt to create a pair while paused should fail
+    let result = factory_client.try_create_pair(&token_a, &token_b, &pool_hash);
+    assert_eq!(result, Err(Ok(Error::Paused)));
+
+    // Unpause create_pair operation
+    factory_client.set_guard_pause(&admin, &PAUSE_CREATE_PAIR_FLAG, &false);
+
+    // Pair creation should now succeed
+    let created = factory_client.create_pair(&token_a, &token_b, &pool_hash);
+    assert!(created != factory_id);
 }
 
 #[test]
-#[should_panic(expected = "Pair already exists")]
-fn test_duplicate_pair_panics() {
+fn test_duplicate_pair_errors() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -89,13 +91,45 @@ fn test_duplicate_pair_panics() {
         .register_stellar_asset_contract_v2(token_admin.clone())
         .address();
 
-    let pool_hash = env
-        .deployer()
-        .upload_contract_wasm(liquidity_pool_contract::WASM);
+    let pool_hash = pool_wasm_hash(&env);
 
     // First creation succeeds
     factory_client.create_pair(&token_a, &token_b, &pool_hash);
 
-    // Second creation with the same pair should panic
-    factory_client.create_pair(&token_a, &token_b, &pool_hash);
+    // Second creation with the same pair should return a pair-exists error
+    let result = factory_client.try_create_pair(&token_a, &token_b, &pool_hash);
+    assert_eq!(result, Err(Ok(Error::PairAlreadyExists)));
+}
+
+#[test]
+fn test_multisig_admin_management() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory_id = env.register(LiquidityPoolFactory, ());
+    let factory_client = LiquidityPoolFactoryClient::new(&env, &factory_id);
+
+    let admin1 = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    let admin3 = Address::generate(&env);
+
+    let admins = soroban_sdk::vec![&env, admin1.clone(), admin2.clone()];
+    factory_client.initialize_guard(&admins, &2);
+
+    // Verify initial setup
+    let config = factory_client.get_multisig_config();
+    assert_eq!(config.admins.len(), 2);
+    assert_eq!(config.threshold, 2);
+
+    // Add admin3 using multi-sig approval
+    let approvers = soroban_sdk::vec![&env, admin1.clone(), admin2.clone()];
+    factory_client.add_guard_admin(&approvers, &admin3);
+
+    assert!(factory_client.is_admin(&admin3));
+    assert_eq!(factory_client.get_admins().len(), 3);
+
+    // Remove admin3
+    factory_client.remove_guard_admin(&approvers, &admin3);
+    assert!(!factory_client.is_admin(&admin3));
+    assert_eq!(factory_client.get_admins().len(), 2);
 }

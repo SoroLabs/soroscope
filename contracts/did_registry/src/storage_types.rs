@@ -49,8 +49,24 @@ pub struct Attestation {
     pub timestamp: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DIDMetadata {
+    pub expiration_timestamp: Option<u64>,
+    pub revocation_bitmap: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DIDUpdated {
+    pub did: String,
+    pub action: String,
+    pub timestamp: u64,
+}
+
 // Storage keys
 pub const DID_DOCUMENT: Symbol = Symbol::short("DID_DOC");
+pub const DID_METADATA: Symbol = Symbol::short("DID_META");
 pub const DID_INDEX: Symbol = Symbol::short("DID_IDX");
 pub const CLAIMS: Symbol = Symbol::short("CLAIMS");
 pub const ATTESTATIONS: Symbol = Symbol::short("ATTEST");

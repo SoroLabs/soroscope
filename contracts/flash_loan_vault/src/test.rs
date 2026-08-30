@@ -1,8 +1,5 @@
 use super::*;
-use soroban_sdk::{
-    contract, contractimpl, contracttype, testutils::Address as _, Address, Env,
-    String as SorobanString,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, testutils::Address as _, Address, Env};
 
 // ── Mock receivers ───────────────────────────────────────────────────────────
 
@@ -207,6 +204,21 @@ pub mod reentrant {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub mod non_compliant {
+    use super::*;
+    /// A contract that does NOT implement the FlashLoanReceiver interface.
+    #[contract]
+    pub struct NonCompliantReceiver;
+
+    #[contractimpl]
+    impl NonCompliantReceiver {
+        /// Intentionally does not implement execute_operation.
+        pub fn dummy(_e: Env) {}
+    }
+}
+
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
 struct TestSetup {
@@ -338,6 +350,63 @@ fn test_set_fee_invalid() {
     s.vault_client.set_fee(&101); // Over MAX_FEE_BPS
 }
 
+// ── Granular borrow pause (Issue #320) ───────────────────────────────────────
+
+#[test]
+fn test_borrow_pause_blocks_flash_loan_and_borrow_and_resume_allows() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    let initiator = Address::generate(&s.e);
+    let receiver_id = s.e.register(good::GoodReceiver, ());
+    let receiver = good::GoodReceiverClient::new(&s.e, &receiver_id);
+    receiver.set_vault(&s.vault_id);
+
+    assert_eq!(s.vault_client.get_borrow_paused(), false);
+    s.vault_client.pause_borrow();
+    assert_eq!(s.vault_client.get_borrow_paused(), true);
+
+    // While paused, flash-loan style borrows must fail with BorrowPaused.
+    let flash_loan_res = s
+        .vault_client
+        .try_flash_loan(&initiator, &receiver_id, &5_000);
+    assert_eq!(flash_loan_res, Err(Ok(Error::BorrowPaused)));
+    // While paused, borrowing must fail with BorrowPaused.
+    let res = s
+        .vault_client
+        .try_flash_loan(&initiator, &receiver_id, &5_000);
+    assert_eq!(res, Err(Ok(Error::BorrowPaused)));
+
+    let borrow_res = s.vault_client.try_borrow(&receiver_id, &5_000);
+    assert_eq!(borrow_res, Err(Ok(Error::BorrowPaused)));
+
+    // Resume and both borrowing entrypoints work again.
+    s.vault_client.resume_borrow();
+    assert_eq!(s.vault_client.get_borrow_paused(), false);
+
+    let flash_loan_fee = s.vault_client.flash_loan(&initiator, &receiver_id, &5_000);
+    assert_eq!(flash_loan_fee, 0);
+
+    let borrow_fee = s.vault_client.borrow(&receiver_id, &5_000);
+    assert_eq!(borrow_fee, 0);
+}
+
+#[test]
+fn test_borrow_pause_does_not_affect_deposit_withdraw() {
+    let s = setup();
+
+    s.vault_client.pause_borrow();
+
+    // Deposit/withdraw should still function normally.
+    s.token_admin.mint(&s.admin, &3_000);
+    s.vault_client.deposit(&s.admin, &3_000);
+    assert_eq!(s.vault_client.get_available(), 3_000);
+
+    s.vault_client.withdraw(&s.admin, &1_000);
+    assert_eq!(s.vault_client.get_available(), 2_000);
+    assert_eq!(s.token_client.balance(&s.admin), 1_000);
+}
+
 // ── Flash loan: success ──────────────────────────────────────────────────────
 
 #[test]
@@ -442,6 +511,46 @@ fn test_flash_loan_borrow_entire_vault() {
 // }
 
 #[test]
+fn test_flash_loan_no_repay_returns_error() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    let receiver_id = s.e.register(BadReceiver, ());
+    let initiator = Address::generate(&s.e);
+
+    let result = s
+        .vault_client
+        .try_flash_loan(&initiator, &receiver_id, &5_000);
+
+    assert_eq!(result, Err(Ok(Error::LoanNotRepaid)));
+    assert_eq!(s.vault_client.get_available(), 10_000);
+    assert_eq!(s.token_client.balance(&receiver_id), 0);
+}
+
+#[test]
+fn test_flash_loan_partial_repay_returns_error() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    // Set fee so partial repay (principal only) is insufficient.
+    s.vault_client.set_fee(&100);
+
+    let receiver_id = s.e.register(partial::PartialReceiver, ());
+    let receiver_client = partial::PartialReceiverClient::new(&s.e, &receiver_id);
+    receiver_client.set_vault(&s.vault_id);
+
+    let initiator = Address::generate(&s.e);
+
+    let result = s
+        .vault_client
+        .try_flash_loan(&initiator, &receiver_id, &5_000);
+
+    assert_eq!(result, Err(Ok(Error::LoanNotRepaid)));
+    assert_eq!(s.vault_client.get_available(), 10_000);
+    assert_eq!(s.vault_client.get_total_deposited(), 10_000);
+}
+
+#[test]
 fn test_flash_loan_overpay() {
     let s = setup();
     fund_vault(&s, 10_000);
@@ -465,7 +574,7 @@ fn test_flash_loan_overpay() {
 // ── Flash loan: reentrancy ───────────────────────────────────────────────────
 
 #[test]
-#[should_panic(expected = "Error(Contract, #4)")]
+#[should_panic(expected = "Contract re-entry is not allowed")]
 fn test_reentrancy_guard() {
     let s = setup();
     fund_vault(&s, 10_000);
@@ -479,6 +588,44 @@ fn test_reentrancy_guard() {
     // Reentrant receiver tries to call flash_loan again during callback.
     // Should fail with Reentrancy error.
     s.vault_client.flash_loan(&initiator, &receiver_id, &5_000);
+}
+
+#[test]
+fn test_mutations_reject_while_flash_loan_active() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    s.e.as_contract(&s.vault_id, || {
+        set_flash_loan_active(&s.e, true);
+    });
+
+    assert_eq!(
+        s.vault_client.try_deposit(&s.admin, &1),
+        Err(Ok(Error::Reentrancy))
+    );
+    assert_eq!(
+        s.vault_client.try_withdraw(&s.admin, &1),
+        Err(Ok(Error::Reentrancy))
+    );
+    assert_eq!(s.vault_client.try_set_fee(&25), Err(Ok(Error::Reentrancy)));
+    assert_eq!(
+        s.vault_client.try_set_paused(&s.admin, &true),
+        Err(Ok(Error::Reentrancy))
+    );
+    assert_eq!(
+        s.vault_client
+            .try_emergency_pause(&soroban_sdk::vec![&s.e, s.admin.clone()]),
+        Err(Ok(Error::Reentrancy))
+    );
+
+    s.e.as_contract(&s.vault_id, || {
+        set_flash_loan_active(&s.e, false);
+    });
+
+    assert_eq!(s.vault_client.get_fee(), 0);
+    assert_eq!(s.vault_client.get_available(), 10_000);
+    assert_eq!(s.vault_client.get_total_deposited(), 10_000);
+    assert_eq!(s.token_client.balance(&s.admin), 0);
 }
 
 // ── Flash loan: edge cases ───────────────────────────────────────────────────
@@ -571,6 +718,48 @@ fn test_sequential_flash_loans_with_fee() {
     assert_eq!(s.vault_client.get_available(), 10_045);
 }
 
+// ── Borrow (alias) tests ───────────────────────────────────────────────────
+
+#[test]
+fn test_borrow_success_zero_fee() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    // Deploy good receiver and have it repay to the vault.
+    let receiver_id = s.e.register(good::GoodReceiver, ());
+    let receiver_client = good::GoodReceiverClient::new(&s.e, &receiver_id);
+    receiver_client.set_vault(&s.vault_id);
+
+    // Borrow 5_000 with 0 fee.
+    let fee = s.vault_client.borrow(&receiver_id, &5_000);
+    assert_eq!(fee, 0);
+    assert_eq!(s.vault_client.get_available(), 10_000);
+}
+
+#[test]
+fn test_borrow_with_fee() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    // Set 1% fee (100 bps).
+    s.vault_client.set_fee(&100);
+
+    // Deploy good receiver and pre-fund it with extra tokens for the fee.
+    let receiver_id = s.e.register(good::GoodReceiver, ());
+    let receiver_client = good::GoodReceiverClient::new(&s.e, &receiver_id);
+    receiver_client.set_vault(&s.vault_id);
+
+    // Pre-fund receiver with enough for the fee: 5000 * 100 / 10000 = 50.
+    s.token_admin.mint(&receiver_id, &50);
+
+    let fee = s.vault_client.borrow(&receiver_id, &5_000);
+    assert_eq!(fee, 50);
+
+    // Vault should now have 10_000 + 50 = 10_050.
+    assert_eq!(s.vault_client.get_available(), 10_050);
+    assert_eq!(s.vault_client.get_total_deposited(), 10_050);
+}
+
 // ── View functions ───────────────────────────────────────────────────────────
 
 #[test]
@@ -584,4 +773,54 @@ fn test_get_available_after_deposit() {
     let s = setup();
     fund_vault(&s, 5_000);
     assert_eq!(s.vault_client.get_available(), 5_000);
+}
+
+// ── Flash loan: interface verification ──────────────────────────────────────
+
+#[test]
+fn test_flash_loan_non_compliant_receiver_returns_error() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    let receiver_id = s.e.register(non_compliant::NonCompliantReceiver, ());
+    let initiator = Address::generate(&s.e);
+
+    let result = s
+        .vault_client
+        .try_flash_loan(&initiator, &receiver_id, &5_000);
+
+    assert!(result.is_err());
+    // Vault funds should remain intact.
+    assert_eq!(s.vault_client.get_available(), 10_000);
+    assert_eq!(s.token_client.balance(&receiver_id), 0);
+}
+
+fn test_borrow_non_compliant_receiver_returns_error() {
+
+
+    let result = s.vault_client.try_borrow(&receiver_id, &5_000);
+
+fn test_flash_loan_small_amount_fee_evasion_prevention() {
+
+    // Set 50 bps fee (0.5%).
+    s.vault_client.set_fee(&50);
+
+    let receiver_id = s.e.register(good::GoodReceiver, ());
+    let receiver_client = good::GoodReceiverClient::new(&s.e, &receiver_id);
+    receiver_client.set_vault(&s.vault_id);
+
+    // Pre-fund receiver with fee.
+    s.token_admin.mint(&receiver_id, &5);
+
+
+    // Borrow small amount (100 units). Without ceiling division, 100 * 50 / 10000 = 0.
+    // With ceiling division, (100 * 50 + 9999) / 10000 = 1.
+    let fee = s.vault_client.flash_loan(&initiator, &receiver_id, &100);
+    assert_eq!(fee, 1);
+
+fn test_borrow_repayment_failure_returns_error() {
+
+    let receiver_id = s.e.register(BadReceiver, ());
+
+    assert_eq!(result, Err(Ok(Error::LoanNotRepaid)));
 }

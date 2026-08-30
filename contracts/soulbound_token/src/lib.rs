@@ -9,5 +9,6 @@ mod storage_types;
 #[cfg(test)]
 mod test;
 
+pub use crate::contract::Error;
 pub use crate::contract::SoulboundToken;
 pub use crate::contract::SoulboundTokenClient;

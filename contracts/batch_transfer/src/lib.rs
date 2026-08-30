@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
 
 #[cfg(test)]
 mod test;
@@ -13,7 +13,13 @@ pub enum Error {
     LengthMismatch = 2,
     InvalidAmount = 3,
     InsufficientBalance = 4,
+    TooManyRecipients = 5,
 }
+
+/// Upper bound on recipients per batch. Oversized recipient vectors are
+/// rejected before any iteration so a caller cannot exhaust the
+/// transaction's CPU instruction budget by passing an unbounded batch.
+const MAX_RECIPIENTS: u32 = 100;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,24 +45,25 @@ pub struct TransferResult {
     pub failure: TransferFailure,
 }
 
+#[soroban_sdk::contractclient(name = "BatchTokenClient")]
 pub trait BatchToken {
     fn balance(e: Env, id: Address) -> i128;
     fn transfer(e: Env, from: Address, to: Address, amount: i128);
 }
-
-soroban_sdk::contractclient!(name = "BatchTokenClient", trait = BatchToken);
 
 fn validate_lengths(recipients: &Vec<Address>, amounts: &Vec<i128>) -> Result<u32, Error> {
     let len = recipients.len();
     if len == 0 {
         return Err(Error::EmptyBatch);
     }
+    if len > MAX_RECIPIENTS {
+        return Err(Error::TooManyRecipients);
+    }
     if len != amounts.len() {
         return Err(Error::LengthMismatch);
     }
     Ok(len)
 }
-
 fn simulate_batch(
     env: &Env,
     token: &Address,
@@ -70,11 +77,14 @@ fn simulate_batch(
     let mut remaining_balance = token_client.balance(sender);
     let mut results = Vec::new(env);
 
+    let zero_address_g = Address::from_string(&String::from_str(env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"));
+    let zero_address_c = Address::from_string(&String::from_str(env, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABU"));
+
     for i in 0..len {
         let recipient = recipients.get(i).unwrap();
         let amount = amounts.get(i).unwrap();
 
-        if amount <= 0 {
+        if amount <= 0 || recipient == zero_address_g || recipient == zero_address_c {
             if matches!(mode, ExecutionMode::AllOrNothing) {
                 return Err(Error::InvalidAmount);
             }

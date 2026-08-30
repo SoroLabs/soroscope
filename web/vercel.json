@@ -1,0 +1,10 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "yarn build",
+  "outputDirectory": ".next",
+  "installCommand": "yarn install",
+  "devCommand": "yarn dev",
+  "env": {
+    "NEXT_TELEMETRY_DISABLED": "1"
+  }
+}

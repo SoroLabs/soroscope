@@ -1,5 +1,5 @@
-use crate::admin::{read_administrator, read_config, write_administrator, write_config};
-use crate::proposal::{cancel_proposal, create_proposal, execute_proposal, queue_proposal, read_proposal, start_voting};
+use crate::admin::{get_security_council, read_administrator, read_config, set_security_council, write_administrator, write_config};
+use crate::proposal::{cancel_proposal, create_proposal, execute_proposal, queue_proposal, read_proposal, start_voting, veto_proposal};
 use crate::storage_types::{GovernanceConfig, Proposal, ProposalAction, ProposalState};
 use crate::voting::{delegate_voting_power, get_effective_voting_power, read_voting_power, vote, write_voting_power};
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
@@ -12,6 +12,7 @@ pub trait GovernanceTrait {
     fn set_admin(e: Env, new_admin: Address);
     fn set_voting_power(e: Env, user: Address, power: i128);
     fn cancel_proposal_admin(e: Env, proposal_id: u32);
+    fn set_security_council(e: Env, security_council: Address);
 
     // Proposal lifecycle
     fn create_proposal(e: Env, title: String, description: String, actions: Vec<ProposalAction>) -> u32;
@@ -19,6 +20,7 @@ pub trait GovernanceTrait {
     fn cast_vote(e: Env, proposal_id: u32, support: bool);
     fn queue_proposal(e: Env, proposal_id: u32);
     fn execute_proposal(e: Env, proposal_id: u32);
+    fn veto_proposal(e: Env, proposal_id: u32);
 
     // Delegation
     fn delegate(e: Env, delegate: Address);
@@ -28,6 +30,7 @@ pub trait GovernanceTrait {
     fn get_voting_power(e: Env, user: Address) -> i128;
     fn get_effective_voting_power(e: Env, user: Address) -> i128;
     fn get_config(e: Env) -> GovernanceConfig;
+    fn get_security_council(e: Env) -> Option<Address>;
 }
 
 #[contract]
@@ -64,6 +67,12 @@ impl GovernanceTrait for Governance {
         cancel_proposal(&e, proposal_id);
     }
 
+    fn set_security_council(e: Env, security_council: Address) {
+        let admin = read_administrator(&e);
+        admin.require_auth();
+        set_security_council(&e, &security_council);
+    }
+
     fn create_proposal(e: Env, title: String, description: String, actions: Vec<ProposalAction>) -> u32 {
         let proposer = e.invoker();
         create_proposal(&e, proposer, title, description, actions)
@@ -88,6 +97,12 @@ impl GovernanceTrait for Governance {
         execute_proposal(&e, proposal_id);
     }
 
+    fn veto_proposal(e: Env, proposal_id: u32) {
+        let security_council = e.invoker();
+        security_council.require_auth();
+        veto_proposal(&e, security_council, proposal_id);
+    }
+
     fn delegate(e: Env, delegate: Address) {
         let delegator = e.invoker();
         delegate_voting_power(&e, delegator, delegate);
@@ -107,5 +122,9 @@ impl GovernanceTrait for Governance {
 
     fn get_config(e: Env) -> GovernanceConfig {
         read_config(&e)
+    }
+
+    fn get_security_council(e: Env) -> Option<Address> {
+        get_security_council(&e)
     }
 }

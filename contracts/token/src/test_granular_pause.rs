@@ -1,18 +1,17 @@
-#![cfg(test)]
-
 //! Granular pausing tests for MINT, BURN, and TRANSFER operations.
 //!
 //! These tests verify that pausing specific operations via EmergencyGuard
 //! works independently — pausing MINT does not affect BURN or TRANSFER,
 //! and vice versa.
 
-use soroban_sdk::{testutils::Address as _, vec, Address, Env};
 use emergency_guard::{EmergencyGuard, EmergencyGuardClient, PauseType};
+use soroban_sdk::{testutils::Address as _, vec, Address, Env};
 
-fn setup_guard(env: &Env, admin: &Address) -> EmergencyGuardClient {
+fn setup_guard<'a>(env: &'a Env, admin: &'a Address) -> EmergencyGuardClient<'a> {
     let contract_id = env.register(EmergencyGuard, ());
     let client = EmergencyGuardClient::new(env, &contract_id);
-    client.initialize(&vec![env, admin.clone()], &1).unwrap();
+    let guardian = Address::generate(env);
+    client.initialize(&vec![env, admin.clone()], &1, &guardian);
     client
 }
 
@@ -24,7 +23,7 @@ fn test_pause_mint_only() {
     let admin = Address::generate(&env);
     let client = setup_guard(&env, &admin);
 
-    client.set_pause(&admin, &PauseType::MINT, &true).unwrap();
+    client.set_pause(&admin, &PauseType::MINT, &true);
 
     assert!(client.is_paused(&PauseType::MINT));
     assert!(!client.is_paused(&PauseType::BURN));
@@ -39,7 +38,7 @@ fn test_pause_burn_only() {
     let admin = Address::generate(&env);
     let client = setup_guard(&env, &admin);
 
-    client.set_pause(&admin, &PauseType::BURN, &true).unwrap();
+    client.set_pause(&admin, &PauseType::BURN, &true);
 
     assert!(!client.is_paused(&PauseType::MINT));
     assert!(client.is_paused(&PauseType::BURN));
@@ -54,7 +53,7 @@ fn test_pause_transfer_only() {
     let admin = Address::generate(&env);
     let client = setup_guard(&env, &admin);
 
-    client.set_pause(&admin, &PauseType::TRANSFER, &true).unwrap();
+    client.set_pause(&admin, &PauseType::TRANSFER, &true);
 
     assert!(!client.is_paused(&PauseType::MINT));
     assert!(!client.is_paused(&PauseType::BURN));
@@ -69,28 +68,28 @@ fn test_pause_all_three_then_unpause_individually() {
     let admin = Address::generate(&env);
     let client = setup_guard(&env, &admin);
 
-    client.set_pause(&admin, &PauseType::MINT, &true).unwrap();
-    client.set_pause(&admin, &PauseType::BURN, &true).unwrap();
-    client.set_pause(&admin, &PauseType::TRANSFER, &true).unwrap();
+    client.set_pause(&admin, &PauseType::MINT, &true);
+    client.set_pause(&admin, &PauseType::BURN, &true);
+    client.set_pause(&admin, &PauseType::TRANSFER, &true);
 
     assert!(client.is_paused(&PauseType::MINT));
     assert!(client.is_paused(&PauseType::BURN));
     assert!(client.is_paused(&PauseType::TRANSFER));
 
     // Unpause MINT only
-    client.set_pause(&admin, &PauseType::MINT, &false).unwrap();
+    client.set_pause(&admin, &PauseType::MINT, &false);
     assert!(!client.is_paused(&PauseType::MINT));
     assert!(client.is_paused(&PauseType::BURN));
     assert!(client.is_paused(&PauseType::TRANSFER));
 
     // Unpause BURN only
-    client.set_pause(&admin, &PauseType::BURN, &false).unwrap();
+    client.set_pause(&admin, &PauseType::BURN, &false);
     assert!(!client.is_paused(&PauseType::MINT));
     assert!(!client.is_paused(&PauseType::BURN));
     assert!(client.is_paused(&PauseType::TRANSFER));
 
     // Unpause TRANSFER
-    client.set_pause(&admin, &PauseType::TRANSFER, &false).unwrap();
+    client.set_pause(&admin, &PauseType::TRANSFER, &false);
     assert!(!client.is_paused(&PauseType::TRANSFER));
 }
 
@@ -103,7 +102,7 @@ fn test_unpause_when_not_paused_is_noop() {
     let client = setup_guard(&env, &admin);
 
     // None paused initially
-    client.set_pause(&admin, &PauseType::MINT, &false).unwrap();
+    client.set_pause(&admin, &PauseType::MINT, &false);
     assert!(!client.is_paused(&PauseType::MINT));
     assert!(!client.is_paused(&PauseType::BURN));
     assert!(!client.is_paused(&PauseType::TRANSFER));

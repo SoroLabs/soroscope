@@ -208,36 +208,81 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "Decimals"
+                              "symbol": "Admins"
                             }
                           ]
                         },
                         "val": {
-                          "u32": 7
+                          "vec": [
+                            {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                            }
+                          ]
                         }
                       },
                       {
                         "key": {
                           "vec": [
                             {
-                              "symbol": "Name"
+                              "symbol": "Metadata"
                             }
                           ]
                         },
                         "val": {
-                          "string": "Test Token"
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "decimals"
+                              },
+                              "val": {
+                                "u32": 7
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "name"
+                              },
+                              "val": {
+                                "string": "Test Token"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "symbol"
+                              },
+                              "val": {
+                                "string": "TEST"
+                              }
+                            }
+                          ]
                         }
                       },
                       {
                         "key": {
                           "vec": [
                             {
-                              "symbol": "Symbol"
+                              "symbol": "PauseState"
                             }
                           ]
                         },
                         "val": {
-                          "string": "TEST"
+                          "vec": [
+                            {
+                              "u32": 0
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "SignatureThreshold"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
                         }
                       }
                     ]

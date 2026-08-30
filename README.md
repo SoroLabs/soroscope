@@ -50,11 +50,62 @@ RUST_LOG=info cargo run -p soroscope-core
 
 The server listens on `http://localhost:8080` by default.
 
+### Merkle Tree Utility
+
+The core crate includes an off-chain Merkle Tree utility (`core/src/merkle_tree.rs`) for building binary Merkle trees and generating inclusion proofs compatible with the `cross_chain_verifier` contract.
+
+**Build a tree and get the root:**
+
+```bash
+# Run your script that calls MerkleTree::build() and prints the root hex
+ROOT=$(cargo run --example build_tree -- --block 1000)
+
+# Post the root on-chain
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --source relayer \
+  --network testnet \
+  -- update_root \
+  --block_height 1000 \
+  --new_root "$ROOT"
+```
+
+**Verify a proof on-chain:**
+
+```bash
+soroban contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- verify_message \
+  --block_height 1000 \
+  --leaf "<leaf_hex>" \
+  --proof '["<sibling_hex>"]' \
+  --proof_flags '[true]'
+```
+
+**Run Merkle Tree tests:**
+
+```bash
+cargo test -p soroscope-core merkle_tree
+```
+
+See [`core/MERKLE_TREE_README.md`](./core/MERKLE_TREE_README.md) for full API reference, proof generation examples, and the complete relayer pipeline.
+
 ---
 
 ## 🌐 Web Dashboard (`/web`)
 
 The **web** app is a Next.js + Tailwind CSS dashboard for exploring resource usage visually.
+
+### Features
+- **Client-Side Simulation Rate Limiting**: Throttles contract simulation requests to a maximum of 2 calls per second via `RequestQueueManager` to prevent hitting Soroban RPC rate limits (429/503).
+- **Infinite Scroll Telemetry Logs**: Smooth `IntersectionObserver`-based infinite scrolling for browsing historical telemetry logs and transaction records.
+- **Subgraph Schema Visualizer**: Interactive React Flow node diagram of cross-contract calls and the ledger keys each invocation reads or writes (**Schema** tab).
+- **Global Search (`Cmd+K` / `Ctrl+K`)**: Quick-search overlay for jumping to any panel, page or contract function from anywhere in the app.
+- **Custom Endpoints**: `/settings` stores a self-hosted Soroban RPC and indexer URL in LocalStorage, with a connection test for each.
+- **Off-Thread WASM Decoding**: Uploaded bytecode is decoded and validated in a dedicated Web Worker, so large contracts never freeze the UI.
+
+See [docs/FRONTEND_FEATURES.md](docs/FRONTEND_FEATURES.md) for details.
 
 ### Install Dependencies
 ```bash
@@ -75,6 +126,13 @@ Then open:
 npm run build
 npm start
 ```
+
+### 🧮 Interactive Token Yield & Staking Calculator Widget
+The web dashboard includes an interactive **Token Yield & Staking Calculator Widget** enabling users to estimate projected APY, compounding returns, and rewards prior to locking tokens into Soroban smart contracts:
+- **Interactive Parameters**: Sliders and numerical inputs for Deposit Amount, Lock Duration (1-36M), Base APY, Compound Frequency (Daily, Weekly, Monthly, Quarterly, Annually, Simple Interest), and Duration Tier Multiplier toggles.
+- **Real-Time Return Projections**: Computes Projected Total Balance, Total Rewards, Effective APY, ROI %, and Estimated Daily & Monthly Earnings.
+- **Milestone Schedule**: Interactive Monthly Milestone Schedule detailing cumulative yield and balance progression.
+- **Unit Testing**: Tests under `web/lib/stakingCalculator.test.cjs` and `web/components/StakingCalculator.test.cjs`.
 
 ---
 
@@ -120,7 +178,7 @@ From the **repo root**:
   npm run lint
   ```
 
-(Add CI in `./.github/workflows` to automate these.)
+These checks run automatically on every push and pull request via the CI pipeline in `.github/workflows/ci.yml` (`cargo check`, `cargo fmt`, `cargo clippy`, `cargo test`, and frontend lint).
 
 ---
 

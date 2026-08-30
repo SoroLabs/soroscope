@@ -7,6 +7,6 @@ mod proxy_logic_v2;
 #[cfg(test)]
 mod test;
 
-pub use crate::proxy::{Proxy, ProxyClient};
+pub use crate::proxy::{DataKey, PendingUpgrade, Proxy, ProxyClient, TIMELOCK_DELAY};
 pub use crate::proxy_logic::{ProxyLogicV1, ProxyLogicV1Client};
 pub use crate::proxy_logic_v2::{ProxyLogicV2, ProxyLogicV2Client};

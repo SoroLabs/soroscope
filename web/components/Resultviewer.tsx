@@ -3,6 +3,7 @@
 import type { InvocationResult } from '../lib/sorobantypes';
 
 import { CallGraphVisualizer } from './CallGraphVisualizer';
+import { CopyButton } from './CopyButton';
 
 interface ResultViewerProps {
   result: InvocationResult | null;
@@ -27,10 +28,10 @@ export function ResultViewer({ result }: ResultViewerProps) {
       <div
         style={{
           padding: '24px',
-          backgroundColor: '#0d1117',
+          backgroundColor: 'var(--bg-elevated)',
           borderRadius: '8px',
           textAlign: 'center',
-          color: '#8b949e',
+          color: 'var(--text-secondary)',
           border: '1px solid #30363d',
         }}
       >
@@ -43,13 +44,13 @@ export function ResultViewer({ result }: ResultViewerProps) {
     <div
       style={{
         padding: '24px',
-        backgroundColor: '#0d1117',
+        backgroundColor: 'var(--bg-elevated)',
         borderRadius: '8px',
         borderLeft: `4px solid ${result.success ? '#00d9ff' : '#fb8500'}`,
         border: `1px solid #30363d`,
       }}
     >
-      <div style={{ marginBottom: '16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div style={{ marginBottom: '16px', display: 'flex', flexWrap: 'wrap', gap: '12px', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
           <h3
             style={{
@@ -61,7 +62,7 @@ export function ResultViewer({ result }: ResultViewerProps) {
           >
             {result.success ? '✓ Success' : '✗ Error'}
           </h3>
-          <p style={{ margin: '0', color: '#8b949e', fontSize: '12px' }}>
+          <p style={{ margin: '0', color: 'var(--text-secondary)', fontSize: '12px' }}>
             {new Date(result.timestamp).toLocaleString()}
           </p>
         </div>
@@ -90,7 +91,7 @@ export function ResultViewer({ result }: ResultViewerProps) {
       {result.error ? (
         <div
           style={{
-            backgroundColor: '#0d1117',
+            backgroundColor: 'var(--bg-elevated)',
             padding: '16px',
             borderRadius: '6px',
             marginBottom: '12px',
@@ -133,15 +134,31 @@ export function ResultViewer({ result }: ResultViewerProps) {
               {result.error}
             </div>
           </div>
-          <div style={{ fontSize: '12px', color: '#8b949e' }}>
-            💡 Tip: Check if the backend is running and all parameters are correct.
+          <div style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+            {result.errorType === 'NETWORK_ERROR' ? (
+              <>
+                ⚠️ The analyzer backend isn’t responding — it may have crashed or isn’t running.
+                <br />
+                Start it with <code style={{ color: '#00d9ff' }}>cargo run</code> (expected at{' '}
+                <code style={{ color: '#00d9ff' }}>localhost:8080</code>), then retry.
+              </>
+            ) : result.errorType === 'PARSE_ERROR' ? (
+              <>
+                ⚠️ The backend returned a malformed response — it may have crashed mid-analysis.
+                Check the analyzer logs, then retry.
+              </>
+            ) : result.errorType === 'INTERNAL_SERVER_ERROR' ? (
+              <>💡 The analyzer hit an internal error during simulation. Check the analyzer logs for the panic trace.</>
+            ) : (
+              <>💡 Tip: Check if the backend is running and all parameters are correct.</>
+            )}
           </div>
         </div>
       ) : (
         result.result && (
           <div
             style={{
-              backgroundColor: '#0d1117',
+              backgroundColor: 'var(--bg-elevated)',
               padding: '12px',
               borderRadius: '6px',
               marginBottom: '12px',
@@ -155,8 +172,10 @@ export function ResultViewer({ result }: ResultViewerProps) {
               overflow: 'auto',
             }}
           >
-            <strong style={{ color: '#8b949e' }}>Result:</strong>
-            <br />
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+              <strong style={{ color: 'var(--text-secondary)' }}>Result:</strong>
+              <CopyButton text={JSON.stringify(result.result, null, 2)} label="Copy Result" tooltipPosition="left" />
+            </div>
             {JSON.stringify(result.result, null, 2)}
           </div>
         )

@@ -15,7 +15,7 @@ export const FunctionSidebar: React.FC<FunctionSidebarProps> = ({
     return (
         <div
             style={{
-                backgroundColor: '#161b22',
+                backgroundColor: 'var(--bg-card)',
                 borderRadius: '8px',
                 padding: '24px',
                 marginBottom: '24px',

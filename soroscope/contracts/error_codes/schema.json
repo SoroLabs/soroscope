@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ContractError",
+  "type": "object",
+  "description": "Explicit numerical discriminant mappings for SoroScope smart contract error codes.",
+  "error_codes": [
+    { "name": "AlreadyInitialized", "code": 1, "description": "Contract has already been initialized." },
+    { "name": "NotInitialized", "code": 2, "description": "Contract has not been initialized yet." },
+    { "name": "Unauthorized", "code": 3, "description": "Caller is not authorized to perform this operation." },
+    { "name": "InsufficientBalance", "code": 4, "description": "Account balance is insufficient for requested transaction." },
+    { "name": "InsufficientLiquidity", "code": 5, "description": "Liquidity pool reserve is insufficient." },
+    { "name": "InsufficientShares", "code": 6, "description": "LP share balance is insufficient." },
+    { "name": "InsufficientAllowance", "code": 7, "description": "Approved token allowance is insufficient." },
+    { "name": "SlippageExceeded", "code": 8, "description": "Slippage tolerance was exceeded during swap." },
+    { "name": "InvalidFee", "code": 9, "description": "Fee parameter exceeds allowed threshold." },
+    { "name": "NoPendingFeeUpdate", "code": 10, "description": "No pending fee update was found." },
+    { "name": "TimelockNotElapsed", "code": 11, "description": "Timelock period has not yet elapsed." },
+    { "name": "OracleNotConfigured", "code": 12, "description": "Price oracle is not configured." },
+    { "name": "InvalidOraclePrice", "code": 13, "description": "Price returned by oracle is invalid or stale." },
+    { "name": "Paused", "code": 14, "description": "Contract execution is currently paused by emergency guard." },
+    { "name": "Overflow", "code": 15, "description": "Arithmetic overflow occurred." },
+    { "name": "DivisionByZero", "code": 16, "description": "Attempted division by zero." },
+    { "name": "InvalidInput", "code": 17, "description": "Input argument provided is invalid." }
+  ]
+}

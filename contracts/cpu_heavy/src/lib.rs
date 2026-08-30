@@ -1,20 +1,75 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, Env, Vec};
+
+#[cfg(test)]
+mod test;
+
+/// Errors returned by the `CpuHeavyContract` benchmark entry points.
+///
+/// Every entry point validates its inputs against a hard cap *before* doing any
+/// work, so an oversized request fails with one of these codes instead of
+/// running until the host aborts the invocation with
+/// `Error(Budget, ExceededLimit)`. A budget abort surfaces to the caller as an
+/// opaque `UnreachableCodeReached` VM trap and says nothing about which
+/// argument was unreasonable; these codes do.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// `n` exceeded [`MAX_FIB`].
+    FibonacciInputTooLarge = 1,
+    /// The input list was longer than [`MAX_SORT`].
+    SortInputTooLarge = 2,
+    /// `limit` exceeded [`MAX_PRIME`].
+    PrimeLimitTooLarge = 3,
+    /// `outer * inner` exceeded [`MAX_LOOP_OPS`].
+    LoopOpsTooLarge = 4,
+    /// One of the combined-benchmark arguments exceeded its sub-cap.
+    CombinedInputTooLarge = 5,
+}
+
+// Hard caps. These sit below the point where a benchmark would exhaust the
+// default network budget (100_000_000 CPU instructions / 41_943_040 memory
+// bytes), measured against the release WASM build:
+//
+//   fibonacci_iterative(50_000)    1.6M CPU              (pure arithmetic loop)
+//   bubble_sort(100)              60.0M CPU / 10.2MB     (host Vec get/set)
+//   count_primes(20_000)          22.7M CPU
+//
+// `bubble_sort` is quadratic in *host* calls, so its cap is by far the
+// tightest: at 150 elements it costs 136.8M CPU and blows the budget outright,
+// which is why the previous cap of 300 was never reachable in practice.
+
+/// Largest `n` accepted by [`CpuHeavyContract::fibonacci_iterative`].
+pub const MAX_FIB: u32 = 50_000;
+/// Longest list accepted by [`CpuHeavyContract::bubble_sort`].
+pub const MAX_SORT: u32 = 100;
+/// Largest `limit` accepted by [`CpuHeavyContract::count_primes`].
+pub const MAX_PRIME: u32 = 20_000;
+/// Largest `outer * inner` product accepted by
+/// [`CpuHeavyContract::nested_loop_burn`].
+pub const MAX_LOOP_OPS: u32 = 500_000;
+
+// Sub-caps for `combined_benchmark`, which pays for all three workloads in one
+// invocation and so has to stay well inside each individual cap.
+/// Largest `fib_n` accepted by [`CpuHeavyContract::combined_benchmark`].
+pub const MAX_COMBINED_FIB: u32 = 10_000;
+/// Largest `sort_size` accepted by [`CpuHeavyContract::combined_benchmark`].
+pub const MAX_COMBINED_SORT: u32 = 50;
+/// Largest `prime_limit` accepted by [`CpuHeavyContract::combined_benchmark`].
+pub const MAX_COMBINED_PRIME: u32 = 5_000;
 
 #[contract]
 pub struct CpuHeavyContract;
 
-// Constants to keep execution deterministic and bounded
-const MAX_FIB: u32 = 50_000;
-const MAX_SORT: u32 = 300;
-const MAX_PRIME: u32 = 20_000;
-const MAX_LOOP_OPS: u32 = 500_000;
-
 #[contractimpl]
 impl CpuHeavyContract {
-    pub fn fibonacci_iterative(_env: Env, n: u32) -> u64 {
+    /// Iterative Fibonacci, wrapping on `u64` overflow.
+    ///
+    /// Returns [`Error::FibonacciInputTooLarge`] if `n` exceeds [`MAX_FIB`].
+    pub fn fibonacci_iterative(_env: Env, n: u32) -> Result<u64, Error> {
         if n > MAX_FIB {
-            panic!("input too large");
+            return Err(Error::FibonacciInputTooLarge);
         }
 
         let mut a: u64 = 0;
@@ -24,18 +79,24 @@ impl CpuHeavyContract {
             a = b;
             b = temp;
         }
-        a
+        Ok(a)
     }
 
-    pub fn bubble_sort(_env: Env, values: Vec<u32>) -> Vec<u32> {
+    /// Bubble-sorts a host `Vec` in place, exercising O(n²) host calls.
+    ///
+    /// Returns [`Error::SortInputTooLarge`] if the list is longer than
+    /// [`MAX_SORT`].
+    pub fn bubble_sort(_env: Env, values: Vec<u32>) -> Result<Vec<u32>, Error> {
         if values.len() > MAX_SORT {
-            panic!("list too long");
+            return Err(Error::SortInputTooLarge);
         }
 
         let mut arr = values;
         let n = arr.len();
         for i in 0..n {
-            for j in 0..n - i - 1 {
+            // `n - i - 1` would underflow on the last pass, and on an empty
+            // list there is nothing to compare at all.
+            for j in 0..n.saturating_sub(i + 1) {
                 let val_j = arr.get(j).unwrap();
                 let val_next = arr.get(j + 1).unwrap();
                 if val_j > val_next {
@@ -44,18 +105,23 @@ impl CpuHeavyContract {
                 }
             }
         }
-        arr
+        Ok(arr)
     }
 
-    pub fn count_primes(_env: Env, limit: u32) -> u32 {
+    /// Counts primes in `2..=limit` by trial division.
+    ///
+    /// Returns [`Error::PrimeLimitTooLarge`] if `limit` exceeds [`MAX_PRIME`].
+    pub fn count_primes(_env: Env, limit: u32) -> Result<u32, Error> {
         if limit > MAX_PRIME {
-            panic!("limit too large");
+            return Err(Error::PrimeLimitTooLarge);
         }
 
         let mut count = 0;
         for num in 2..=limit {
             let mut is_prime = true;
             let mut i = 2;
+            // `MAX_PRIME` is far below `sqrt(u32::MAX)`, so `i * i` cannot
+            // overflow for any accepted `limit`.
             while i * i <= num {
                 if num % i == 0 {
                     is_prime = false;
@@ -67,12 +133,17 @@ impl CpuHeavyContract {
                 count += 1;
             }
         }
-        count
+        Ok(count)
     }
 
-    pub fn nested_loop_burn(_env: Env, outer: u32, inner: u32) -> u64 {
+    /// Burns `outer * inner` iterations of trivial arithmetic.
+    ///
+    /// Returns [`Error::LoopOpsTooLarge`] if the product exceeds
+    /// [`MAX_LOOP_OPS`]. The product uses `saturating_mul` so a caller cannot
+    /// slip past the guard by overflowing it.
+    pub fn nested_loop_burn(_env: Env, outer: u32, inner: u32) -> Result<u64, Error> {
         if outer.saturating_mul(inner) > MAX_LOOP_OPS {
-            panic!("total ops too large");
+            return Err(Error::LoopOpsTooLarge);
         }
 
         let mut sum: u64 = 0;
@@ -81,27 +152,38 @@ impl CpuHeavyContract {
                 sum = sum.wrapping_add(i as u64).wrapping_add(j as u64);
             }
         }
-        sum
+        Ok(sum)
     }
 
-    pub fn combined_benchmark(env: Env, fib_n: u32, sort_size: u32, prime_limit: u32) -> Vec<u64> {
-        if fib_n > 10_000 || sort_size > 100 || prime_limit > 5_000 {
-            panic!("combined inputs too large");
+    /// Runs all three workloads in one invocation and returns
+    /// `[fibonacci, prime_count]`.
+    ///
+    /// Returns [`Error::CombinedInputTooLarge`] if any argument exceeds its
+    /// sub-cap.
+    pub fn combined_benchmark(
+        env: Env,
+        fib_n: u32,
+        sort_size: u32,
+        prime_limit: u32,
+    ) -> Result<Vec<u64>, Error> {
+        if fib_n > MAX_COMBINED_FIB
+            || sort_size > MAX_COMBINED_SORT
+            || prime_limit > MAX_COMBINED_PRIME
+        {
+            return Err(Error::CombinedInputTooLarge);
         }
 
         let mut results = Vec::new(&env);
-        results.push_back(Self::fibonacci_iterative(env.clone(), fib_n));
+        results.push_back(Self::fibonacci_iterative(env.clone(), fib_n)?);
 
         let mut to_sort = Vec::new(&env);
         for i in (0..sort_size).rev() {
             to_sort.push_back(i);
         }
-        Self::bubble_sort(env.clone(), to_sort);
+        Self::bubble_sort(env.clone(), to_sort)?;
 
-        results.push_back(Self::count_primes(env.clone(), prime_limit) as u64);
+        results.push_back(Self::count_primes(env.clone(), prime_limit)? as u64);
 
-        results
+        Ok(results)
     }
 }
-
-mod test;

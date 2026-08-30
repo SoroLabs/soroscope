@@ -5,7 +5,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, BytesN as _, Ledger},
-    Address, BytesN, Env, String,
+    Address, BytesN, Env, String, Vec,
 };
 
 fn setup(identity_required: bool) -> (Env, Address, Address, Address, Address) {
@@ -24,6 +24,72 @@ fn setup(identity_required: bool) -> (Env, Address, Address, Address, Address) {
 
 fn make_identity(env: &Env, seed: u8) -> BytesN<32> {
     BytesN::from_array(env, &[seed; 32])
+}
+
+fn setup_multisig() -> (Env, Address, Address, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(GovernanceContract, ());
+    let admin_a = Address::generate(&env);
+    let admin_b = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    let mut admins = Vec::new(&env);
+    admins.push_back(admin_a.clone());
+    admins.push_back(admin_b.clone());
+    GovernanceContractClient::new(&env, &contract_id)
+        .initialize_with_admins(&admin_a, &admins, &2, &9, &false);
+    (env, contract_id, admin_a, admin_b, outsider)
+}
+
+fn expired_proposal(client: &GovernanceContractClient<'_>, env: &Env) -> Proposal {
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
+    let proposal = client.create_proposal(
+        &String::from_str(env, "Execute approved decision"),
+        &String::from_str(env, "Requires M-of-N authorization"),
+        &11,
+    );
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
+    proposal
+}
+
+#[test]
+fn execution_requires_distinct_threshold_admin_approvals() {
+    let (env, contract_id, admin_a, admin_b, _) = setup_multisig();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    let proposal = expired_proposal(&client, &env);
+    let mut one_approval = Vec::new(&env);
+    one_approval.push_back(admin_a.clone());
+    assert_eq!(
+        client.try_execute_proposal(&proposal.id, &one_approval),
+        Err(Ok(Error::InsufficientApprovals))
+    );
+
+    let mut approvals = Vec::new(&env);
+    approvals.push_back(admin_a);
+    approvals.push_back(admin_b);
+    assert!(!client.execute_proposal(&proposal.id, &approvals).open);
+}
+
+#[test]
+fn duplicate_or_non_admin_execution_approvals_are_rejected() {
+    let (env, contract_id, admin_a, _, outsider) = setup_multisig();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    let proposal = expired_proposal(&client, &env);
+    let mut duplicate_approvals = Vec::new(&env);
+    duplicate_approvals.push_back(admin_a.clone());
+    duplicate_approvals.push_back(admin_a);
+    assert_eq!(
+        client.try_execute_proposal(&proposal.id, &duplicate_approvals),
+        Err(Ok(Error::InsufficientApprovals))
+    );
+
+    let mut invalid_approvals = Vec::new(&env);
+    invalid_approvals.push_back(outsider.clone());
+    invalid_approvals.push_back(outsider);
+    assert_eq!(
+        client.try_execute_proposal(&proposal.id, &invalid_approvals),
+        Err(Ok(Error::Unauthorized))
+    );
 }
 
 #[test]
@@ -121,4 +187,112 @@ fn votes_cannot_exceed_registered_units() {
 
     let err = client.try_cast_vote(&proposal.id, &voter, &true, &11);
     assert_eq!(err, Err(Ok(Error::InsufficientVotingUnits)));
+}
+
+#[test]
+fn test_veto_proposal_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(GovernanceContract, ());
+    let admin = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    let client = GovernanceContractClient::new(&env, &contract_id);
+
+    // Initialize governance
+    client.initialize(&admin, &604800, &172800, &10);
+
+    // Set security council
+    client.set_security_council(&security_council);
+
+    // Create and queue a proposal
+    let title = String::from_str(&env, "Test proposal");
+    let description = String::from_str(&env, "Test description");
+    let actions = Vec::new(&env);
+    let proposal_id = client.create_proposal(&title, &description, &actions);
+
+    // Start voting
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = 50;
+    });
+    client.start_voting(&proposal_id);
+
+    // Set voting power
+    client.set_voting_power(&admin, &100);
+
+    // Vote
+    client.cast_vote(&proposal_id, &true);
+
+    // Advance time past voting period
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = 100;
+    });
+
+    // Queue proposal
+    client.queue_proposal(&proposal_id);
+
+    // Veto the proposal during timelock period
+    client.veto_proposal(&proposal_id);
+
+    // Verify proposal is vetoed
+    let proposal = client.get_proposal(&proposal_id);
+    assert_eq!(proposal.state, ProposalState::Vetoed);
+}
+
+#[test]
+fn test_veto_proposal_not_security_council() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(GovernanceContract, ());
+    let admin = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    let client = GovernanceContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &604800, &172800, &10);
+    client.set_security_council(&security_council);
+
+    let title = String::from_str(&env, "Test");
+    let description = String::from_str(&env, "Test");
+    let actions = Vec::new(&env);
+    let proposal_id = client.create_proposal(&title, &description, &actions);
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = 50;
+    });
+    client.start_voting(&proposal_id);
+    client.set_voting_power(&admin, &100);
+    client.cast_vote(&proposal_id, &true);
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = 100;
+    });
+    client.queue_proposal(&proposal_id);
+
+    // Try to veto with unauthorized address - should panic due to assert
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.veto_proposal(&proposal_id);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_and_get_security_council() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(GovernanceContract, ());
+    let admin = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    let client = GovernanceContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &604800, &172800, &10);
+
+    // Set security council
+    client.set_security_council(&security_council);
+
+    // Get security council
+    let retrieved = client.get_security_council();
+    assert_eq!(retrieved, Some(security_council));
 }

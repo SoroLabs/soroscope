@@ -46,12 +46,19 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::jobs::JobId;
+use crate::trace_propagation::TracedMessage;
 
 // ── Channel capacity ─────────────────────────────────────────────────────────
 
-/// Number of events that can be buffered per broadcast channel slot before
-/// slow consumers are forced to drop events via `RecvError::Lagged`.
+/// Default number of events buffered per broadcast channel slot before slow
+/// consumers are forced to drop events via `RecvError::Lagged`.
 const BUS_CAPACITY: usize = 256;
+
+/// Minimum allowed channel capacity (prevents degenerate single-slot configs).
+const BUS_CAPACITY_MIN: usize = 16;
+
+/// Maximum allowed channel capacity (guards against OOM from untrusted config).
+const BUS_CAPACITY_MAX: usize = 65_536;
 
 // ── Event types ──────────────────────────────────────────────────────────────
 
@@ -161,25 +168,36 @@ impl SimulationEvent {
 /// async context and [`SimulationBus::subscribe`] to get a receiver.
 #[derive(Clone)]
 pub struct SimulationBus {
-    sender: broadcast::Sender<SimulationEvent>,
+    sender: broadcast::Sender<TracedMessage<SimulationEvent>>,
 }
 
 impl SimulationBus {
-    /// Create a new bus with the default channel capacity.
+    /// Create a new bus with the default channel capacity (`BUS_CAPACITY`).
     pub fn new() -> Arc<Self> {
-        let (sender, _) = broadcast::channel(BUS_CAPACITY);
+        Self::with_capacity(BUS_CAPACITY)
+    }
+
+    /// Create a new bus with an explicit channel capacity.
+    ///
+    /// `capacity` is clamped to `[BUS_CAPACITY_MIN, BUS_CAPACITY_MAX]`.
+    /// Slow subscribers that fall more than `capacity` events behind receive
+    /// [`RecvError::Lagged`] on the next receive call — this is the intended
+    /// backpressure mechanism (drop the stale event, catch up on the next tick).
+    pub fn with_capacity(capacity: usize) -> Arc<Self> {
+        let clamped = capacity.clamp(BUS_CAPACITY_MIN, BUS_CAPACITY_MAX);
+        let (sender, _) = broadcast::channel(clamped);
         Arc::new(Self { sender })
     }
 
     /// Publish an event.  Returns the number of active subscribers that
     /// received it (0 if nobody is listening, which is perfectly fine).
     pub fn publish(&self, event: SimulationEvent) -> usize {
-        self.sender.send(event).unwrap_or(0)
+        self.sender.send(TracedMessage::capture(event)).unwrap_or(0)
     }
 
     /// Subscribe to the bus.  The returned receiver will lag (and skip events)
     /// if it cannot keep up with the publication rate.
-    pub fn subscribe(&self) -> broadcast::Receiver<SimulationEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<TracedMessage<SimulationEvent>> {
         self.sender.subscribe()
     }
 
@@ -230,7 +248,11 @@ impl SimulationBus {
         }
     }
 
-    pub fn completed(job_id: &JobId, resources: &crate::simulation::SorobanResources, cost_stroops: u64) -> SimulationEvent {
+    pub fn completed(
+        job_id: &JobId,
+        resources: &crate::simulation::SorobanResources,
+        cost_stroops: u64,
+    ) -> SimulationEvent {
         SimulationEvent::Completed {
             job_id: job_id.to_string(),
             data: CompletedPayload {
@@ -301,7 +323,11 @@ async fn handle_socket(mut socket: WebSocket, job_id: String, state: Arc<crate::
             // Receive next event from the bus
             result = rx.recv() => {
                 match result {
-                    Ok(event) => {
+                    Ok(message) => {
+                        let dispatch_span = tracing::info_span!("simulation_event_dispatch");
+                        message.set_parent(&dispatch_span);
+                        let _dispatch_guard = dispatch_span.enter();
+                        let event = message.payload;
                         // Only forward events belonging to the requested job
                         if event.job_id() != job_id {
                             continue;
@@ -379,8 +405,8 @@ mod tests {
         bus.publish(event);
 
         let received = rx.recv().await.expect("should receive event");
-        assert_eq!(received.job_id(), fake_id.to_string());
-        assert!(!received.is_terminal());
+        assert_eq!(received.payload.job_id(), fake_id.to_string());
+        assert!(!received.payload.is_terminal());
     }
 
     #[tokio::test]
@@ -407,12 +433,8 @@ mod tests {
     #[tokio::test]
     async fn event_json_round_trips() {
         let fake_id = JobId::new();
-        let event = SimulationBus::provider_failover(
-            &fake_id,
-            "primary-node",
-            "backup-node",
-            "timeout",
-        );
+        let event =
+            SimulationBus::provider_failover(&fake_id, "primary-node", "backup-node", "timeout");
         let json = serde_json::to_string(&event).expect("serialise");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(parsed["event"], "provider_failover");
@@ -425,7 +447,11 @@ mod tests {
         let event = SimulationBus::consensus_check(
             &fake_id,
             true,
-            vec!["node-a".to_string(), "node-b".to_string(), "node-c".to_string()],
+            vec![
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string(),
+            ],
             None,
         );
         let json = serde_json::to_string(&event).expect("serialise");

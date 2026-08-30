@@ -6,7 +6,7 @@ use crate::guardian::{
 };
 use crate::storage_types::{
     ApprovalEvent, CancelEvent, DepositEvent, Error, EscrowConfig, GuardianRotationEvent,
-    ReleaseEvent,
+    MutualCancelEvent, ReleaseEvent,
 };
 use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
 
@@ -17,6 +17,8 @@ pub struct TimelockEscrow;
 impl TimelockEscrow {
     /// Initializes the escrow with depositor, beneficiary, token, guardians, and lock duration.
     /// The timelock is computed as current ledger sequence + `lock_ledgers`.
+    /// `cancellation_fee_bps` is the fee (in basis points) deducted on cancel, capped at 10000.
+    /// `protocol_vault` receives the cancellation fee.
     pub fn initialize(
         e: Env,
         depositor: Address,
@@ -24,11 +26,16 @@ impl TimelockEscrow {
         token: Address,
         guardians: Vec<Address>,
         lock_ledgers: u32,
+        cancellation_fee_bps: u32,
+        protocol_vault: Address,
     ) -> Result<(), Error> {
         if has_config(&e) {
             return Err(Error::AlreadyInitialized);
         }
         validate_guardians(&guardians)?;
+        if cancellation_fee_bps > 10_000 {
+            return Err(Error::CancellationFeeTooHigh);
+        }
 
         let config = EscrowConfig {
             depositor,
@@ -38,6 +45,8 @@ impl TimelockEscrow {
             unlock_ledger: e.ledger().sequence().saturating_add(lock_ledgers),
             is_released: false,
             is_cancelled: false,
+            cancellation_fee_bps,
+            protocol_vault,
         };
 
         write_config(&e, &config);
@@ -155,6 +164,8 @@ impl TimelockEscrow {
 
     /// Depositor cancels the escrow and reclaims funds.
     /// Allowed before timelock, or after timelock only if zero approvals exist.
+    /// A configurable cancellation fee (in basis points) is deducted and sent
+    /// to the protocol vault; the remainder is returned to the depositor.
     pub fn cancel(e: Env) -> Result<(), Error> {
         let mut config = read_config(&e)?;
         require_active(&config)?;
@@ -166,10 +177,21 @@ impl TimelockEscrow {
             return Err(Error::AlreadyFinalized);
         }
 
+        let fee = config.amount * i128::from(config.cancellation_fee_bps) / 10_000;
+        let refund = config.amount - fee;
+
+        if fee > 0 {
+            token::Client::new(&e, &config.token).transfer(
+                &e.current_contract_address(),
+                &config.protocol_vault,
+                &fee,
+            );
+        }
+
         token::Client::new(&e, &config.token).transfer(
             &e.current_contract_address(),
             &config.depositor,
-            &config.amount,
+            &refund,
         );
 
         let cancelled_amount = config.amount;
@@ -183,6 +205,61 @@ impl TimelockEscrow {
                 depositor: config.depositor,
                 token: config.token,
                 amount: cancelled_amount,
+                fee,
+                protocol_vault: config.protocol_vault,
+            },
+        );
+
+        e.storage().instance().extend_ttl(100, 100);
+        Ok(())
+    }
+
+    /// Both depositor and beneficiary mutually agree to cancel the escrow.
+    /// Works regardless of timelock or approval state. The cancellation fee is
+    /// deducted and sent to the protocol vault; the remainder is returned to the depositor.
+    pub fn mutual_cancel(e: Env) -> Result<(), Error> {
+        let mut config = read_config(&e)?;
+        require_active(&config)?;
+        require_funded(&config)?;
+
+        config.depositor.require_auth();
+        config.beneficiary.require_auth();
+
+        let fee = config.amount * i128::from(config.cancellation_fee_bps) / 10_000;
+        let refund = config.amount - fee;
+
+        if fee > 0 {
+            token::Client::new(&e, &config.token).transfer(
+                &e.current_contract_address(),
+                &config.protocol_vault,
+                &fee,
+            );
+        }
+
+        token::Client::new(&e, &config.token).transfer(
+            &e.current_contract_address(),
+            &config.depositor,
+            &refund,
+        );
+
+        let cancelled_amount = config.amount;
+        config.amount = 0;
+        config.is_cancelled = true;
+        write_config(&e, &config);
+
+        e.events().publish(
+            (
+                String::from_str(&e, "mutual_cancel"),
+                config.depositor.clone(),
+                config.beneficiary.clone(),
+            ),
+            MutualCancelEvent {
+                depositor: config.depositor,
+                beneficiary: config.beneficiary,
+                token: config.token,
+                amount: cancelled_amount,
+                fee,
+                protocol_vault: config.protocol_vault,
             },
         );
 

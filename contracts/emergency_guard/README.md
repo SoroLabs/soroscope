@@ -6,6 +6,7 @@ The EmergencyGuard trait provides a standardized, reusable mechanism for emergen
 
 - **Granular Pausing**: Pause specific operations (swaps, deposits, withdrawals, transfers, minting, burning) independently
 - **Multi-Signature Support**: Built-in support for multi-sig authorization patterns
+- **Role Separation**: Guardians can trigger pauses while admins can resume and manage role assignments
 - **Admin Rotation**: Securely rotate admin authority without transferring funds
 - **Efficient Storage**: Uses bitmask for compact pause state storage
 - **Event Logging**: Logs all administrative actions for audit trails
@@ -30,9 +31,8 @@ pub const BURN: u32 = 1 << 5;      // 0x00000020
 ```
 DataKey::PauseState      -> PauseType(u32)      // Bitmask of paused operations
 DataKey::Admins          -> Vec<Address>        // List of authorized admins
+DataKey::Guardians       -> Vec<Address>        // List of authorized guardians
 DataKey::SignatureThreshold -> u32              // Required multi-sig threshold
-DataKey::AdminQueue      -> Vec<Address>        // Reserved for admin rotation queue
-DataKey::PendingAdmin    -> Address             // Reserved for pending admin rotations
 ```
 
 ### Multi-Signature Support

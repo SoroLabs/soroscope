@@ -1,11 +1,11 @@
 import React from 'react';
-import { ContractFunction } from '../lib/sorobantypes';
+import { ContractFunction, SimulationInputs } from '../lib/sorobantypes';
 import { DynamicForm } from './DynamicForm';
 
 interface ContractInteractionProps {
     selectedFunction: ContractFunction;
     loading: boolean;
-    onSubmit: (inputs: Record<string, any>) => Promise<void>;
+    onSubmit: (inputs: SimulationInputs) => Promise<void>;
 }
 
 export const ContractInteraction: React.FC<ContractInteractionProps> = ({
@@ -16,10 +16,10 @@ export const ContractInteraction: React.FC<ContractInteractionProps> = ({
     return (
         <div
             style={{
-                backgroundColor: '#161b22',
+                backgroundColor: 'var(--bg-card)',
                 borderRadius: '8px',
                 padding: '24px',
-                border: '1px solid #30363d',
+                border: '1px solid var(--border-default)',
             }}
         >
             <h2

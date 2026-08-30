@@ -141,6 +141,109 @@ fn test_mint_invalid_tick_range() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_mint_tick_below_min_tick() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let (token_a, token_b, admin_a, _) = setup_tokens(&e);
+    let client = setup_amm(&e, &token_a, &token_b);
+
+    let user = Address::generate(&e);
+    admin_a.mint(&user, &1_000_000);
+
+    // tick_lower below MIN_TICK — must fail with InvalidTickRange.
+    client.mint(&user, &-524_290i32, &-524_280i32, &100_000u128, &100_000u128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_mint_tick_above_max_tick() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let (token_a, token_b, admin_a, _) = setup_tokens(&e);
+    let client = setup_amm(&e, &token_a, &token_b);
+
+    let user = Address::generate(&e);
+    admin_a.mint(&user, &1_000_000);
+
+    // tick_upper above MAX_TICK — must fail with InvalidTickRange.
+    client.mint(&user, &524_280i32, &524_290i32, &100_000u128, &100_000u128);
+}
+
+#[test]
+fn test_mint_at_boundary_ticks() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let (token_a, token_b, admin_a, admin_b) = setup_tokens(&e);
+    let client = setup_amm(&e, &token_a, &token_b);
+
+    let user = Address::generate(&e);
+    admin_a.mint(&user, &1_000_000);
+    admin_b.mint(&user, &1_000_000);
+
+    // tick_lower == MIN_TICK and tick_upper == MAX_TICK — should succeed
+    // (both are at valid, tick_spacing-aligned boundaries for tick_spacing = 10).
+    let (liq, _, _) = client.mint(&user, &-524_280i32, &524_280i32, &100_000u128, &100_000u128);
+    assert!(liq > 0, "boundary-aligned ticks should mint successfully");
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_burn_invalid_tick_range() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let (token_a, token_b, admin_a, _) = setup_tokens(&e);
+    let client = setup_amm(&e, &token_a, &token_b);
+
+    let user = Address::generate(&e);
+    admin_a.mint(&user, &1_000_000);
+
+    // Burn with tick_lower < MIN_TICK — must fail with InvalidTickRange.
+    client.burn(&user, &-524_290i32, &-524_280i32, &100u128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_collect_fees_invalid_tick_range() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let (token_a, token_b, admin_a, _) = setup_tokens(&e);
+    let client = setup_amm(&e, &token_a, &token_b);
+
+    let user = Address::generate(&e);
+    admin_a.mint(&user, &1_000_000);
+
+    // Collect fees with tick_upper > MAX_TICK — must fail with InvalidTickRange.
+    client.collect_fees(&user, &524_280i32, &524_290i32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_initialize_tick_out_of_bounds() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(ConcentratedAmm, ());
+    let client = ConcentratedAmmClient::new(&e, &contract_id);
+
+    let token_a = Address::generate(&e);
+    let token_b = Address::generate(&e);
+
+    // initial_tick above MAX_TICK — must fail with InvalidTickRange.
+    client.initialize(&token_a, &token_b, &30, &10, &Q64, &524_290i32);
+}
+
+#[test]
 fn test_burn_recovers_tokens() {
     let e = Env::default();
     e.mock_all_auths();

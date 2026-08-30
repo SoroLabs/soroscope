@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -26,6 +26,59 @@ const PEER_FAILURE_PENALTY: i64 = 20;
 const MIN_PROVIDER_SCORE: i64 = 25;
 const MAX_GOSSIP_PROVIDERS: usize = 64;
 const MAX_GOSSIP_PEERS: usize = 64;
+pub const MIN_SAMPLES_FOR_EMA: u64 = 5;
+
+#[derive(Debug)]
+pub struct ProviderStats {
+    ema_rtt_us: AtomicU64,
+    sample_count: AtomicU64,
+    window: u64,
+}
+
+impl ProviderStats {
+    pub fn new(window: u64) -> Self {
+        Self {
+            ema_rtt_us: AtomicU64::new(0),
+            sample_count: AtomicU64::new(0),
+            window: window.max(1),
+        }
+    }
+
+    pub fn record(&self, rtt_us: u64) {
+        let count = self.sample_count.fetch_add(1, Ordering::Relaxed);
+        if count == 0 {
+            self.ema_rtt_us.store(rtt_us, Ordering::Relaxed);
+            return;
+        }
+
+        let previous = self.ema_rtt_us.load(Ordering::Relaxed);
+        let alpha_num = 2u128;
+        let alpha_den = (self.window + 1) as u128;
+        let next = ((rtt_us as u128 * alpha_num) + (previous as u128 * (alpha_den - alpha_num)))
+            / alpha_den;
+        self.ema_rtt_us.store(next as u64, Ordering::Relaxed);
+    }
+
+    pub fn ema_rtt_us(&self) -> u64 {
+        self.ema_rtt_us.load(Ordering::Relaxed)
+    }
+
+    pub fn sample_count(&self) -> u64 {
+        self.sample_count.load(Ordering::Relaxed)
+    }
+
+    pub fn is_warmed(&self) -> bool {
+        self.sample_count() >= MIN_SAMPLES_FOR_EMA
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderStatsSnapshot {
+    pub name: String,
+    pub url: String,
+    pub ema_rtt_us: u64,
+    pub sample_count: u64,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RpcProvider {
@@ -142,6 +195,7 @@ struct RemoteProviderObservation {
 struct ProviderState {
     provider: RwLock<RpcProvider>,
     source: &'static str,
+    stats: ProviderStats,
     local_score: AtomicI64,
     consecutive_failures: AtomicU64,
     tripped_at: RwLock<Option<Instant>>,
@@ -155,6 +209,7 @@ impl ProviderState {
         Self {
             provider: RwLock::new(provider),
             source,
+            stats: ProviderStats::new(20),
             local_score: AtomicI64::new(local_score),
             consecutive_failures: AtomicU64::new(0),
             tripped_at: RwLock::new(None),
@@ -196,6 +251,7 @@ pub struct ProviderRegistry {
     client: Client,
     instance_id: String,
     public_base_url: Option<String>,
+    latency_cursor: AtomicUsize,
 }
 
 impl ProviderRegistry {
@@ -237,19 +293,112 @@ impl ProviderRegistry {
             client: Client::new(),
             instance_id: config.instance_id,
             public_base_url: config.public_base_url.map(|url| normalize_base_url(&url)),
+            latency_cursor: AtomicUsize::new(0),
         })
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub fn public_base_url(&self) -> Option<&str> {
+        self.public_base_url.as_deref()
     }
 
     /// Return the list of providers that are currently available for requests,
     /// in priority order (skipping tripped providers whose cooldown hasn't elapsed).
     pub async fn healthy_providers(&self) -> Vec<RpcProvider> {
         let mut available = Vec::new();
-        for state in &self.states {
-            if self.is_available(state).await {
-                available.push(state.provider.clone());
+        let states = self.states.read().await;
+        let provider_states = states.values().cloned().collect::<Vec<_>>();
+        drop(states);
+
+        for state in provider_states {
+            if self.is_available(state.clone()).await {
+                available.push(state.provider.read().await.clone());
             }
         }
         available
+    }
+
+    pub async fn providers_by_latency(&self) -> Vec<RpcProvider> {
+        let states = self.states.read().await;
+        let provider_states = states.values().cloned().collect::<Vec<_>>();
+        drop(states);
+
+        let mut available = Vec::new();
+        for state in provider_states {
+            if self.is_available(state.clone()).await {
+                available.push(state);
+            }
+        }
+
+        if available.is_empty() {
+            return Vec::new();
+        }
+
+        if available.iter().all(|state| state.stats.is_warmed()) {
+            available.sort_by_key(|state| state.stats.ema_rtt_us());
+        } else {
+            let offset = self.latency_cursor.fetch_add(1, Ordering::Relaxed) % available.len();
+            available.rotate_left(offset);
+        }
+
+        let mut providers = Vec::with_capacity(available.len());
+        for state in available {
+            providers.push(state.provider.read().await.clone());
+        }
+        providers
+    }
+
+    pub fn record_rtt(&self, url: &str, rtt_us: u64) {
+        if let Ok(states) = self.states.try_read() {
+            if let Some(state) = states.get(url) {
+                state.stats.record(rtt_us);
+            }
+        }
+    }
+
+    pub fn stats_snapshot(&self) -> Vec<ProviderStatsSnapshot> {
+        let Ok(states) = self.states.try_read() else {
+            return Vec::new();
+        };
+
+        states
+            .values()
+            .filter_map(|state| {
+                state
+                    .provider
+                    .try_read()
+                    .ok()
+                    .map(|provider| ProviderStatsSnapshot {
+                        name: provider.name.clone(),
+                        url: provider.url.clone(),
+                        ema_rtt_us: state.stats.ema_rtt_us(),
+                        sample_count: state.stats.sample_count(),
+                    })
+            })
+            .collect()
+    }
+
+    pub async fn provider_reports(&self) -> Vec<ProviderHealthReport> {
+        self.collect_provider_reports()
+            .await
+            .into_iter()
+            .map(|(_, report)| report)
+            .collect()
+    }
+
+    pub async fn peer_reports(&self) -> Vec<PeerHealthReport> {
+        let peers = self.peers.read().await;
+        let peer_states = peers.values().cloned().collect::<Vec<_>>();
+        drop(peers);
+
+        let mut reports = Vec::with_capacity(peer_states.len());
+        for peer in peer_states {
+            reports.push(self.build_peer_report(peer).await);
+        }
+        reports
     }
 
     pub async fn report_success(&self, url: &str) {
@@ -312,24 +461,59 @@ impl ProviderRegistry {
     pub fn spawn_health_checker(
         self: &Arc<Self>,
         interval: Duration,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         let registry = Arc::clone(self);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
-                ticker.tick().await;
-                registry.run_health_checks().await;
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => {
+                        tracing::info!("RPC health checker shutting down");
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.recv() => {
+                                tracing::info!("RPC health checker shutting down");
+                                break;
+                            }
+                            _ = registry.run_health_checks() => {}
+                        }
+                    }
+                }
             }
         })
     }
 
-    pub fn spawn_gossip_task(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_gossip_task(
+        self: &Arc<Self>,
+        interval: Duration,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
         let registry = Arc::clone(self);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
-                ticker.tick().await;
-                registry.run_gossip_round().await;
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => {
+                        tracing::info!("Provider gossip task shutting down");
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.recv() => {
+                                tracing::info!("Provider gossip task shutting down");
+                                break;
+                            }
+                            _ = registry.run_gossip_round() => {}
+                        }
+                    }
+                }
             }
         })
     }
@@ -672,6 +856,95 @@ impl ProviderRegistry {
         }
     }
 
+    async fn is_available(&self, state: Arc<ProviderState>) -> bool {
+        if self.is_provider_tripped(&state).await {
+            return false;
+        }
+
+        state.local_score.load(Ordering::Relaxed) >= MIN_PROVIDER_SCORE
+            || state.consecutive_failures.load(Ordering::Relaxed) < CIRCUIT_BREAKER_THRESHOLD
+    }
+
+    pub async fn registry_snapshot(&self) -> RegistrySnapshot {
+        let reports = self.collect_provider_reports().await;
+        let providers = reports
+            .into_iter()
+            .filter(|(provider, report)| provider.should_advertise() && report.healthy)
+            .take(MAX_GOSSIP_PROVIDERS)
+            .map(|(provider, report)| GossipProviderSnapshot {
+                provider: provider.public_provider(),
+                score: report.effective_score,
+                latest_ledger: Some(report.latest_ledger),
+                consecutive_failures: report.consecutive_failures,
+                healthy: report.healthy,
+                observed_at: Utc::now(),
+            })
+            .collect();
+
+        let peers = self
+            .peer_reports()
+            .await
+            .into_iter()
+            .filter(|peer| peer.healthy)
+            .take(MAX_GOSSIP_PEERS)
+            .map(|peer| PeerAdvertisement {
+                instance_id: peer.instance_id,
+                base_url: peer.base_url,
+            })
+            .collect();
+
+        RegistrySnapshot {
+            instance_id: self.instance_id.clone(),
+            base_url: self.public_base_url.clone(),
+            generated_at: Utc::now(),
+            peers,
+            providers,
+        }
+    }
+
+    pub async fn merge_snapshot(&self, snapshot: RegistrySnapshot) {
+        if let Some(base_url) = snapshot.base_url.as_deref() {
+            self.register_peer(base_url, Some(snapshot.instance_id.clone()), None)
+                .await;
+        }
+
+        for peer in snapshot.peers {
+            self.register_peer(
+                &peer.base_url,
+                peer.instance_id,
+                snapshot.base_url.as_deref(),
+            )
+            .await;
+        }
+
+        for snapshot_provider in snapshot.providers {
+            let provider = RpcProvider {
+                name: snapshot_provider.provider.name,
+                url: snapshot_provider.provider.url,
+                auth_header: None,
+                auth_value: None,
+                advertise: Some(true),
+            };
+            let state = self
+                .get_or_insert_provider(provider, "gossip", DISCOVERED_PROVIDER_STARTING_SCORE)
+                .await;
+            let source = snapshot
+                .base_url
+                .clone()
+                .unwrap_or_else(|| snapshot.instance_id.clone());
+            state.remote_observations.write().await.insert(
+                source,
+                RemoteProviderObservation {
+                    score: snapshot_provider.score,
+                    latest_ledger: snapshot_provider.latest_ledger.unwrap_or(0),
+                    consecutive_failures: snapshot_provider.consecutive_failures,
+                    healthy: snapshot_provider.healthy,
+                    observed_at: snapshot_provider.observed_at,
+                },
+            );
+        }
+    }
+
     async fn is_provider_tripped(&self, state: &ProviderState) -> bool {
         let tripped_at = *state.tripped_at.read().await;
         match tripped_at {
@@ -727,9 +1000,14 @@ mod tests {
         ]);
 
         let providers = registry.healthy_providers().await;
+        let urls = providers
+            .iter()
+            .map(|provider| provider.url.as_str())
+            .collect::<HashSet<_>>();
+
         assert_eq!(providers.len(), 2);
-        assert_eq!(providers[0].url, "http://a.test");
-        assert_eq!(providers[1].url, "http://b.test");
+        assert!(urls.contains("http://a.test"));
+        assert!(urls.contains("http://b.test"));
     }
 
     #[tokio::test]
@@ -906,9 +1184,17 @@ mod tests {
         for _ in 0..MIN_SAMPLES_FOR_EMA - 1 {
             stats.record(100);
         }
-        assert!(!stats.is_warmed(), "{} samples is below threshold", stats.sample_count());
+        assert!(
+            !stats.is_warmed(),
+            "{} samples is below threshold",
+            stats.sample_count()
+        );
         stats.record(100);
-        assert!(stats.is_warmed(), "{} samples should be warmed", stats.sample_count());
+        assert!(
+            stats.is_warmed(),
+            "{} samples should be warmed",
+            stats.sample_count()
+        );
     }
 
     #[tokio::test]
@@ -1004,5 +1290,37 @@ mod tests {
         // EMA for `a` converged to 1_000; `b` seeded at 10_000.
         assert_eq!(a.ema_rtt_us, 1_000);
         assert_eq!(b.ema_rtt_us, 10_000);
+    }
+
+    #[tokio::test]
+    async fn health_checker_exits_when_shutdown_is_broadcast() {
+        let registry = ProviderRegistry::new(vec![make_provider("a", "http://a.test")]);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = registry.spawn_health_checker(Duration::from_millis(10), shutdown_rx);
+
+        shutdown_tx
+            .send(())
+            .expect("shutdown broadcast should succeed");
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("health checker should exit promptly after shutdown")
+            .expect("health checker task should not panic");
+    }
+
+    #[tokio::test]
+    async fn gossip_task_exits_when_shutdown_is_broadcast() {
+        let registry = ProviderRegistry::new(vec![make_provider("a", "http://a.test")]);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = registry.spawn_gossip_task(Duration::from_millis(10), shutdown_rx);
+
+        shutdown_tx
+            .send(())
+            .expect("shutdown broadcast should succeed");
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("gossip task should exit promptly after shutdown")
+            .expect("gossip task should not panic");
     }
 }

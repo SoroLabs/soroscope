@@ -3,11 +3,16 @@ name = "oracle-aggregator"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+
+[workspace.dependencies]
+soroban-sdk = "22.0.0"
+
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-soroban-sdk = "22.0.0"
+soroban-sdk.workspace = true
 
 [dev-dependencies]
-soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }

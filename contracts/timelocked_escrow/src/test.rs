@@ -8,9 +8,10 @@ use soroban_sdk::{
 
 const LOCK_LEDGERS: u32 = 100;
 const DEPOSIT_AMOUNT: i128 = 10_000;
+const FEE_BPS: u32 = 100; // 1%
 
 /// Creates a fully initialized test environment with token, escrow, depositor,
-/// beneficiary, and 5 guardians. Mints tokens to the depositor.
+/// beneficiary, 5 guardians, a protocol vault, and a 1% cancellation fee.
 fn setup() -> (
     Env,
     TimelockEscrowClient<'static>,
@@ -18,6 +19,7 @@ fn setup() -> (
     Address,      // depositor
     Address,      // beneficiary
     Vec<Address>, // guardians
+    Address,      // protocol_vault
 ) {
     let e = Env::default();
     e.mock_all_auths();
@@ -25,6 +27,7 @@ fn setup() -> (
 
     let depositor = Address::generate(&e);
     let beneficiary = Address::generate(&e);
+    let protocol_vault = Address::generate(&e);
 
     // Register a Stellar asset and mint to depositor
     let token_admin = Address::generate(&e);
@@ -49,9 +52,19 @@ fn setup() -> (
         &token_addr,
         &guardians,
         &LOCK_LEDGERS,
+        &FEE_BPS,
+        &protocol_vault,
     );
 
-    (e, client, token_addr, depositor, beneficiary, guardians)
+    (
+        e,
+        client,
+        token_addr,
+        depositor,
+        beneficiary,
+        guardians,
+        protocol_vault,
+    )
 }
 
 fn advance_ledger(e: &Env, by: u32) {
@@ -64,7 +77,7 @@ fn advance_ledger(e: &Env, by: u32) {
 
 #[test]
 fn test_full_lifecycle() {
-    let (e, client, token_addr, _depositor, beneficiary, guardians) = setup();
+    let (e, client, token_addr, _depositor, beneficiary, guardians, _vault) = setup();
     let token_client = token::Client::new(&e, &token_addr);
 
     client.deposit(&DEPOSIT_AMOUNT);
@@ -96,7 +109,7 @@ fn test_full_lifecycle() {
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_release_before_timelock_fails() {
-    let (_, client, _, _, _, guardians) = setup();
+    let (_, client, _, _, _, guardians, _) = setup();
     client.deposit(&DEPOSIT_AMOUNT);
 
     client.approve(&guardians.get(0).unwrap());
@@ -112,7 +125,7 @@ fn test_release_before_timelock_fails() {
 #[test]
 #[should_panic(expected = "Error(Contract, #6)")]
 fn test_release_insufficient_approvals() {
-    let (e, client, _, _, _, guardians) = setup();
+    let (e, client, _, _, _, guardians, _) = setup();
     client.deposit(&DEPOSIT_AMOUNT);
 
     // Only 2 approvals
@@ -128,7 +141,7 @@ fn test_release_insufficient_approvals() {
 #[test]
 #[should_panic(expected = "Error(Contract, #8)")]
 fn test_double_approve_fails() {
-    let (_, client, _, _, _, guardians) = setup();
+    let (_, client, _, _, _, guardians, _) = setup();
     client.deposit(&DEPOSIT_AMOUNT);
 
     let g = guardians.get(0).unwrap();
@@ -141,18 +154,19 @@ fn test_double_approve_fails() {
 #[test]
 #[should_panic(expected = "Error(Contract, #7)")]
 fn test_non_guardian_approve_fails() {
-    let (e, client, _, _, _, _) = setup();
+    let (e, client, _, _, _, _, _) = setup();
     client.deposit(&DEPOSIT_AMOUNT);
 
     let imposter = Address::generate(&e);
     client.approve(&imposter);
 }
 
-// ── 6. Cancel Before Timelock ─────────────────────────────────
+// ── 6. Cancel Before Timelock Deducts Fee ─────────────────────
 
 #[test]
-fn test_cancel_before_timelock() {
-    let (_, client, _, _, _, _) = setup();
+fn test_cancel_before_timelock_deducts_fee() {
+    let (e, client, token_addr, depositor, _, _, protocol_vault) = setup();
+    let token_client = token::Client::new(&e, &token_addr);
 
     client.deposit(&DEPOSIT_AMOUNT);
 
@@ -162,13 +176,22 @@ fn test_cancel_before_timelock() {
     let config = client.get_config();
     assert!(config.is_cancelled);
     assert_eq!(config.amount, 0);
+
+    // Fee = 1% of 10_000 = 100
+    let expected_fee: i128 = DEPOSIT_AMOUNT * 100 / 10_000; // 100
+
+    assert_eq!(token_client.balance(&protocol_vault), expected_fee);
+    assert_eq!(
+        token_client.balance(&depositor),
+        DEPOSIT_AMOUNT * 2 - expected_fee
+    );
 }
 
 // ── 7. Cancel After Timelock No Approvals ─────────────────────
 
 #[test]
 fn test_cancel_after_timelock_no_approvals() {
-    let (e, client, _, _, _, _) = setup();
+    let (e, client, _, _, _, _, _) = setup();
     client.deposit(&DEPOSIT_AMOUNT);
 
     advance_ledger(&e, LOCK_LEDGERS + 1);
@@ -185,7 +208,7 @@ fn test_cancel_after_timelock_no_approvals() {
 #[test]
 #[should_panic(expected = "Error(Contract, #9)")]
 fn test_cancel_after_timelock_with_approvals_fails() {
-    let (e, client, _, _, _, guardians) = setup();
+    let (e, client, _, _, _, guardians, _) = setup();
     client.deposit(&DEPOSIT_AMOUNT);
 
     client.approve(&guardians.get(0).unwrap());
@@ -199,7 +222,7 @@ fn test_cancel_after_timelock_with_approvals_fails() {
 #[test]
 #[should_panic(expected = "Error(Contract, #9)")]
 fn test_release_after_cancel_fails() {
-    let (e, client, _, _, _, guardians) = setup();
+    let (e, client, _, _, _, guardians, _) = setup();
     client.deposit(&DEPOSIT_AMOUNT);
     client.cancel();
 
@@ -214,7 +237,7 @@ fn test_release_after_cancel_fails() {
 
 #[test]
 fn test_guardian_rotation() {
-    let (e, client, _, _, _, guardians) = setup();
+    let (e, client, _, _, _, guardians, _) = setup();
     client.deposit(&DEPOSIT_AMOUNT);
 
     // Guardian 0 approves before rotation
@@ -253,7 +276,7 @@ fn test_guardian_rotation() {
 #[test]
 #[should_panic(expected = "Error(Contract, #6)")]
 fn test_guardian_rotation_insufficient_sigs() {
-    let (e, client, _, _, _, guardians) = setup();
+    let (e, client, _, _, _, guardians, _) = setup();
 
     let mut new_guardians = Vec::new(&e);
     for _ in 0..5 {
@@ -278,6 +301,7 @@ fn test_duplicate_guardians_rejected() {
 
     let depositor = Address::generate(&e);
     let beneficiary = Address::generate(&e);
+    let protocol_vault = Address::generate(&e);
     let token_addr = e
         .register_stellar_asset_contract_v2(Address::generate(&e))
         .address();
@@ -299,6 +323,8 @@ fn test_duplicate_guardians_rejected() {
         &token_addr,
         &guardians,
         &LOCK_LEDGERS,
+        &FEE_BPS,
+        &protocol_vault,
     );
 }
 
@@ -307,7 +333,7 @@ fn test_duplicate_guardians_rejected() {
 #[test]
 #[should_panic(expected = "Error(Contract, #1)")]
 fn test_double_initialize_fails() {
-    let (_e, client, token_addr, depositor, beneficiary, guardians) = setup();
+    let (_e, client, token_addr, depositor, beneficiary, guardians, _vault) = setup();
 
     client.initialize(
         &depositor,
@@ -315,6 +341,8 @@ fn test_double_initialize_fails() {
         &token_addr,
         &guardians,
         &LOCK_LEDGERS,
+        &FEE_BPS,
+        &_vault,
     );
 }
 
@@ -323,7 +351,7 @@ fn test_double_initialize_fails() {
 #[test]
 #[should_panic(expected = "Error(Contract, #9)")]
 fn test_deposit_after_release_fails() {
-    let (e, client, _, _, _, guardians) = setup();
+    let (e, client, _, _, _, guardians, _) = setup();
     client.deposit(&DEPOSIT_AMOUNT);
 
     client.approve(&guardians.get(0).unwrap());
@@ -367,7 +395,7 @@ fn test_bitmap_operations() {
 
 #[test]
 fn test_view_functions() {
-    let (e, client, _, _, _, guardians) = setup();
+    let (e, client, _, _, _, guardians, _) = setup();
     client.deposit(&DEPOSIT_AMOUNT);
 
     // Initial state
@@ -392,4 +420,252 @@ fn test_view_functions() {
 
     advance_ledger(&e, LOCK_LEDGERS + 1);
     assert!(client.is_releasable());
+}
+
+// ── 17. Mutual Cancel Deducts Fee ─────────────────────────────
+
+#[test]
+fn test_mutual_cancel_deducts_fee() {
+    let (e, client, token_addr, depositor, beneficiary, _guardians, protocol_vault) = setup();
+    let token_client = token::Client::new(&e, &token_addr);
+
+    client.deposit(&DEPOSIT_AMOUNT);
+
+    client.mutual_cancel();
+
+    let config = client.get_config();
+    assert!(config.is_cancelled);
+    assert_eq!(config.amount, 0);
+
+    let expected_fee: i128 = DEPOSIT_AMOUNT * 100 / 10_000; // 100
+
+    assert_eq!(token_client.balance(&protocol_vault), expected_fee);
+    assert_eq!(
+        token_client.balance(&depositor),
+        DEPOSIT_AMOUNT * 2 - expected_fee
+    );
+    assert_eq!(token_client.balance(&beneficiary), 0);
+}
+
+// ── 18. Mutual Cancel After Timelock ──────────────────────────
+
+#[test]
+fn test_mutual_cancel_after_timelock() {
+    let (e, client, token_addr, depositor, _beneficiary, guardians, protocol_vault) = setup();
+    let token_client = token::Client::new(&e, &token_addr);
+
+    client.deposit(&DEPOSIT_AMOUNT);
+
+    // Get some approvals
+    client.approve(&guardians.get(0).unwrap());
+    client.approve(&guardians.get(1).unwrap());
+
+    advance_ledger(&e, LOCK_LEDGERS + 1);
+
+    // Even after timelock with approvals, mutual cancel works
+    client.mutual_cancel();
+
+    let config = client.get_config();
+    assert!(config.is_cancelled);
+
+    let expected_fee: i128 = DEPOSIT_AMOUNT * 100 / 10_000; // 100
+    assert_eq!(token_client.balance(&protocol_vault), expected_fee);
+    assert_eq!(
+        token_client.balance(&depositor),
+        DEPOSIT_AMOUNT * 2 - expected_fee
+    );
+}
+
+// ── 19. Mutual Cancel After Cancel Fails ──────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_mutual_cancel_after_cancel_fails() {
+    let (_, client, _, _, _, _, _) = setup();
+    client.deposit(&DEPOSIT_AMOUNT);
+    client.cancel();
+    client.mutual_cancel();
+}
+
+// ── 20. Initialize With Max Fee Succeeds ──────────────────────
+
+#[test]
+fn test_initialize_with_max_fee() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let depositor = Address::generate(&e);
+    let beneficiary = Address::generate(&e);
+    let protocol_vault = Address::generate(&e);
+    let token_addr = e
+        .register_stellar_asset_contract_v2(Address::generate(&e))
+        .address();
+
+    let mut guardians = Vec::new(&e);
+    for _ in 0..5 {
+        guardians.push_back(Address::generate(&e));
+    }
+
+    let contract_id = e.register(TimelockEscrow, ());
+    let client = TimelockEscrowClient::new(&e, &contract_id);
+
+    // Max fee = 10_000 bps = 100%
+    client.initialize(
+        &depositor,
+        &beneficiary,
+        &token_addr,
+        &guardians,
+        &LOCK_LEDGERS,
+        &10_000u32,
+        &protocol_vault,
+    );
+
+    let config = client.get_config();
+    assert_eq!(config.cancellation_fee_bps, 10_000);
+    assert_eq!(config.protocol_vault, protocol_vault);
+}
+
+// ── 21. Initialize With Excessive Fee Fails ───────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_initialize_excessive_fee_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let depositor = Address::generate(&e);
+    let beneficiary = Address::generate(&e);
+    let protocol_vault = Address::generate(&e);
+    let token_addr = e
+        .register_stellar_asset_contract_v2(Address::generate(&e))
+        .address();
+
+    let mut guardians = Vec::new(&e);
+    for _ in 0..5 {
+        guardians.push_back(Address::generate(&e));
+    }
+
+    let contract_id = e.register(TimelockEscrow, ());
+    let client = TimelockEscrowClient::new(&e, &contract_id);
+
+    // Fee > 10_000 bps
+    client.initialize(
+        &depositor,
+        &beneficiary,
+        &token_addr,
+        &guardians,
+        &LOCK_LEDGERS,
+        &10_001u32,
+        &protocol_vault,
+    );
+}
+
+// ── 22. Cancel With Zero Fee Sends All To Depositor ───────────
+
+#[test]
+fn test_cancel_with_zero_fee() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let depositor = Address::generate(&e);
+    let beneficiary = Address::generate(&e);
+    let protocol_vault = Address::generate(&e);
+    let token_admin = Address::generate(&e);
+    let token_addr = e
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let sac = token::StellarAssetClient::new(&e, &token_addr);
+    sac.mint(&depositor, &(DEPOSIT_AMOUNT * 2));
+
+    let mut guardians = Vec::new(&e);
+    for _ in 0..5 {
+        guardians.push_back(Address::generate(&e));
+    }
+
+    let contract_id = e.register(TimelockEscrow, ());
+    let client = TimelockEscrowClient::new(&e, &contract_id);
+
+    client.initialize(
+        &depositor,
+        &beneficiary,
+        &token_addr,
+        &guardians,
+        &LOCK_LEDGERS,
+        &0u32,
+        &protocol_vault,
+    );
+
+    let token_client = token::Client::new(&e, &token_addr);
+    let depositor_initial = token_client.balance(&depositor);
+
+    client.deposit(&DEPOSIT_AMOUNT);
+    client.cancel();
+
+    // No fee deducted — depositor gets full refund
+    assert_eq!(token_client.balance(&depositor), depositor_initial);
+    assert_eq!(token_client.balance(&protocol_vault), 0);
+}
+
+// ── 23. Mutual Cancel With Zero Fee ───────────────────────────
+
+#[test]
+fn test_mutual_cancel_with_zero_fee() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let depositor = Address::generate(&e);
+    let beneficiary = Address::generate(&e);
+    let protocol_vault = Address::generate(&e);
+    let token_admin = Address::generate(&e);
+    let token_addr = e
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let sac = token::StellarAssetClient::new(&e, &token_addr);
+    sac.mint(&depositor, &(DEPOSIT_AMOUNT * 2));
+
+    let mut guardians = Vec::new(&e);
+    for _ in 0..5 {
+        guardians.push_back(Address::generate(&e));
+    }
+
+    let contract_id = e.register(TimelockEscrow, ());
+    let client = TimelockEscrowClient::new(&e, &contract_id);
+
+    client.initialize(
+        &depositor,
+        &beneficiary,
+        &token_addr,
+        &guardians,
+        &LOCK_LEDGERS,
+        &0u32,
+        &protocol_vault,
+    );
+
+    let token_client = token::Client::new(&e, &token_addr);
+    let depositor_initial = token_client.balance(&depositor);
+
+    client.deposit(&DEPOSIT_AMOUNT);
+    client.mutual_cancel();
+
+    assert_eq!(token_client.balance(&depositor), depositor_initial);
+    assert_eq!(token_client.balance(&protocol_vault), 0);
+}
+
+// ── 24. Release After Mutual Cancel Fails ─────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_release_after_mutual_cancel_fails() {
+    let (e, client, _, _, _, guardians, _) = setup();
+    client.deposit(&DEPOSIT_AMOUNT);
+    client.mutual_cancel();
+
+    client.approve(&guardians.get(0).unwrap());
+    client.approve(&guardians.get(1).unwrap());
+    client.approve(&guardians.get(2).unwrap());
+    advance_ledger(&e, LOCK_LEDGERS + 1);
+    client.release();
 }

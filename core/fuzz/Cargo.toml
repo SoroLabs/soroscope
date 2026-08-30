@@ -1,0 +1,34 @@
+[package]
+name = "soroscope-merkle-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.soroscope-core]
+path = ".."
+
+# Disable all default features of the parent crate that require network / DB
+# access so the fuzz targets stay fast and self-contained.
+[[bin]]
+name = "merkle_build"
+path = "fuzz_targets/merkle_build.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "merkle_proof"
+path = "fuzz_targets/merkle_proof.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "merkle_hex"
+path = "fuzz_targets/merkle_hex.rs"
+test = false
+doc = false

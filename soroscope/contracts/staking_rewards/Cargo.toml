@@ -1,0 +1,17 @@
+[package]
+name = "soroban-staking-rewards"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = "22.0.0"
+soroscope-math = { path = "../math" }
+soroscope-error-codes = { path = "../error_codes" }
+emergency_guard = { path = "../emergency_guard" }
+
+[dev-dependencies]
+soroban-sdk = { version = "22.0.0", features = ["testutils"] }

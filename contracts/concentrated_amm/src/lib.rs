@@ -79,6 +79,9 @@ impl ConcentratedAmm {
         if e.storage().instance().has(&DataKey::TokenA) {
             return Err(Error::AlreadyInitialized);
         }
+        if initial_tick < MIN_TICK || initial_tick > MAX_TICK {
+            return Err(Error::InvalidTickRange);
+        }
         
         e.storage().instance().set(&DataKey::TokenA, &token_a);
         e.storage().instance().set(&DataKey::TokenB, &token_b);
@@ -105,6 +108,9 @@ impl ConcentratedAmm {
 
         let tick_spacing: i32 = e.storage().instance().get(&DataKey::TickSpacing).ok_or(Error::NotInitialized)?;
         if tick_lower >= tick_upper || tick_lower % tick_spacing != 0 || tick_upper % tick_spacing != 0 {
+            return Err(Error::InvalidTickRange);
+        }
+        if tick_lower < MIN_TICK || tick_upper > MAX_TICK {
             return Err(Error::InvalidTickRange);
         }
 
@@ -209,6 +215,10 @@ impl ConcentratedAmm {
     ) -> Result<(u128, u128), Error> {
         from.require_auth();
 
+        if tick_lower < MIN_TICK || tick_upper > MAX_TICK || tick_lower >= tick_upper {
+            return Err(Error::InvalidTickRange);
+        }
+
         let pos_key = DataKey::Position(from.clone(), tick_lower, tick_upper);
         let mut pos: PositionInfo = e.storage().persistent().get(&pos_key).ok_or(Error::InsufficientAmount)?;
         
@@ -286,6 +296,10 @@ impl ConcentratedAmm {
         tick_upper: i32,
     ) -> Result<(u128, u128), Error> {
         from.require_auth();
+
+        if tick_lower < MIN_TICK || tick_upper > MAX_TICK || tick_lower >= tick_upper {
+            return Err(Error::InvalidTickRange);
+        }
 
         let pos_key = DataKey::Position(from.clone(), tick_lower, tick_upper);
         let mut pos: PositionInfo = e.storage().persistent().get(&pos_key).ok_or(Error::InsufficientAmount)?;

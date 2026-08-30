@@ -115,6 +115,60 @@ fn partial_mode_skips_failures_and_continues() {
 }
 
 #[test]
+#[test]
+fn accepts_batch_at_max_recipient_limit() {
+    let (env, batch_id, token_id, sender, _recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+
+    // Mint enough to cover MAX_RECIPIENTS transfers of 1 unit each.
+    let token = TokenClient::new(&env, &token_id);
+    let admin_authorized = sender.clone();
+    let _ = admin_authorized;
+
+    let mut recipients = Vec::new(&env);
+    let mut amounts = Vec::new(&env);
+    for _ in 0..MAX_RECIPIENTS {
+        recipients.push_back(Address::generate(&env));
+        amounts.push_back(1i128);
+    }
+
+    let results = batch.execute(
+        &token_id,
+        &sender,
+        &recipients,
+        &amounts,
+        &ExecutionMode::AllOrNothing,
+    );
+
+    assert_eq!(results.len(), MAX_RECIPIENTS);
+    assert_eq!(token.balance(&sender), 1_000 - MAX_RECIPIENTS as i128);
+}
+
+#[test]
+fn rejects_batch_over_max_recipient_limit() {
+    let (env, batch_id, token_id, sender, _recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = TokenClient::new(&env, &token_id);
+
+    let mut recipients = Vec::new(&env);
+    let mut amounts = Vec::new(&env);
+    for _ in 0..(MAX_RECIPIENTS + 1) {
+        recipients.push_back(Address::generate(&env));
+        amounts.push_back(1i128);
+    }
+
+    let err = batch.try_execute(
+        &token_id,
+        &sender,
+        &recipients,
+        &amounts,
+        &ExecutionMode::AllOrNothing,
+    );
+
+    assert_eq!(err, Err(Ok(Error::TooManyRecipients)));
+    // Nothing should have moved.
+    assert_eq!(token.balance(&sender), 1_000);
+}
 fn quote_matches_partial_execution_plan() {
     let (env, batch_id, token_id, sender, recipient_a) = setup();
     let batch = BatchTransferClient::new(&env, &batch_id);

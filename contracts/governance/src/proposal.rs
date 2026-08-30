@@ -123,3 +123,23 @@ pub fn cancel_proposal(e: &Env, proposal_id: u32) {
     proposal.state = ProposalState::Cancelled;
     write_proposal(e, &proposal);
 }
+
+pub fn veto_proposal(e: &Env, security_council: Address, proposal_id: u32) {
+    let mut proposal = read_proposal(e, proposal_id);
+
+    // Can only veto proposals that are Queued (in timelock period)
+    assert!(matches!(proposal.state, ProposalState::Queued));
+
+    // Verify caller is Security Council
+    let stored_council: Address = e.storage().instance().get(&DataKey::SecurityCouncil)
+        .expect("Security Council not set");
+    assert!(stored_council == security_council, "Caller is not Security Council");
+
+    // Check if proposal is still in timelock period (not yet executable)
+    let config = crate::admin::read_config(e);
+    let current_time = e.ledger().timestamp();
+    assert!(current_time < proposal.queued_time + config.timelock_delay, "Timelock period has passed");
+
+    proposal.state = ProposalState::Vetoed;
+    write_proposal(e, &proposal);
+}

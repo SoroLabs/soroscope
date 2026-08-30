@@ -1,0 +1,18 @@
+[package]
+name = "soroban-token-contract"
+description = "Soroban Token Contract with emergency pause and multi-sig controls"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+emergency_guard = { path = "../emergency_guard", default-features = false }
+soroban-sdk = "22.0.0"
+# Emergency guard provides standardized pause and admin management capabilities
+
+[dev-dependencies]
+soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+emergency_guard = { path = "../emergency_guard", default-features = false }

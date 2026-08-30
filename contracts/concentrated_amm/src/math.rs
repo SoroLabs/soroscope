@@ -12,6 +12,14 @@ pub enum MathError {
 
 pub const Q64: u128 = 1 << 64;
 
+/// Minimum and maximum tick indices, empirically determined to stay within
+/// the representable u128 range of the Q64.64 sqrt-price computation in
+/// `get_sqrt_ratio_at_tick`.  The underlying `mul_div_u128` multi-word
+/// arithmetic overflows for |tick| > 524_290, so we set the boundary to
+/// the nearest tick_spacing-aligned safe value.
+pub const MIN_TICK: i32 = -524_280;
+pub const MAX_TICK: i32 = 524_280;
+
 pub fn mul_div_u128(a: u128, b: u128, d: u128) -> Result<u128, MathError> {
     if d == 0 { return Err(MathError::DivisionByZero); }
     if let Some(prod) = a.checked_mul(b) { return Ok(prod / d); }

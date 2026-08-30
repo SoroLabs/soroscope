@@ -5,16 +5,15 @@ edition = "2021"
 publish = false
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
-soroban-sdk = "22.0.0"
+soroban-sdk.workspace = true
+emergency_guard = { path = "../emergency_guard", default-features = false }
 
 [dev-dependencies]
-soroban-sdk = { version = "22.0.0", features = ["testutils"] }
-english-auction-contract = { package = "soroban-english-auction-contract", path = "../english_auction" }
-dutch-auction-contract = { package = "soroban-dutch-auction-contract", path = "../dutch_auction" }
-token-contract = { package = "soroban-token-contract", path = "../token" }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+emergency_guard = { path = "../emergency_guard", default-features = false }
 
 [features]
 testutils = []

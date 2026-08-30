@@ -1,17 +1,19 @@
 #![cfg(test)]
 
-//! Threshold multi-sig tests for the token contract.
-//!
-//! These tests verify N-of-M multi-sig admin capabilities using the
-//! EmergencyGuard contract as the token's admin, exercising add_admin,
-//! remove_admin, emergency_pause, and resume with threshold enforcement.
+//! Threshold multi-sig tests exercising the EmergencyGuard RBAC model:
+//! - Guardians can trigger emergency_pause unilaterally.
+//! - Admins (multi-sig) can resume and manage roles.
 
 use soroban_sdk::{testutils::Address as _, vec, Address, Env};
 
-// Import EmergencyGuard directly from its crate
 use emergency_guard::{EmergencyGuard, EmergencyGuardClient};
 
-fn setup_guard(env: &Env, admins: &[Address], threshold: u32) -> (EmergencyGuardClient, Address) {
+fn setup_guard(
+    env: &Env,
+    admins: &[Address],
+    threshold: u32,
+    guardian: &Address,
+) -> EmergencyGuardClient<'_> {
     let contract_id = env.register(EmergencyGuard, ());
     let client = EmergencyGuardClient::new(env, &contract_id);
     let admins_vec = {
@@ -21,57 +23,97 @@ fn setup_guard(env: &Env, admins: &[Address], threshold: u32) -> (EmergencyGuard
         }
         v
     };
-    client.initialize(&admins_vec, &threshold).unwrap();
-    (client, contract_id)
+    client.initialize(&admins_vec, &threshold, guardian);
+    client
 }
 
-/// 2-of-3: emergency_pause succeeds with exactly 2 approvers.
+/// A guardian can trigger emergency_pause without admin multi-sig.
 #[test]
-fn test_multisig_2_of_3_pause_succeeds() {
+fn test_guardian_single_sig_emergency_pause() {
     let env = Env::default();
     env.mock_all_auths();
 
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
     let a3 = Address::generate(&env);
-    let (client, _) = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 2);
+    let guardian = Address::generate(&env);
+    let client = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 2, &guardian);
 
-    let approvers = vec![&env, a1.clone(), a2.clone()];
-    client.emergency_pause(&approvers).unwrap();
-
+    // Guardian acts alone — no admin multi-sig needed
+    client.emergency_pause(&guardian);
     assert!(client.is_paused(&emergency_guard::PauseType::MINT));
 }
 
-/// 2-of-3: emergency_pause fails with only 1 approver.
+/// An admin can also trigger emergency_pause unilaterally.
 #[test]
-fn test_multisig_2_of_3_pause_fails_insufficient() {
+fn test_admin_single_sig_emergency_pause() {
     let env = Env::default();
     env.mock_all_auths();
 
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
-    let a3 = Address::generate(&env);
-    let (client, _) = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 2);
+    let guardian = Address::generate(&env);
+    let client = setup_guard(&env, &[a1.clone(), a2.clone()], 2, &guardian);
 
-    let approvers = vec![&env, a1.clone()];
-    let result = client.try_emergency_pause(&approvers);
+    client.emergency_pause(&a1);
+    assert!(client.is_paused(&emergency_guard::PauseType::MINT));
+}
+
+/// A non-guardian, non-admin cannot trigger emergency_pause.
+#[test]
+fn test_outsider_cannot_emergency_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    let client = setup_guard(&env, &[a1.clone(), a2.clone()], 2, &guardian);
+
+    let result = client.try_emergency_pause(&outsider);
     assert!(result.is_err());
 }
 
-/// 3-of-3: all admins required; succeeds with all 3.
+/// 2-of-3: resume succeeds with exactly 2 admin approvers.
 #[test]
-fn test_multisig_3_of_3_all_required() {
+fn test_multisig_2_of_3_resume_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
 
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
     let a3 = Address::generate(&env);
-    let (client, _) = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 3);
+    let guardian = Address::generate(&env);
+    let client = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 2, &guardian);
 
-    let approvers = vec![&env, a1.clone(), a2.clone(), a3.clone()];
-    client.emergency_pause(&approvers).unwrap();
+    // Guardian pauses
+    client.emergency_pause(&guardian);
     assert!(client.is_paused(&emergency_guard::PauseType::MINT));
+
+    // 2-of-3 admins resume
+    let approvers = vec![&env, a1.clone(), a2.clone()];
+    client.resume(&approvers);
+    assert!(!client.is_paused(&emergency_guard::PauseType::MINT));
+}
+
+/// resume fails with only 1 approver when threshold is 2.
+#[test]
+fn test_multisig_resume_fails_insufficient() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let a3 = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let client = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 2, &guardian);
+
+    client.emergency_pause(&guardian);
+
+    let approvers = vec![&env, a1.clone()];
+    let result = client.try_resume(&approvers);
+    assert!(result.is_err());
 }
 
 /// add_admin requires multi-sig; new admin appears in list.
@@ -83,10 +125,11 @@ fn test_multisig_add_admin() {
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
     let new_admin = Address::generate(&env);
-    let (client, _) = setup_guard(&env, &[a1.clone(), a2.clone()], 2);
+    let guardian = Address::generate(&env);
+    let client = setup_guard(&env, &[a1.clone(), a2.clone()], 2, &guardian);
 
     let approvers = vec![&env, a1.clone(), a2.clone()];
-    client.add_admin(&approvers, &new_admin).unwrap();
+    client.add_admin(&approvers, &new_admin);
 
     let admins = client.get_admins();
     assert!(admins.iter().any(|a| a == new_admin));
@@ -101,30 +144,32 @@ fn test_multisig_remove_admin() {
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
     let a3 = Address::generate(&env);
-    let (client, _) = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 2);
+    let guardian = Address::generate(&env);
+    let client = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 2, &guardian);
 
     let approvers = vec![&env, a1.clone(), a2.clone()];
-    client.remove_admin(&approvers, &a3).unwrap();
+    client.remove_admin(&approvers, &a3);
 
     let admins = client.get_admins();
     assert!(!admins.iter().any(|a| a == a3));
 }
 
-/// resume requires multi-sig; unpauses after emergency_pause.
+/// 3-of-3: all admins required for resume; succeeds with all 3.
 #[test]
-fn test_multisig_resume_after_pause() {
+fn test_multisig_3_of_3_all_required() {
     let env = Env::default();
     env.mock_all_auths();
 
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
-    let (client, _) = setup_guard(&env, &[a1.clone(), a2.clone()], 2);
+    let a3 = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let client = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 3, &guardian);
 
-    let approvers = vec![&env, a1.clone(), a2.clone()];
-    client.emergency_pause(&approvers).unwrap();
-    assert!(client.is_paused(&emergency_guard::PauseType::MINT));
+    client.emergency_pause(&guardian);
 
-    client.resume(&approvers).unwrap();
+    let approvers = vec![&env, a1.clone(), a2.clone(), a3.clone()];
+    client.resume(&approvers);
     assert!(!client.is_paused(&emergency_guard::PauseType::MINT));
 }
 
@@ -136,10 +181,13 @@ fn test_multisig_duplicate_approvers_rejected() {
 
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
-    let (client, _) = setup_guard(&env, &[a1.clone(), a2.clone()], 2);
+    let guardian = Address::generate(&env);
+    let client = setup_guard(&env, &[a1.clone(), a2.clone()], 2, &guardian);
+
+    client.emergency_pause(&guardian);
 
     // Provide a1 twice — should only count as 1 unique approver
     let approvers = vec![&env, a1.clone(), a1.clone()];
-    let result = client.try_emergency_pause(&approvers);
+    let result = client.try_resume(&approvers);
     assert!(result.is_err());
 }

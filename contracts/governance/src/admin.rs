@@ -36,3 +36,13 @@ pub fn write_config(e: &Env, config: &crate::storage_types::GovernanceConfig) {
     let key = DataKey::Config;
     e.storage().instance().set(&key, config);
 }
+
+pub fn set_security_council(e: &Env, security_council: &Address) {
+    let key = DataKey::SecurityCouncil;
+    e.storage().instance().set(&key, security_council);
+}
+
+pub fn get_security_council(e: &Env) -> Option<Address> {
+    let key = DataKey::SecurityCouncil;
+    e.storage().instance().get(&key)
+}

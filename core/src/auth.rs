@@ -1,10 +1,17 @@
 use crate::errors::AppError;
 use axum::{extract::Request, http::header, middleware::Next, response::Response, Extension, Json};
-use base64::{engine::general_purpose::STANDARD as BASE64, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine};
+use base64::{
+    engine::general_purpose::STANDARD as BASE64,
+    engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine,
+};
 use ed25519_dalek::{Signature as Ed25519Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rand::RngCore;
-use rsa::{pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey}, RsaPrivateKey, RsaPublicKey, traits::PublicKeyParts};
+use rsa::{
+    pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey},
+    traits::PublicKeyParts,
+    RsaPrivateKey, RsaPublicKey,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use soroban_sdk::xdr::{
@@ -12,6 +19,7 @@ use soroban_sdk::xdr::{
     Preconditions, ReadXdr, SequenceNumber, SignatureHint, TimeBounds, TimePoint, Transaction,
     TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, WriteXdr,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use stellar_strkey::Strkey;
@@ -29,6 +37,9 @@ pub struct AuthState {
     pub signing_key: SigningKey,
     pub server_public_key: [u8; 32],
     pub network_passphrase: String,
+    /// Emergency pause flag for message verification.
+    /// When true, all verification endpoints reject requests.
+    pub emergency_verification_paused: Arc<AtomicBool>,
 }
 
 impl AuthState {
@@ -36,6 +47,7 @@ impl AuthState {
         jwt_private_key_pem: Option<String>,
         sep10_seed: Option<[u8; 32]>,
         network_passphrase: String,
+        emergency_verification_paused: bool,
     ) -> Self {
         let seed = match sep10_seed {
             Some(seed) => seed,
@@ -45,6 +57,7 @@ impl AuthState {
                 seed
             }
         };
+        let signing_key = SigningKey::from_bytes(&seed);
         let server_public_key = signing_key.verifying_key().to_bytes();
 
         let priv_key = if let Some(pem) = jwt_private_key_pem {
@@ -59,7 +72,9 @@ impl AuthState {
         let encoding_key = EncodingKey::from_rsa_pem(pem_str.as_bytes()).unwrap();
 
         let pub_key = RsaPublicKey::from(&priv_key);
-        let pub_pem = pub_key.to_public_key_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        let pub_pem = pub_key
+            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap();
         let decoding_key = DecodingKey::from_rsa_pem(pub_pem.as_bytes()).unwrap();
 
         let n = BASE64_URL.encode(pub_key.n().to_bytes_be());
@@ -73,12 +88,22 @@ impl AuthState {
             signing_key,
             server_public_key,
             network_passphrase,
+            emergency_verification_paused: Arc::new(AtomicBool::new(emergency_verification_paused)),
         }
     }
 
     pub fn server_stellar_address(&self) -> String {
         Strkey::PublicKeyEd25519(stellar_strkey::ed25519::PublicKey(self.server_public_key))
             .to_string()
+    }
+
+    pub fn is_verification_paused(&self) -> bool {
+        self.emergency_verification_paused.load(Ordering::SeqCst)
+    }
+
+    pub fn set_verification_paused(&self, paused: bool) {
+        self.emergency_verification_paused
+            .store(paused, Ordering::SeqCst);
     }
 }
 
@@ -104,6 +129,22 @@ pub struct VerifyResponse {
     pub token: String,
 }
 
+/// Emergency pause toggle request (admin-only).
+#[derive(Deserialize, ToSchema)]
+pub struct EmergencyPauseRequest {
+    /// If true, verification is paused. If false, verification resumes.
+    pub paused: bool,
+}
+
+/// Emergency pause toggle response.
+#[derive(Serialize, ToSchema)]
+pub struct EmergencyPauseResponse {
+    /// Current pause status.
+    pub paused: bool,
+    /// Message describing the status change.
+    pub message: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     sub: String,
@@ -116,7 +157,7 @@ struct Claims {
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
 }
 
@@ -183,7 +224,8 @@ fn build_challenge_envelope(
     let hash = tx_hash(&tx, &net_id)?;
     let sig = state.signing_key.sign(&hash);
 
-    let hint: [u8; 4] = state.server_public_key[28..32].try_into().unwrap();
+    let hint: [u8; 4] = state.server_public_key[28..32].try_into()
+        .map_err(|_| AppError::Internal("invalid server public key length".into()))?;
     let decorated = DecoratedSignature {
         hint: SignatureHint(hint),
         signature: sig
@@ -284,20 +326,22 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
     let hash = tx_hash(&inner.tx, &net_id)?;
 
     let sigs: &[DecoratedSignature] = inner.signatures.as_ref();
-    let server_hint: [u8; 4] = state.server_public_key[28..32].try_into().unwrap();
-    let client_hint: [u8; 4] = client_key[28..32].try_into().unwrap();
+    let server_hint: [u8; 4] = state.server_public_key[28..32].try_into()
+        .map_err(|_| AppError::Internal("invalid server public key length".into()))?;
+    let client_hint: [u8; 4] = client_key[28..32].try_into()
+        .map_err(|_| AppError::BadRequest("invalid client public key length".into()))?;
 
     let mut server_ok = false;
     let mut client_ok = false;
 
     for ds in sigs {
         let sig_bytes: &[u8] = ds.signature.as_ref();
-        let Ok(sig) = Ed25519Signature::from_bytes(sig_bytes) else {
+        let Ok(sig) = Ed25519Signature::try_from(sig_bytes) else {
             continue;
         };
 
         if ds.hint.0 == server_hint {
-            if let Ok(vk) = PublicKey::from_bytes(&state.server_public_key) {
+            if let Ok(vk) = VerifyingKey::from_bytes(&state.server_public_key) {
                 if vk.verify(&hash, &sig).is_ok() {
                     server_ok = true;
                 }
@@ -305,7 +349,7 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
         }
 
         if ds.hint.0 == client_hint {
-            if let Ok(vk) = PublicKey::from_bytes(&client_key) {
+            if let Ok(vk) = VerifyingKey::from_bytes(&client_key) {
                 if vk.verify(&hash, &sig).is_ok() {
                     client_ok = true;
                 }
@@ -336,12 +380,8 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
     };
 
     let header = Header::new(Algorithm::RS256);
-    encode(
-        &header,
-        &claims,
-        &state.encoding_key,
-    )
-    .map_err(|e| AppError::Internal(format!("JWT encode error: {e}")))
+    encode(&header, &claims, &state.encoding_key)
+        .map_err(|e| AppError::Internal(format!("JWT encode error: {e}")))
 }
 
 #[utoipa::path(
@@ -350,7 +390,8 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
     request_body = ChallengeRequest,
     responses(
         (status = 200, description = "SEP-10 challenge transaction", body = ChallengeResponse),
-        (status = 400, description = "Invalid account")
+        (status = 400, description = "Invalid account"),
+        (status = 503, description = "Verification paused for emergency maintenance")
     ),
     tag = "Auth"
 )]
@@ -358,6 +399,12 @@ pub async fn challenge_handler(
     Extension(state): Extension<Arc<AuthState>>,
     Json(payload): Json<ChallengeRequest>,
 ) -> Result<Json<ChallengeResponse>, AppError> {
+    if state.is_verification_paused() {
+        return Err(AppError::Internal(
+            "Message verification is temporarily paused for emergency maintenance".into(),
+        ));
+    }
+
     let strkey = Strkey::from_string(&payload.account)
         .map_err(|_| AppError::BadRequest("Invalid Stellar address".into()))?;
 
@@ -380,7 +427,8 @@ pub async fn challenge_handler(
     request_body = VerifyRequest,
     responses(
         (status = 200, description = "JWT token issued", body = VerifyResponse),
-        (status = 401, description = "Authentication failed")
+        (status = 401, description = "Authentication failed"),
+        (status = 503, description = "Verification paused for emergency maintenance")
     ),
     tag = "Auth"
 )]
@@ -388,8 +436,44 @@ pub async fn verify_handler(
     Extension(state): Extension<Arc<AuthState>>,
     Json(payload): Json<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, AppError> {
+    if state.is_verification_paused() {
+        return Err(AppError::Internal(
+            "Message verification is temporarily paused for emergency maintenance".into(),
+        ));
+    }
+
     let token = verify_challenge_envelope(&state, &payload.transaction)?;
     Ok(Json(VerifyResponse { token }))
+}
+
+/// Emergency pause toggle endpoint (for administrative control).
+/// This endpoint allows operators to pause all message verification in emergency scenarios.
+#[utoipa::path(
+    post,
+    path = "/auth/emergency-pause",
+    request_body = EmergencyPauseRequest,
+    responses(
+        (status = 200, description = "Emergency pause toggled", body = EmergencyPauseResponse),
+        (status = 400, description = "Invalid request")
+    ),
+    tag = "Auth"
+)]
+pub async fn emergency_pause_handler(
+    Extension(state): Extension<Arc<AuthState>>,
+    Json(payload): Json<EmergencyPauseRequest>,
+) -> Result<Json<EmergencyPauseResponse>, AppError> {
+    state.set_verification_paused(payload.paused);
+
+    let message = if payload.paused {
+        "Message verification has been PAUSED for emergency maintenance".to_string()
+    } else {
+        "Message verification has been RESUMED".to_string()
+    };
+
+    Ok(Json(EmergencyPauseResponse {
+        paused: payload.paused,
+        message,
+    }))
 }
 
 pub async fn auth_middleware(
@@ -397,6 +481,13 @@ pub async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, AppError> {
+    // Check if verification is paused — deny all requests during emergency maintenance
+    if state.is_verification_paused() {
+        return Err(AppError::Internal(
+            "Authentication is temporarily paused for emergency maintenance".into(),
+        ));
+    }
+
     let auth_header = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -408,15 +499,13 @@ pub async fn auth_middleware(
         .ok_or_else(|| AppError::Unauthorized("Expected Bearer token".into()))?;
 
     let validation = Validation::new(Algorithm::RS256);
-    let token_data = decode::<Claims>(
-        token,
-        &state.decoding_key,
-        &validation,
-    )
-    .map_err(|e| AppError::Unauthorized(format!("Invalid token: {e}")))?;
+    let token_data = decode::<Claims>(token, &state.decoding_key, &validation)
+        .map_err(|e| AppError::Unauthorized(format!("Invalid token: {e}")))?;
 
     if !token_data.claims.scopes.contains(&"simulate".to_string()) {
-        return Err(AppError::Unauthorized("Missing required scope 'simulate'".into()));
+        return Err(AppError::Unauthorized(
+            "Missing required scope 'simulate'".into(),
+        ));
     }
 
     Ok(next.run(req).await)

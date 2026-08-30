@@ -1,0 +1,13 @@
+# Rust
+/target
+**/target
+test_snapshots/
+
+# Node
+/node_modules
+**/node_modules
+
+# Misc
+.DS_Store
+.env
+.env.local

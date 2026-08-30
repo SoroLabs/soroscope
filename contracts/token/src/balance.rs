@@ -26,3 +26,30 @@ pub fn spend_balance(e: &Env, addr: Address, amount: i128) {
     }
     write_balance(e, addr, balance - amount);
 }
+
+// ── Supply helpers ────────────────────────────────────────────────────────
+
+pub fn read_total_supply(e: &Env) -> i128 {
+    let key = DataKey::TotalSupply;
+    e.storage().instance().get(&key).unwrap_or_default()
+}
+
+pub fn write_total_supply(e: &Env, amount: i128) {
+    let key = DataKey::TotalSupply;
+    e.storage().instance().set(&key, &amount);
+}
+
+pub fn has_max_supply(e: &Env) -> bool {
+    let key = DataKey::MaxSupply;
+    e.storage().instance().has(&key)
+}
+
+pub fn read_max_supply(e: &Env) -> i128 {
+    let key = DataKey::MaxSupply;
+    e.storage().instance().get(&key).unwrap()
+}
+
+pub fn write_max_supply(e: &Env, amount: i128) {
+    let key = DataKey::MaxSupply;
+    e.storage().instance().set(&key, &amount);
+}

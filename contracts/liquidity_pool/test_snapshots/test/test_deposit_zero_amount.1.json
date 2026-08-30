@@ -632,7 +632,7 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "GuardAdmins"
+                              "symbol": "Admins"
                             }
                           ]
                         },
@@ -648,24 +648,16 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "GuardPauseState"
+                              "symbol": "PauseState"
                             }
                           ]
                         },
                         "val": {
-                          "u32": 0
-                        }
-                      },
-                      {
-                        "key": {
                           "vec": [
                             {
-                              "symbol": "GuardThreshold"
+                              "u32": 0
                             }
                           ]
-                        },
-                        "val": {
-                          "u32": 1
                         }
                       },
                       {
@@ -678,6 +670,25 @@
                         },
                         "val": {
                           "map": [
+                            {
+                              "key": {
+                                "symbol": "admin"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "base_fee_bps"
+                              },
+                              "val": {
+                                "i128": {
+                                  "hi": 0,
+                                  "lo": 30
+                                }
+                              }
+                            },
                             {
                               "key": {
                                 "symbol": "fee_bps"
@@ -739,6 +750,18 @@
                               }
                             }
                           ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "SignatureThreshold"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
                         }
                       }
                     ]

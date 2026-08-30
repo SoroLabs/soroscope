@@ -82,9 +82,9 @@ export const NutritionLabel: React.FC<NutritionLabelProps> = ({
     };
 
     return (
-        <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-6 font-mono">
-            <div className="border-b-2 border-[#30363d] pb-2 mb-4 flex justify-between items-end">
-                <h2 className="text-2xl font-black text-[#c9d1d9] uppercase tracking-wider">Nutrition Facts</h2>
+        <div className="bg-[var(--bg-card)] border border-[var(--border-default)] rounded-lg p-4 sm:p-6 font-mono">
+            <div className="border-b-2 border-[var(--border-default)] pb-2 mb-4 flex flex-wrap justify-between items-end gap-2">
+                <h2 className="text-xl sm:text-2xl font-black text-[#c9d1d9] uppercase tracking-wider">Nutrition Facts</h2>
                 <span className="text-xs text-[#8b949e]">Per Transaction</span>
             </div>
 
@@ -106,7 +106,7 @@ export const NutritionLabel: React.FC<NutritionLabelProps> = ({
                             </div>
 
                             {/* Progress Bar Container */}
-                            <div className="h-2 w-full bg-[#0d1117] rounded-full overflow-hidden border border-[#30363d]">
+                            <div className="h-2 w-full bg-[var(--bg-elevated)] rounded-full overflow-hidden border border-[var(--border-default)]">
                                 <div
                                     className="h-full rounded-full transition-all duration-500 ease-out"
                                     style={{
@@ -125,7 +125,7 @@ export const NutritionLabel: React.FC<NutritionLabelProps> = ({
                 })}
             </div>
 
-            <div className="mt-6 pt-4 border-t-[4px] border-[#30363d]">
+            <div className="mt-6 pt-4 border-t-[4px] border-[var(--border-default)]">
                 <p className="text-[10px] text-[#8b949e] leading-tight">
                     * Percent Daily Values are based on current Soroban network protocol limits. Your limits may vary based on protocol version.
                 </p>

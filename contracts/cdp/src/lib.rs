@@ -26,6 +26,8 @@ pub enum Error {
     InvalidOraclePrice = 11,
     LiquidationUnavailable = 12,
     MathOverflow = 13,
+    VolatilityNotAvailable = 14,
+    VolatilityTooHigh = 15,
 }
 
 #[contracttype]
@@ -41,6 +43,7 @@ pub struct Position {
 pub struct RiskParams {
     pub min_collateral_ratio_bps: i128,
     pub liquidation_incentive_bps: i128,
+    pub volatility_config: VolatilityConfig,
 }
 
 #[contracttype]
@@ -73,15 +76,26 @@ pub enum DataKey {
     TotalBadDebt,
     RiskParams,
     InterestRateModel,
+    VolatilityConfig,
     Position(Address),
     StableBalance(Address),
 }
 
 pub trait PriceOracle {
     fn latest_price(e: Env) -> i128;
+    fn volatility_bps(e: Env) -> i128;
 }
 
 soroban_sdk::contractclient!(name = "PriceOracleClient", trait = PriceOracle);
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolatilityConfig {
+    pub low_volatility_threshold_bps: i128,
+    pub high_volatility_threshold_bps: i128,
+    pub base_collateral_floor_bps: i128,
+    pub max_collateral_floor_bps: i128,
+}
 
 fn checked_add(a: i128, b: i128) -> Result<i128, Error> {
     a.checked_add(b).ok_or(Error::MathOverflow)
@@ -160,6 +174,19 @@ fn oracle_price(env: &Env) -> Result<i128, Error> {
         return Err(Error::InvalidOraclePrice);
     }
     Ok(price)
+}
+
+fn oracle_volatility_bps(env: &Env) -> Result<i128, Error> {
+    let oracle: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Oracle)
+        .ok_or(Error::OracleNotConfigured)?;
+    let volatility = PriceOracleClient::new(env, &oracle).volatility_bps();
+    if volatility < 0 {
+        return Err(Error::VolatilityNotAvailable);
+    }
+    Ok(volatility)
 }
 
 fn collateral_value(price: i128, collateral_amount: i128) -> Result<i128, Error> {
@@ -248,11 +275,44 @@ fn accrue_position(env: &Env, user: Address) -> Result<Position, Error> {
     Ok(position)
 }
 
+fn dynamic_collateral_floor(env: &Env) -> Result<i128, Error> {
+    let params = read_risk_params(env)?;
+    let volatility = oracle_volatility_bps(env)?;
+    let config = &params.volatility_config;
+    
+    // If volatility is below low threshold, use base floor
+    if volatility <= config.low_volatility_threshold_bps {
+        return Ok(config.base_collateral_floor_bps);
+    }
+    
+    // If volatility is above high threshold, use max floor
+    if volatility >= config.high_volatility_threshold_bps {
+        return Ok(config.max_collateral_floor_bps);
+    }
+    
+    // Linear interpolation between base and max floor
+    let volatility_range = config.high_volatility_threshold_bps - config.low_volatility_threshold_bps;
+    let volatility_above_low = volatility - config.low_volatility_threshold_bps;
+    let floor_range = config.max_collateral_floor_bps - config.base_collateral_floor_bps;
+    
+    let additional_floor = checked_mul(floor_range, volatility_above_low)? / volatility_range;
+    checked_add(config.base_collateral_floor_bps, additional_floor)
+}
+
 fn ensure_safe(env: &Env, position: &Position) -> Result<(), Error> {
     let price = oracle_price(env)?;
     let params = read_risk_params(env)?;
+    let dynamic_floor = dynamic_collateral_floor(env)?;
     let ratio = collateral_ratio_bps(price, position.collateral_amount, position.debt_amount)?;
-    if ratio < params.min_collateral_ratio_bps {
+    
+    // Use the higher of static min ratio or dynamic floor
+    let required_ratio = if params.min_collateral_ratio_bps > dynamic_floor {
+        params.min_collateral_ratio_bps
+    } else {
+        dynamic_floor
+    };
+    
+    if ratio < required_ratio {
         return Err(Error::Undercollateralized);
     }
     Ok(())
@@ -274,6 +334,10 @@ impl CdpContract {
         slope1_bps: i128,
         slope2_bps: i128,
         optimal_utilization_bps: i128,
+        low_volatility_threshold_bps: i128,
+        high_volatility_threshold_bps: i128,
+        base_collateral_floor_bps: i128,
+        max_collateral_floor_bps: i128,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -282,6 +346,11 @@ impl CdpContract {
             || liquidation_incentive_bps < 0
             || optimal_utilization_bps <= 0
             || optimal_utilization_bps >= BPS
+            || low_volatility_threshold_bps < 0
+            || high_volatility_threshold_bps <= low_volatility_threshold_bps
+            || base_collateral_floor_bps < BPS
+            || max_collateral_floor_bps < base_collateral_floor_bps
+            || max_collateral_floor_bps > BPS * 3
         {
             return Err(Error::InvalidConfig);
         }
@@ -296,6 +365,12 @@ impl CdpContract {
             &RiskParams {
                 min_collateral_ratio_bps,
                 liquidation_incentive_bps,
+                volatility_config: VolatilityConfig {
+                    low_volatility_threshold_bps,
+                    high_volatility_threshold_bps,
+                    base_collateral_floor_bps,
+                    max_collateral_floor_bps,
+                },
             },
         );
         env.storage().instance().set(
@@ -364,6 +439,14 @@ impl CdpContract {
         let position = read_position(&env, user);
         let price = oracle_price(&env)?;
         collateral_ratio_bps(price, position.collateral_amount, position.debt_amount)
+    }
+
+    pub fn dynamic_collateral_floor(env: Env) -> Result<i128, Error> {
+        dynamic_collateral_floor(&env)
+    }
+
+    pub fn current_volatility_bps(env: Env) -> Result<i128, Error> {
+        oracle_volatility_bps(&env)
     }
 
     pub fn deposit_collateral(env: Env, user: Address, amount: i128) -> Result<Position, Error> {

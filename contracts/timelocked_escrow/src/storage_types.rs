@@ -23,6 +23,8 @@ pub struct EscrowConfig {
     pub unlock_ledger: u32,
     pub is_released: bool,
     pub is_cancelled: bool,
+    pub cancellation_fee_bps: u32,
+    pub protocol_vault: Address,
 }
 
 // ── Errors ────────────────────────────────────────────────────
@@ -43,6 +45,7 @@ pub enum Error {
     Unauthorized = 10,
     InvalidGuardianCount = 11,
     DuplicateGuardian = 12,
+    CancellationFeeTooHigh = 13,
 }
 
 // ── Event Structs ─────────────────────────────────────────────
@@ -79,6 +82,19 @@ pub struct CancelEvent {
     pub depositor: Address,
     pub token: Address,
     pub amount: i128,
+    pub fee: i128,
+    pub protocol_vault: Address,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct MutualCancelEvent {
+    pub depositor: Address,
+    pub beneficiary: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub fee: i128,
+    pub protocol_vault: Address,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

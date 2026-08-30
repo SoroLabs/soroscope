@@ -767,13 +767,32 @@ fn test_pause_and_unpause() {
     assert_eq!(shares, 1000);
 
     // Admin pauses deposits only.
-    client.guard_pause(&admin, &emergency_guard::PauseType::DEPOSIT, &true);
-    assert!(client.guard_is_paused(&emergency_guard::PauseType::DEPOSIT));
-    assert!(!client.guard_is_paused(&emergency_guard::PauseType::SWAP));
+    client.set_operation_paused(&admin, &emergency_guard::PauseType::DEPOSIT, &true);
+    assert_eq!(client.try_deposit(&user, &1, &1), Err(Ok(Error::Paused)));
 
     // Unpause deposits.
+    client.set_operation_paused(&admin, &emergency_guard::PauseType::DEPOSIT, &false);
+    client.guard_pause(&admin, &pause_op::DEPOSIT, &true);
+    assert!(client.guard_is_paused(&pause_op::DEPOSIT));
+    assert!(!client.guard_is_paused(&pause_op::SWAP));
+
+    // Unpause deposits.
+    client.guard_pause(&admin, &pause_op::DEPOSIT, &false);
+    assert!(!client.guard_is_paused(&pause_op::DEPOSIT));
+    // Admin pauses deposits and swaps together.
+    client.guard_pause(
+        &admin,
+        &(emergency_guard::PauseType::DEPOSIT | emergency_guard::PauseType::SWAP),
+        &true,
+    );
+    assert!(client.guard_is_paused(&emergency_guard::PauseType::DEPOSIT));
+    assert!(client.guard_is_paused(&emergency_guard::PauseType::SWAP));
+    assert!(!client.guard_is_paused(&emergency_guard::PauseType::WITHDRAW));
+
+    // Unpause deposits only, leaving swaps paused.
     client.guard_pause(&admin, &emergency_guard::PauseType::DEPOSIT, &false);
     assert!(!client.guard_is_paused(&emergency_guard::PauseType::DEPOSIT));
+    assert!(client.guard_is_paused(&emergency_guard::PauseType::SWAP));
 
     // Operations should work again
     token_a_admin.mint(&user, &500);
@@ -783,7 +802,61 @@ fn test_pause_and_unpause() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #9)")]
+fn test_emergency_guard_trait_impl() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin1 = Address::generate(&e);
+    let admin2 = Address::generate(&e);
+    let admin3 = Address::generate(&e);
+    let _admins = soroban_sdk::vec![&e, admin1.clone(), admin2.clone(), admin3.clone()];
+
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin1.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin1.clone())
+        .address();
+
+    client.initialize(&admin1, &token_a, &token_b);
+
+    // `initialize` already seeds the guard with admin1 at threshold 1, so grow the
+    // admin set from there instead of calling `init_guard` a second time.
+    client.add_admin(&soroban_sdk::vec![&e, admin1.clone()], &admin2);
+    client.add_admin(
+        &soroban_sdk::vec![&e, admin1.clone(), admin2.clone()],
+        &admin3,
+    );
+    // Lower threshold by rotating to a 3-admin setup — just verify via get_admins/threshold.
+    assert!(!client.get_guard_admins().is_empty());
+
+    // Pause SWAP via single admin.
+    client.guard_pause(&admin1, &PauseType::SWAP, &true);
+    assert!(client.guard_is_paused(&PauseType::SWAP));
+    assert!(!client.guard_is_paused(&PauseType::DEPOSIT));
+
+    let approvers = soroban_sdk::vec![&e, admin1.clone(), admin2.clone()];
+    // Emergency pause all via multi-sig.
+    client.emergency_pause_all(&approvers);
+    assert_eq!(client.get_pause_state(), u32::MAX);
+
+    // Resume all via multi-sig.
+    client.resume_all(&approvers);
+    assert_eq!(client.get_pause_state(), 0);
+
+    // Add and remove admin3 (already added above, so remove it).
+    client.remove_admin(
+        &soroban_sdk::vec![&e, admin1.clone(), admin2.clone()],
+        &admin3,
+    );
+    assert!(!client.get_guard_admins().iter().any(|a| a == admin3));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
 fn test_deposit_when_paused() {
     let e = Env::default();
     e.mock_all_auths();
@@ -813,14 +886,15 @@ fn test_deposit_when_paused() {
     token_b_admin.mint(&user, &1000);
 
     // Pause deposits only.
-    client.guard_pause(&admin, &emergency_guard::PauseType::DEPOSIT, &true);
+    client.set_operation_paused(&admin, &emergency_guard::PauseType::DEPOSIT, &true);
+    client.guard_pause(&admin, &pause_op::DEPOSIT, &true);
 
     // Try to deposit - should panic with Paused error
     client.deposit(&user, &1000, &1000);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #9)")]
+#[should_panic(expected = "Error(Contract, #14)")]
 fn test_swap_when_paused() {
     let e = Env::default();
     e.mock_all_auths();
@@ -851,14 +925,15 @@ fn test_swap_when_paused() {
     client.deposit(&user, &1000, &1000);
 
     // Pause swaps only.
-    client.guard_pause(&admin, &emergency_guard::PauseType::SWAP, &true);
+    client.set_operation_paused(&admin, &emergency_guard::PauseType::SWAP, &true);
+    client.guard_pause(&admin, &pause_op::SWAP, &true);
 
     // Try to swap - should panic with Paused error
     client.swap(&user, &false, &100, &200);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #9)")]
+#[should_panic(expected = "Error(Contract, #14)")]
 fn test_withdraw_when_paused() {
     let e = Env::default();
     e.mock_all_auths();
@@ -889,10 +964,129 @@ fn test_withdraw_when_paused() {
     let shares = client.deposit(&user, &1000, &1000);
 
     // Pause withdrawals only.
-    client.guard_pause(&admin, &emergency_guard::PauseType::WITHDRAW, &true);
+    client.set_operation_paused(&admin, &emergency_guard::PauseType::WITHDRAW, &true);
+    client.guard_pause(&admin, &pause_op::WITHDRAW, &true);
 
     // Try to withdraw - should panic with Paused error
     client.withdraw(&user, &shares);
+}
+
+#[test]
+fn test_pause_deposit_only_allows_swap_and_withdraw() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+    token_a_admin.mint(&user, &3_000);
+    token_b_admin.mint(&user, &3_000);
+    let shares = client.deposit(&user, &1_000, &1_000);
+
+    client.set_operation_paused(&admin, &emergency_guard::PauseType::DEPOSIT, &true);
+
+    assert_eq!(
+        client.try_deposit(&user, &100, &100),
+        Err(Ok(Error::Paused))
+    );
+    assert!(client.swap(&user, &false, &50, &100) > 0);
+    let (withdrawn_a, withdrawn_b) = client.withdraw(&user, &(shares / 10));
+    assert!(withdrawn_a > 0);
+    assert!(withdrawn_b > 0);
+}
+
+#[test]
+fn test_pause_swap_only_allows_deposit_and_withdraw() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+    token_a_admin.mint(&user, &3_000);
+    token_b_admin.mint(&user, &3_000);
+    client.deposit(&user, &1_000, &1_000);
+
+    client.set_operation_paused(&admin, &emergency_guard::PauseType::SWAP, &true);
+
+    assert_eq!(
+        client.try_swap(&user, &false, &50, &100),
+        Err(Ok(Error::Paused))
+    );
+    let added_shares = client.deposit(&user, &500, &500);
+    assert!(added_shares > 0);
+    assert_eq!(client.withdraw(&user, &100), (100, 100));
+}
+
+#[test]
+fn test_pause_withdraw_only_allows_deposit_and_swap() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+    token_a_admin.mint(&user, &3_000);
+    token_b_admin.mint(&user, &3_000);
+    let shares = client.deposit(&user, &1_000, &1_000);
+
+    client.set_operation_paused(&admin, &emergency_guard::PauseType::WITHDRAW, &true);
+
+    assert_eq!(
+        client.try_withdraw(&user, &(shares / 10)),
+        Err(Ok(Error::Paused))
+    );
+    let added_shares = client.deposit(&user, &500, &500);
+    assert!(added_shares > 0);
+    assert!(client.swap(&user, &false, &50, &100) > 0);
 }
 
 // ===== Admin Fee Control Tests =====
@@ -1182,13 +1376,13 @@ fn test_rotate_admin_replaces_guard_and_pool_admin() {
     assert_eq!(client.get_admin(), new_admin);
 
     assert_eq!(
-        client.try_set_operation_paused(&admin, &emergency_guard::PauseType::SWAP, &true),
+        client.try_set_operation_paused(&admin, &pause_op::SWAP, &true),
         Err(Ok(Error::Unauthorized))
     );
 
-    client.set_operation_paused(&new_admin, &emergency_guard::PauseType::SWAP, &true);
+    client.set_operation_paused(&new_admin, &pause_op::SWAP, &true);
     assert_eq!(
-        client.try_set_operation_paused(&new_admin, &emergency_guard::PauseType::SWAP, &false),
+        client.try_set_operation_paused(&new_admin, &pause_op::SWAP, &false),
         Ok(Ok(()))
     );
 }
@@ -1240,7 +1434,7 @@ fn test_failed_rotate_admin_does_not_add_new_admin() {
 
     assert_eq!(
         client.try_rotate_admin(&vec![&e, admin.clone()], &missing_old_admin, &new_admin),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(emergency_guard::GuardError::Unauthorized))
     );
 
     let admins = client.get_admins();
@@ -1272,7 +1466,7 @@ fn test_add_then_remove_admin_enforces_rotation_membership() {
 
     assert_eq!(
         client.try_add_admin(&vec![&e, stranger.clone()], &new_admin),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(emergency_guard::GuardError::Unauthorized))
     );
 
     client.add_admin(&vec![&e, admin.clone()], &new_admin);
@@ -1289,12 +1483,12 @@ fn test_add_then_remove_admin_enforces_rotation_membership() {
 
     assert_eq!(
         client.try_remove_admin(&vec![&e, new_admin.clone()], &new_admin),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(emergency_guard::GuardError::Unauthorized))
     );
 }
 
 #[test]
-fn test_rotated_admin_controls_emergency_pause_and_resume() {
+fn test_rotated_admin_controls_emergency_pause_and_guard_unpause() {
     let e = Env::default();
     e.mock_all_auths();
 
@@ -1326,11 +1520,11 @@ fn test_rotated_admin_controls_emergency_pause_and_resume() {
     );
 
     assert_eq!(
-        client.try_resume(&vec![&e, admin.clone()]),
+        client.try_guard_unpause(&vec![&e, admin.clone()]),
         Err(Ok(Error::Unauthorized))
     );
 
-    client.resume(&vec![&e, new_admin.clone()]);
+    client.guard_unpause(&vec![&e, new_admin.clone()]);
     assert_eq!(client.deposit(&user, &1_000, &1_000), 1_000);
 }
 
@@ -1422,5 +1616,773 @@ fn test_deposit_zero_amount() {
     assert_eq!(
         one_zero_shares, 0,
         "Depositing (0, 500) must mint 0 shares (limited by zero side)"
+    );
+}
+
+// ===== Staking and Rewards Tests =====
+
+#[test]
+fn test_stake_basic() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    // Mint and deposit to get shares
+    token_a_admin.mint(&user, &1000);
+    token_b_admin.mint(&user, &1000);
+    let shares = client.deposit(&user, &1000, &1000);
+
+    // Verify balance before staking
+    assert_eq!(client.balance(&user), shares);
+    assert_eq!(client.get_staked_balance(&user), 0);
+
+    // Stake half of the shares
+    let stake_amount = shares / 2;
+    client.stake(&user, &stake_amount);
+
+    // Verify balances after staking
+    assert_eq!(client.balance(&user), shares - stake_amount);
+    assert_eq!(client.get_staked_balance(&user), stake_amount);
+    assert_eq!(client.get_total_staked(), stake_amount);
+}
+
+#[test]
+fn test_stake_insufficient_balance() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    token_a_admin.mint(&user, &1000);
+    token_b_admin.mint(&user, &1000);
+    let shares = client.deposit(&user, &1000, &1000);
+
+    // Try to stake more than available
+    assert_eq!(
+        client.try_stake(&user, &(shares + 1)),
+        Err(Ok(Error::InsufficientBalance))
+    );
+    assert!(client.try_stake(&user, &(shares + 1)).is_err());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_stake_when_paused() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    token_a_admin.mint(&user, &1000);
+    token_b_admin.mint(&user, &1000);
+    let shares = client.deposit(&user, &1000, &1000);
+
+    // Pause the contract
+    client.set_paused(&true);
+
+    // Try to stake - should panic with Paused error
+    client.stake(&user, &shares);
+}
+
+#[test]
+fn test_unstake_basic() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    token_a_admin.mint(&user, &1000);
+    token_b_admin.mint(&user, &1000);
+    let shares = client.deposit(&user, &1000, &1000);
+
+    // Stake all shares
+    client.stake(&user, &shares);
+    assert_eq!(client.get_staked_balance(&user), shares);
+
+    // Unstake half
+    let unstake_amount = shares / 2;
+    client.unstake(&user, &unstake_amount);
+
+    // Verify balances after unstaking
+    assert_eq!(client.balance(&user), unstake_amount);
+    assert_eq!(client.get_staked_balance(&user), shares - unstake_amount);
+    assert_eq!(client.get_total_staked(), shares - unstake_amount);
+}
+
+#[test]
+fn test_unstake_insufficient_staked() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    token_a_admin.mint(&user, &1000);
+    token_b_admin.mint(&user, &1000);
+    let shares = client.deposit(&user, &1000, &1000);
+
+    client.stake(&user, &(shares / 2));
+
+    // Try to unstake more than staked
+    assert_eq!(
+        client.try_unstake(&user, &shares),
+        Err(Ok(Error::InsufficientShares))
+    );
+    assert!(client.try_unstake(&user, &shares).is_err());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_unstake_when_paused() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    token_a_admin.mint(&user, &1000);
+    token_b_admin.mint(&user, &1000);
+    let shares = client.deposit(&user, &1000, &1000);
+
+    client.stake(&user, &shares);
+
+    // Pause the contract
+    client.set_paused(&true);
+
+    // Try to unstake - should panic with Paused error
+    client.unstake(&user, &shares);
+}
+
+#[test]
+fn test_claim_rewards_basic() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    token_a_admin.mint(&user, &1000);
+    token_b_admin.mint(&user, &1000);
+    let shares = client.deposit(&user, &1000, &1000);
+
+    // Stake shares
+    client.stake(&user, &shares);
+
+    // No rewards initially
+    assert_eq!(client.get_pending_rewards(&user), 0);
+
+    // Advance ledger to accumulate rewards
+    {
+        let mut info = e.ledger().get();
+        info.sequence_number = 100;
+        e.ledger().set(info);
+    }
+    let mut ledger_info = e.ledger().get();
+    ledger_info.sequence_number = 100;
+    e.ledger().set(ledger_info);
+
+    // Now there should be pending rewards
+    let pending = client.get_pending_rewards(&user);
+    assert!(pending > 0);
+
+    // Claim rewards
+    let claimed = client.claim_rewards(&user);
+    assert_eq!(claimed, pending);
+
+    // After claiming, pending should be 0
+    assert_eq!(client.get_pending_rewards(&user), 0);
+}
+
+#[test]
+fn test_claim_rewards_no_stake() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    // Try to claim rewards with no stake
+    let claimed = client.claim_rewards(&user);
+    assert_eq!(claimed, 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_claim_rewards_when_paused() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    token_a_admin.mint(&user, &1000);
+    token_b_admin.mint(&user, &1000);
+    let shares = client.deposit(&user, &1000, &1000);
+
+    client.stake(&user, &shares);
+    {
+        let mut info = e.ledger().get();
+        info.sequence_number = 100;
+        e.ledger().set(info);
+    }
+    let mut ledger_info = e.ledger().get();
+    ledger_info.sequence_number = 100;
+    e.ledger().set(ledger_info);
+
+    // Pause the contract
+    client.set_paused(&true);
+
+    // Try to claim rewards - should panic with Paused error
+    client.claim_rewards(&user);
+}
+
+#[test]
+fn test_stake_unstake_claim_full_cycle() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    // Deposit
+    token_a_admin.mint(&user, &1000);
+    token_b_admin.mint(&user, &1000);
+    let shares = client.deposit(&user, &1000, &1000);
+
+    // Stake
+    client.stake(&user, &shares);
+    assert_eq!(client.get_staked_balance(&user), shares);
+
+    // Advance ledger
+    {
+        let mut info = e.ledger().get();
+        info.sequence_number = 50;
+        e.ledger().set(info);
+    }
+    let mut ledger_info = e.ledger().get();
+    ledger_info.sequence_number = 50;
+    e.ledger().set(ledger_info);
+
+    // Claim some rewards
+    let first_claim = client.claim_rewards(&user);
+    assert!(first_claim > 0);
+
+    // Advance more
+    {
+        let mut info = e.ledger().get();
+        info.sequence_number = 100;
+        e.ledger().set(info);
+    }
+    let mut ledger_info = e.ledger().get();
+    ledger_info.sequence_number = 100;
+    e.ledger().set(ledger_info);
+
+    // Claim more rewards
+    let second_claim = client.claim_rewards(&user);
+    assert!(second_claim > 0);
+
+    // Unstake all
+    client.unstake(&user, &shares);
+    assert_eq!(client.get_staked_balance(&user), 0);
+    assert_eq!(client.balance(&user), shares);
+}
+
+#[test]
+fn test_multiple_users_staking() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let user1 = Address::generate(&e);
+    let user2 = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    // User 1 deposits and stakes
+    token_a_admin.mint(&user1, &1000);
+    token_b_admin.mint(&user1, &1000);
+    let shares1 = client.deposit(&user1, &1000, &1000);
+    client.stake(&user1, &shares1);
+
+    // User 2 deposits and stakes
+    token_a_admin.mint(&user2, &2000);
+    token_b_admin.mint(&user2, &2000);
+    let shares2 = client.deposit(&user2, &2000, &2000);
+    client.stake(&user2, &shares2);
+
+    // Verify total staked
+    assert_eq!(client.get_total_staked(), shares1 + shares2);
+
+    // Advance and claim
+    let mut ledger_info = e.ledger().get();
+    ledger_info.sequence_number = 100;
+    e.ledger().set(ledger_info);
+
+    let rewards1 = client.claim_rewards(&user1);
+    let rewards2 = client.claim_rewards(&user2);
+
+    // User2 staked more, so should get more rewards (approximately 2x)
+    assert!(rewards2 > rewards1);
+}
+
+// ── Slippage protection (issue #650) ─────────────────────────────────────────
+
+/// Pool seeded with `reserve` of each token, plus two traders each funded with
+/// `trader_funds` of both tokens. Returns the pool client, the two traders, and
+/// both token clients for balance assertions.
+fn slippage_fixture<'a>(
+    e: &'a Env,
+    reserve: i128,
+    trader_funds: i128,
+) -> (
+    LiquidityPoolClient<'a>,
+    Address,
+    Address,
+    soroban_sdk::token::Client<'a>,
+    soroban_sdk::token::Client<'a>,
+) {
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(e, &contract_id);
+
+    let admin = Address::generate(e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(e, &token_b);
+
+    let lp = Address::generate(e);
+    let trader = Address::generate(e);
+    let other = Address::generate(e);
+
+    e.cost_estimate().budget().reset_unlimited();
+    client.initialize(&admin, &token_a, &token_b);
+
+    token_a_admin.mint(&lp, &reserve);
+    token_b_admin.mint(&lp, &reserve);
+    client.deposit(&lp, &reserve, &reserve);
+
+    for account in [&trader, &other] {
+        token_a_admin.mint(account, &trader_funds);
+        token_b_admin.mint(account, &trader_funds);
+    }
+
+    (
+        client,
+        trader,
+        other,
+        soroban_sdk::token::Client::new(e, &token_a),
+        soroban_sdk::token::Client::new(e, &token_b),
+    )
+}
+
+#[test]
+fn test_swap_exact_in_delivers_quoted_output() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, token_a, token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // 100 A in against 1000/1000 reserves at the default 30 bps fee.
+    let quote = client.get_amount_out(&false, &100);
+    assert_eq!(quote, 90);
+
+    // Quoting min_amount_out at exactly the quote must still fill: the state the
+    // quote was read from is the state the swap executes against.
+    let received = client.swap_exact_in(&trader, &false, &100, &quote);
+    assert_eq!(received, quote);
+
+    // Exactly `amount_in` leaves the trader, exactly `received` arrives.
+    assert_eq!(token_a.balance(&trader), 1000 - 100);
+    assert_eq!(token_b.balance(&trader), 1000 + received);
+}
+
+#[test]
+fn test_swap_exact_in_rejects_output_below_minimum() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, token_a, token_b) = slippage_fixture(&e, 1000, 1000);
+
+    let quote = client.get_amount_out(&false, &100);
+
+    // Asking for one unit more than the pool can deliver must revert, not fill.
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &100, &(quote + 1)),
+        Err(Ok(Error::SlippageExceeded))
+    );
+
+    // A rejected swap moves nothing.
+    assert_eq!(token_a.balance(&trader), 1000);
+    assert_eq!(token_b.balance(&trader), 1000);
+    assert_eq!(client.get_amount_out(&false, &100), quote);
+}
+
+/// The sandwich this parameter exists to stop: a quote is taken, an attacker
+/// front-runs to move the price, and the victim's swap must abort rather than
+/// fill at the worse rate.
+#[test]
+fn test_swap_exact_in_min_amount_out_blocks_front_run() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, victim, attacker, _token_a, token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // Victim quotes, then the attacker moves the price ahead of them.
+    let quote = client.get_amount_out(&false, &100);
+    client.swap_exact_in(&attacker, &false, &500, &0);
+
+    // The same input now buys materially less.
+    let degraded = client.get_amount_out(&false, &100);
+    assert!(
+        degraded < quote,
+        "front-run should degrade the quote: {degraded} vs {quote}"
+    );
+
+    // With min_amount_out pinned to the original quote, the victim is protected.
+    assert_eq!(
+        client.try_swap_exact_in(&victim, &false, &100, &quote),
+        Err(Ok(Error::SlippageExceeded))
+    );
+    assert_eq!(token_b.balance(&victim), 1000);
+
+    // A min the victim would actually have accepted still fills.
+    let received = client.swap_exact_in(&victim, &false, &100, &degraded);
+    assert_eq!(received, degraded);
+}
+
+#[test]
+fn test_swap_exact_in_zero_minimum_accepts_any_fill() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // min_amount_out = 0 opts out of the check entirely.
+    let received = client.swap_exact_in(&trader, &false, &100, &0);
+    assert!(received > 0);
+    assert_eq!(token_b.balance(&trader), 1000 + received);
+}
+
+#[test]
+fn test_swap_exact_in_buy_a_direction() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, token_a, token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // buy_a: token B goes in, token A comes out.
+    let quote = client.get_amount_out(&true, &100);
+    let received = client.swap_exact_in(&trader, &true, &100, &quote);
+
+    assert_eq!(received, quote);
+    assert_eq!(token_b.balance(&trader), 1000 - 100);
+    assert_eq!(token_a.balance(&trader), 1000 + received);
+
+    // Slippage is enforced in this direction too.
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &true, &100, &(quote * 2)),
+        Err(Ok(Error::SlippageExceeded))
+    );
+}
+
+#[test]
+fn test_swap_exact_in_rejects_invalid_amounts() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &0, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &-100, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // A negative floor would silently disable the check, so reject it.
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &100, &-1),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        client.try_get_amount_out(&false, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        client.try_get_amount_in(&false, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
+fn test_swap_exact_in_input_too_small_to_fill() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1_000_000, 1000);
+
+    // 1 unit against a 1M/1M pool rounds down to zero output. Settling that would
+    // take the input and hand back nothing.
+    assert_eq!(client.get_amount_out(&false, &1), 0);
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &1, &0),
+        Err(Ok(Error::InsufficientLiquidity))
+    );
+}
+
+#[test]
+fn test_swap_exact_in_respects_swap_pause() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    client.pause_swaps();
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &100, &0),
+        Err(Ok(Error::Paused))
+    );
+
+    client.resume_swaps();
+    assert!(client.swap_exact_in(&trader, &false, &100, &0) > 0);
+}
+
+#[test]
+fn test_swap_exact_in_preserves_constant_product() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    let before = client.get_reserves();
+    let product_before = before.0 * before.1;
+
+    client.swap_exact_in(&trader, &false, &100, &0);
+
+    let after = client.get_reserves();
+    // Fees plus truncation in the pool's favour mean the invariant only grows.
+    assert!(
+        after.0 * after.1 >= product_before,
+        "invariant weakened: {} -> {}",
+        product_before,
+        after.0 * after.1
+    );
+}
+
+#[test]
+fn test_swap_exact_in_charges_the_pool_fee() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1_000_000, 1000);
+
+    client.set_fee(&0);
+    let without_fee = client.get_amount_out(&false, &100_000);
+
+    client.set_fee(&MAX_FEE_BPS);
+    let with_fee = client.get_amount_out(&false, &100_000);
+
+    assert!(
+        with_fee < without_fee,
+        "fee should reduce output: {with_fee} vs {without_fee}"
+    );
+}
+
+#[test]
+fn test_amount_in_quote_round_trips_against_amount_out() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    let quoted_out = client.get_amount_out(&false, &100);
+    let quoted_in = client.get_amount_in(&false, &quoted_out);
+
+    // Rounding always favours the pool, so re-quoting never asks for less than
+    // the original input.
+    assert!(
+        quoted_in >= 100,
+        "round trip under-charged: {quoted_in} for {quoted_out} out"
     );
 }
