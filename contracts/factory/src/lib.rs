@@ -248,6 +248,9 @@ pub enum Error {
 pub enum DataKey {
     Admin,
     Pair(Address, Address),
+    Instance(Address),
+    InstanceIndex(u32),
+    InstanceCount,
 }
 
 #[contracttype]
@@ -255,6 +258,23 @@ pub enum DataKey {
 pub struct MultisigConfig {
     pub admins: Vec<Address>,
     pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContractKind {
+    Pool,
+    Vault,
+    Token,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractRecord {
+    pub contract_id: Address,
+    pub creator: Address,
+    pub kind: ContractKind,
+    pub created_at: u64,
 }
 
 fn map_guard_err(err: GuardError) -> Error {
@@ -466,6 +486,13 @@ impl LiquidityPoolFactory {
             .instance()
             .set(&DataKey::Pair(token_0, token_1), &deployed_address);
 
+        let creator: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.current_contract_address());
+        Self::register_instance_internal(&env, &deployed_address, &creator, ContractKind::Pool);
+
         Ok(deployed_address)
     }
 
@@ -477,6 +504,123 @@ impl LiquidityPoolFactory {
         };
 
         env.storage().instance().get(&DataKey::Pair(token_0, token_1))
+    }
+
+    /// Registers a deployed contract instance (pool, vault, or token) in the
+    /// universal registry. The creator must authorize the registration.
+    pub fn register_instance(
+        env: Env,
+        contract_id: Address,
+        creator: Address,
+        kind: ContractKind,
+    ) -> Result<(), Error> {
+        creator.require_auth();
+        Self::register_instance_internal(&env, &contract_id, &creator, kind);
+        Ok(())
+    }
+
+    fn register_instance_internal(
+        env: &Env,
+        contract_id: &Address,
+        creator: &Address,
+        kind: ContractKind,
+    ) {
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Instance(contract_id.clone()))
+        {
+            return;
+        }
+
+        let record = ContractRecord {
+            contract_id: contract_id.clone(),
+            creator: creator.clone(),
+            kind,
+            created_at: env.ledger().timestamp(),
+        };
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InstanceCount)
+            .unwrap_or(0);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Instance(contract_id.clone()), &record);
+        env.storage()
+            .instance()
+            .set(&DataKey::InstanceIndex(count), contract_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::InstanceCount, &(count + 1));
+    }
+
+    /// Returns the registry record for a given contract ID, if registered.
+    pub fn get_instance(env: Env, contract_id: Address) -> Option<ContractRecord> {
+        env.storage().instance().get(&DataKey::Instance(contract_id))
+    }
+
+    /// Returns the total number of registered contract instances.
+    pub fn get_instance_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::InstanceCount)
+            .unwrap_or(0)
+    }
+
+    /// Returns the contract ID stored at the given registry index.
+    pub fn get_instance_at(env: Env, index: u32) -> Option<Address> {
+        env.storage().instance().get(&DataKey::InstanceIndex(index))
+    }
+
+    /// Returns a paginated list of registry records for indexers.
+    pub fn get_instances(env: Env, start: u32, limit: u32) -> Vec<ContractRecord> {
+        let count = Self::get_instance_count(env.clone());
+        let mut out = Vec::new(&env);
+        let mut i = start;
+        while i < count && out.len() < limit {
+            if let Some(addr) = Self::get_instance_at(env.clone(), i) {
+                if let Some(record) = Self::get_instance(env.clone(), addr) {
+                    out.push_back(record);
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Returns all registry records created by the given address.
+    pub fn get_instances_by_creator(env: Env, creator: Address) -> Vec<ContractRecord> {
+        let count = Self::get_instance_count(env.clone());
+        let mut out = Vec::new(&env);
+        for i in 0..count {
+            if let Some(addr) = Self::get_instance_at(env.clone(), i) {
+                if let Some(record) = Self::get_instance(env.clone(), addr) {
+                    if record.creator == creator {
+                        out.push_back(record);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Returns all registry records matching the given contract kind.
+    pub fn get_instances_by_kind(env: Env, kind: ContractKind) -> Vec<ContractRecord> {
+        let count = Self::get_instance_count(env.clone());
+        let mut out = Vec::new(&env);
+        for i in 0..count {
+            if let Some(addr) = Self::get_instance_at(env.clone(), i) {
+                if let Some(record) = Self::get_instance(env.clone(), addr) {
+                    if record.kind == kind {
+                        out.push_back(record);
+                    }
+                }
+            }
+        }
+        out
     }
 
     pub fn get_multisig_config(env: Env) -> MultisigConfig {
