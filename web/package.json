@@ -7,7 +7,6 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint . --ext .ts,.tsx,.js,.jsx",
-    "test": "node --test lib/__tests__/*.test.js"
     "test": "node --test ./lib ./components ./hooks"
   },
   "dependencies": {
