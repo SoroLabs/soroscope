@@ -399,15 +399,15 @@ fn swap_sides(pool: &PoolState, buy_a: bool) -> SwapSides {
 /// Output produced by `amount_in`, constant product net of the pool fee.
 ///
 /// `out = (in_after_fee * reserve_out) / (reserve_in * 10_000 + in_after_fee)`
-/// with `in_after_fee = amount_in * (10_000 - fee_bps)`. Division truncates, so
-/// rounding dust stays with the pool rather than the caller.
+/// with `in_after_fee = amount_in * (10_000 - fee_bps)`. Integer division
+/// truncates toward zero, so dust stays with the pool rather than the caller.
 fn amount_out_for_in(
     amount_in: i128,
     reserve_in: i128,
     reserve_out: i128,
     fee_bps: i128,
 ) -> Result<i128, Error> {
-    if reserve_in <= 0 || reserve_out <= 0 {
+    if amount_in <= 0 || reserve_in <= 0 || reserve_out <= 0 {
         return Err(Error::InsufficientLiquidity);
     }
     let in_after_fee = amount_in
@@ -424,15 +424,15 @@ fn amount_out_for_in(
     Ok(numerator / denominator)
 }
 
-/// Input required to receive exactly `amount_out`, rounded up by one so the
-/// constant-product invariant is never weakened by truncation.
+/// Input required to receive exactly `amount_out`, rounded up so the pool never
+/// loses value due to integer truncation.
 fn amount_in_for_out(
     amount_out: i128,
     reserve_in: i128,
     reserve_out: i128,
     fee_bps: i128,
 ) -> Result<i128, Error> {
-    if amount_out >= reserve_out {
+    if amount_out <= 0 || amount_out >= reserve_out || reserve_in <= 0 || reserve_out <= 0 {
         return Err(Error::InsufficientLiquidity);
     }
     let numerator = reserve_in
@@ -443,7 +443,12 @@ fn amount_in_for_out(
     let denominator = (reserve_out - amount_out)
         .checked_mul(10_000 - fee_bps)
         .ok_or(Error::InsufficientLiquidity)?;
-    Ok((numerator / denominator) + 1)
+    let quotient = numerator / denominator;
+    Ok(if numerator % denominator == 0 {
+        quotient
+    } else {
+        quotient + 1
+    })
 }
 
 /// Point `DataKey::Admin` (and `PoolState::admin`) at `replacement` when
@@ -1072,49 +1077,9 @@ impl LiquidityPool {
         require_not_paused(&e, PauseType::SWAP)?;
         to.require_auth();
 
-        let mut pool = load_pool(&e)?;
-        let (reserve_in, reserve_out, token_in, token_out) = if buy_a {
-            (
-                pool.reserve_b,
-                pool.reserve_a,
-                pool.token_b.clone(),
-                pool.token_a.clone(),
-            )
-        } else {
-        };
-
-        if out >= reserve_out {
-            return Err(Error::InsufficientLiquidity);
+        if out <= 0 || in_max < 0 {
+            return Err(Error::InvalidAmount);
         }
-
-        let fee_scale = 10_000i128 - pool.fee_bps;
-        let numerator = reserve_in
-            .checked_mul(out)
-            .ok_or(Error::InsufficientLiquidity)?
-            .checked_mul(10_000)
-            .ok_or(Error::InsufficientLiquidity)?;
-        let denominator = (reserve_out - out)
-            .checked_mul(fee_scale)
-
-        // Constant-product invariant preservation.
-        //
-        // The required input is `numerator / denominator`, but integer division
-        // truncates toward zero. The previous implementation used
-        // `numerator / denominator + 1`, which unconditionally adds a whole unit
-        // — even when the division is already exact. That systematically
-        // over-charges the trader by one base unit on every exact-division swap,
-        // leaking value into the pool and breaking round-trip price parity
-        // (a swap followed by its inverse no longer returns the original amount).
-        // The correct rule is ceiling division: charge the *smallest* integer
-        // input that still keeps `k' = new_reserve_in * new_reserve_out` at or
-        // above the old invariant `k`. When the division is exact the ceiling is
-        // the quotient itself (no surcharge); otherwise it rounds up by one unit,
-        // rounding in the pool's favour just enough to cover the truncated
-        // remainder. This matches Uniswap-v2's `getAmountIn` semantics.
-        if denominator <= 0 {
-        let amount_in = if numerator % denominator == 0 {
-            numerator / denominator
-            numerator / denominator + 1
 
         let pool = load_pool(&e)?;
         let sides = swap_sides(&pool, buy_a);
