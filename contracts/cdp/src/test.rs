@@ -248,6 +248,55 @@ fn mint_respects_dynamic_collateral_floor_in_high_volatility() {
 }
 
 #[test]
+fn collateral_ratio_bps_rounds_to_nearest_basis_point() {
+    let (env, contract_id, _admin, borrower, _liquidator, _collateral, oracle_id) = setup();
+    let client = CdpContractClient::new(&env, &contract_id);
+    let oracle = MockOracleClient::new(&env, &oracle_id);
+
+    oracle.set_price(&(2 * PRICE_SCALE));
+    client.deposit_collateral(&borrower, &100_000);
+    let position = client.mint_stable(&borrower, &13_334);
+
+    assert_eq!(position.debt_amount, 13_334);
+    assert_eq!(client.collateral_ratio_bps(&borrower).unwrap(), 15_000);
+}
+
+#[test]
+fn liquidation_boundary_ratio_rounds_to_nearest_basis_point() {
+    let (env, contract_id, _admin, borrower, _liquidator, _collateral, oracle_id) = setup();
+    let client = CdpContractClient::new(&env, &contract_id);
+    let oracle = MockOracleClient::new(&env, &oracle_id);
+
+    oracle.set_price(&(2 * PRICE_SCALE));
+    client.deposit_collateral(&borrower, &100_000);
+    client.mint_stable(&borrower, &13_333);
+
+    assert_eq!(client.collateral_ratio_bps(&borrower).unwrap(), 15_001);
+    assert!(client.quote_liquidation(&borrower, &1).is_err());
+
+    client.mint_stable(&borrower, &1);
+    assert_eq!(client.collateral_ratio_bps(&borrower).unwrap(), 15_000);
+    assert!(client.quote_liquidation(&borrower, &1).is_err());
+}
+
+#[test]
+fn zero_debt_ratio_stays_infinite_and_does_not_divide_by_zero() {
+    let (env, contract_id, _admin, borrower, _liquidator, _collateral, oracle_id) = setup();
+    let client = CdpContractClient::new(&env, &contract_id);
+    let oracle = MockOracleClient::new(&env, &oracle_id);
+
+    oracle.set_price(&(2 * PRICE_SCALE));
+    client.deposit_collateral(&borrower, &100_000);
+
+    let mut position = client.get_position(&borrower);
+    position.debt_amount = 0;
+    let ratio = CdpContract::collateral_ratio_bps(env.clone(), borrower.clone());
+
+    assert_eq!(ratio.unwrap(), i128::MAX);
+    assert!(client.quote_liquidation(&borrower, &1).is_err());
+}
+
+#[test]
 fn current_volatility_returns_oracle_value() {
     let (env, contract_id, _admin, _borrower, _liquidator, _collateral, oracle_id) = setup();
     let client = CdpContractClient::new(&env, &contract_id);

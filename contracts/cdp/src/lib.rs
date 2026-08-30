@@ -197,7 +197,19 @@ fn collateral_ratio_bps(price: i128, collateral_amount: i128, debt_amount: i128)
     if debt_amount <= 0 {
         return Ok(i128::MAX);
     }
-    Ok(checked_mul(collateral_value(price, collateral_amount)?, BPS)? / debt_amount)
+
+    let numerator = checked_mul(collateral_amount, price)?;
+    let scaled_numerator = checked_mul(numerator, BPS)?;
+    let denominator = checked_mul(debt_amount, PRICE_SCALE)?;
+    let ratio = scaled_numerator / denominator;
+    let remainder = scaled_numerator % denominator;
+    let remainder_twice = remainder.checked_mul(2).ok_or(Error::MathOverflow)?;
+
+    Ok(if remainder_twice >= denominator {
+        checked_add(ratio, 1)?
+    } else {
+        ratio
+    })
 }
 
 fn total_debt(env: &Env) -> i128 {
