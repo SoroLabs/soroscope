@@ -1,8 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Map, String,
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Map, String, Vec,
 };
 
 #[cfg(test)]
@@ -77,10 +76,12 @@ pub enum DataKey {
     Admin,
     MinVotingUnits,
     IdentityRequired,
+    VoterList,
     NextProposalId,
     Voter(Address),
     IdentityOwner(BytesN<32>),
     Proposal(u32),
+    ProposalSnapshot(u32),
     Receipt(u32, Address),
     ExecutionAdmins,
     ExecutionThreshold,
@@ -328,6 +329,17 @@ impl GovernanceContract {
             voting_units,
             identity_commitment,
         };
+        if previous_profile.is_none() {
+            let mut voters: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::VoterList)
+                .unwrap_or_else(|| Vec::new(&env));
+            voters.push_back(voter.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::VoterList, &voters);
+        }
         env.storage().persistent().set(&voter_key, &profile);
         Ok(profile)
     }
@@ -355,6 +367,24 @@ impl GovernanceContract {
             .instance()
             .get(&DataKey::NextProposalId)
             .unwrap_or(0);
+        let mut voting_units_snapshot = Map::new(&env);
+        let voters: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VoterList)
+            .unwrap_or_else(|| Vec::new(&env));
+        for voter in voters.iter() {
+            if let Some(profile) = env
+                .storage()
+                .persistent()
+                .get::<_, VoterProfile>(&DataKey::Voter(voter.clone()))
+            {
+                voting_units_snapshot.set(voter.clone(), profile.voting_units);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalSnapshot(proposal_id), &voting_units_snapshot);
         let proposal = Proposal {
             id: proposal_id,
             creator: admin,
@@ -424,10 +454,6 @@ impl GovernanceContract {
     ) -> Option<VoteReceipt> {
         let proposal = get_proposal(&env, proposal_id).ok()?;
         proposal.voter_receipts.get(voter)
-    pub fn get_vote_receipt(env: Env, proposal_id: u32, voter: Address) -> Option<VoteReceipt> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Receipt(proposal_id, voter))
     }
 
     pub fn cast_vote(
@@ -447,10 +473,13 @@ impl GovernanceContract {
             return Err(Error::ProposalClosed);
         }
 
-        let profile: VoterProfile = env
+        let snapshot: Map<Address, i128> = env
             .storage()
             .persistent()
-            .get(&DataKey::Voter(voter.clone()))
+            .get(&DataKey::ProposalSnapshot(proposal_id))
+            .ok_or(Error::VoterNotRegistered)?;
+        let voting_units = snapshot
+            .get(voter.clone())
             .ok_or(Error::VoterNotRegistered)?;
 
         let mut receipts = proposal.voter_receipts.clone();
@@ -458,7 +487,7 @@ impl GovernanceContract {
             support,
             credits_spent: 0,
             votes_cast: 0,
-            voting_units_snapshot: profile.voting_units,
+            voting_units_snapshot: voting_units,
         });
 
         if receipt.credits_spent > 0 && receipt.support != support {
