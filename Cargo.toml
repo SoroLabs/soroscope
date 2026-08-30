@@ -19,7 +19,7 @@ members = [
     "core",
 ]
 
-    "contracts/*",
-
 [workspace.dependencies]
 soroban-sdk = "22.0.0"
+ed25519-dalek = "=2.1.1"
+

@@ -1,4 +1,3 @@
-```rust
 #![allow(dead_code)]
 
 mod auth;
@@ -6,13 +5,15 @@ mod benchmarks;
 mod cache;
 mod call_trace_parser;
 mod comparison;
+mod contract_registry;
+mod cors;
 mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
 pub mod fee_store;
 mod gas_golfing;
-mod grpc;
 mod graphql;
+mod grpc;
 pub mod insights;
 mod jobs;
 mod leader_lock;
@@ -24,15 +25,15 @@ mod rpc_throttle;
 mod runner;
 mod simulation;
 mod simulation_service;
+mod sys_alarms;
 mod task_queue;
 mod trace_propagation;
 mod wasm_branch_analysis;
-mod worker_pool;
-mod webhooks;
 mod webhook_validation;
+mod webhooks;
+mod worker_pool;
 mod ws;
-
-use crate::webhook_validation::ValidatedWebhook;
+mod xdr_decoder;
 
 use crate::cache::{ContractCache, SimulationCache};
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
@@ -46,8 +47,9 @@ use crate::jobs::{JobQueue, JobQueueConfig, JobWorker};
 use crate::merkle_tree::MerkleTree;
 use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
 use crate::simulation::{SimulationEngine, SimulationMode, SimulationResult};
-use crate::ws::SimulationBus;
+use crate::webhook_validation::ValidatedWebhook;
 use crate::worker_pool::EventWorkerPool;
+use crate::ws::SimulationBus;
 use axum::{
     extract::{Json, Multipart, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
@@ -64,16 +66,6 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-// CLI Argument Handling
-use crate::fee_analytics::{FeeAnalyticsEngine, MarketConditions, ModelBreakdown};
-use crate::fee_collector::{FeeCollector, FeeCollectorConfig};
-use crate::fee_store::FeeStore;
-use crate::gas_golfing::{GasGolfingAnalyzer, GasGolfingReport};
-use crate::insights::InsightsEngine;
-use crate::jobs::{JobQueue, JobQueueConfig, JobWorker};
-use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
-use crate::simulation::{SimulationEngine, SimulationMode, SimulationResult};
-use crate::ws::SimulationBus;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -252,6 +244,8 @@ fn default_max_ledger_age() -> u32 {
 
 fn default_event_bus_capacity() -> usize {
     256
+}
+
 fn default_allowed_origins() -> String {
     // Empty string means: fall back to allow-all (*).
     // Operators set ALLOWED_ORIGINS=http://localhost:3000,https://app.example.com
@@ -520,23 +514,40 @@ impl AppMetrics {
             &["host"],
         )?;
         let host_memory_usage_percent = prometheus::GaugeVec::new(
+            Opts::new(
                 "host_memory_usage_percent",
                 "Host-wide memory usage percentage (0-100) sampled by the system alarm monitor",
+            ),
+            &["host"],
+        )?;
         let process_memory_bytes = prometheus::GaugeVec::new(
+            Opts::new(
                 "process_memory_bytes",
                 "Resident memory size of the SoroScope process in bytes",
+            ),
             &["process"],
+        )?;
         let indexing_latency_seconds = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "indexing_latency_seconds",
                 "Latency of ledger indexing/collection cycles in seconds",
+            ),
             &["stage"],
+        )?;
         let events_processed_total = IntCounterVec::new(
+            Opts::new(
                 "events_processed_total",
                 "Total number of ledger events successfully processed",
+            ),
+            &["stage"],
+        )?;
         let indexing_errors_total = IntCounterVec::new(
+            Opts::new(
                 "indexing_errors_total",
                 "Total number of indexing cycle failures",
+            ),
+            &["stage"],
+        )?;
         let job_queue_depth = prometheus::GaugeVec::new(
             Opts::new("job_queue_depth", "Current depth of background job queues"),
             &["queue"],
@@ -928,7 +939,6 @@ fn to_report(
         protocol_version: result.protocol_version,
         testnet_averages: TestnetAverages {
             cpu_instructions: 3_000_000,
-            ram_bytes: 512_000,
             ledger_read_bytes: 2_048,
             ledger_write_bytes: 1_024,
             transaction_size_bytes: 600,
@@ -1151,12 +1161,7 @@ async fn analyze_wasm(
     }
 
     // ── Validate WASM binary version: must be version 1 (little-endian) ──────
-    let version = u32::from_le_bytes([
-        wasm_bytes[4],
-        wasm_bytes[5],
-        wasm_bytes[6],
-        wasm_bytes[7],
-    ]);
+    let version = u32::from_le_bytes([wasm_bytes[4], wasm_bytes[5], wasm_bytes[6], wasm_bytes[7]]);
     if version != 1 {
         return Err(AppError::BadRequest(format!(
             "Unsupported WASM version: {}. Expected version 1.",
@@ -1901,10 +1906,11 @@ fn group_batch_entries(
     }
 }
 
-async fn incoming_webhook(
-    ValidatedWebhook(body): ValidatedWebhook,
-) -> impl IntoResponse {
-    tracing::info!("Received authenticated inbound webhook of length {}", body.len());
+async fn incoming_webhook(ValidatedWebhook(body): ValidatedWebhook) -> impl IntoResponse {
+    tracing::info!(
+        "Received authenticated inbound webhook of length {}",
+        body.len()
+    );
     StatusCode::OK
 }
 
@@ -1917,7 +1923,10 @@ async fn health_check() -> &'static str {
 /// Returns 200 OK as long as the process is running. No external dependency
 /// checks are performed; a live process is always considered alive.
 async fn healthz() -> impl IntoResponse {
-    (StatusCode::OK, axum::Json(serde_json::json!({"status": "ok"})))
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({"status": "ok"})),
+    )
 }
 
 /// `/readyz` — Kubernetes readiness probe.
@@ -1988,17 +1997,21 @@ async fn main() {
     let config = load_config().expect("Failed to load configuration");
 
     // ── Tracing init (#572: JSON format + x-request-id correlation) ────
-    let log_json = env::var("LOG_FORMAT").map(|v| v.to_lowercase() == "json").unwrap_or(false);
-    let filter = EnvFilter::from_default_env();
+    let log_json = env::var("LOG_FORMAT")
+        .map(|v| v.to_lowercase() == "json")
+        .unwrap_or(false);
+    let filter = build_env_filter(&config.rust_log);
     if log_json {
         tracing_subscriber::registry()
             .with(filter)
             .with(tracing_subscriber::fmt::layer().json())
             .init();
     } else {
+        tracing_subscriber::registry()
+            .with(filter)
             .with(tracing_subscriber::fmt::layer())
+            .init();
     }
-        .with(build_env_filter(&config.rust_log))
 
     tracing::info!(rust_log = %config.rust_log, "SoroScope Starting...");
     tracing::info!("SoroScope initialized with config: {:?}", config);
@@ -2301,9 +2314,7 @@ async fn main() {
         let (start, end) = match (start_ledger, end_ledger) {
             (Some(s), Some(e)) if s <= e => (s, e),
             _ => {
-                eprintln!(
-                    "Usage: soroscope-cli reindex --start-ledger <N> --end-ledger <M>"
-                );
+                eprintln!("Usage: soroscope-cli reindex --start-ledger <N> --end-ledger <M>");
                 eprintln!("\nRe-fetch and re-process ledger fee data for the given ledger range.");
                 eprintln!("\nArguments:");
                 eprintln!("  --start-ledger <N>  First ledger sequence to re-index (inclusive)");
@@ -2337,10 +2348,21 @@ async fn main() {
             request_timeout: std::time::Duration::from_secs(30),
         };
 
+        let metrics = Arc::new(AppMetrics::new().expect("Failed to initialize Prometheus metrics"));
+        let redis_client = redis::Client::open(config.redis_url.clone())
+            .expect("Failed to create Redis client for leader lock");
+        let leader_lock = Arc::new(crate::leader_lock::RedisLeaderLock::new(
+            redis_client,
+            "reindex_fee_collector",
+            std::time::Duration::from_secs(10),
+        ));
+
         let collector = Arc::new(FeeCollector::new(
             Arc::clone(&registry),
             Arc::clone(&fee_store),
             collector_config,
+            metrics,
+            leader_lock,
         ));
 
         let total = end - start + 1;
@@ -2371,9 +2393,7 @@ async fn main() {
             }
         }
 
-        println!(
-            "Re-indexing complete. Processed: {processed}/{total}, Errors: {errors}"
-        );
+        println!("Re-indexing complete. Processed: {processed}/{total}, Errors: {errors}");
 
         return;
     }
@@ -2431,9 +2451,14 @@ async fn main() {
     tracing::info!(mode = ?simulation_mode, "Simulation mode configured");
 
     // Initialize the dedicated event worker pool
-    let event_pool = Arc::new(EventWorkerPool::new(config.event_worker_threads)
-        .expect("Failed to build event worker pool"));
-    tracing::info!("Dedicated event worker pool initialized with {} threads", config.event_worker_threads);
+    let event_pool = Arc::new(
+        EventWorkerPool::new(config.event_worker_threads)
+            .expect("Failed to build event worker pool"),
+    );
+    tracing::info!(
+        "Dedicated event worker pool initialized with {} threads",
+        config.event_worker_threads
+    );
 
     // ── Fee Market Setup ────────────────────────────────────────────────
     let database_url = &config.database_url;
@@ -2467,7 +2492,7 @@ async fn main() {
     let simulation_bus = SimulationBus::with_capacity(config.event_bus_capacity);
 
     // Spawn background cleanup task
-    job_queue.spawn_cleanup_task();
+    job_queue.spawn_cleanup_task(shutdown_tx.subscribe());
 
     let job_worker = JobWorker::new(
         job_queue.clone(),
@@ -2609,9 +2634,7 @@ async fn main() {
     let simulation_cache = SimulationCache::new(&sled_db);
     let contract_cache = Arc::new(ContractCache::new(&sled_db));
 
-    let app_metrics = Arc::new(
-        AppMetrics::new().expect("Failed to initialize Prometheus metrics"),
-    );
+    let app_metrics = Arc::new(AppMetrics::new().expect("Failed to initialize Prometheus metrics"));
 
     let app_state = Arc::new(AppState {
         engine: SimulationEngine::with_registry_and_cache(
@@ -2628,7 +2651,6 @@ async fn main() {
         fee_analytics_engine,
         fee_store,
         metrics: Arc::clone(&app_metrics),
-        metrics,
         simulation_bus,
     });
 
@@ -2662,8 +2684,6 @@ async fn main() {
     let graphql_schema =
         graphql::build_schema(app_state.job_queue.clone(), app_state.engine.clone());
 
-    let cors = CorsLayer::new().allow_origin(Any);
-    let cors = soroscope_core::cors::build_cors_layer(&config.cors_allowed_origins);
     let cors = {
         let raw = config.allowed_origins.trim().to_string();
         if raw.is_empty() {
@@ -2677,6 +2697,7 @@ async fn main() {
                 .filter_map(|s| s.trim().parse::<HeaderValue>().ok())
                 .collect();
             CorsLayer::new().allow_origin(origins)
+        }
     };
 
     let protected = Router::new()
@@ -2716,9 +2737,9 @@ async fn main() {
         .route("/api/v1/webhooks/incoming", post(incoming_webhook))
         .merge(protected)
         .layer(Extension(auth_state))
-        .layer(Extension(webhook_validation::InboundWebhookSecret(Arc::new(
-            config.inbound_webhook_secret.clone(),
-        ))))
+        .layer(Extension(webhook_validation::InboundWebhookSecret(
+            Arc::new(config.inbound_webhook_secret.clone()),
+        )))
         // GraphQL contract execution history + token metadata query layer.
         .route(
             "/graphql",
@@ -2774,19 +2795,12 @@ async fn main() {
 async fn shutdown_signal(shutdown_tx: tokio::sync::broadcast::Sender<()>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
+            .await
             .expect("failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]
     let terminate = async {
-        .with_graceful_shutdown(shutdown_signal())
-
-    tracing::info!("Server shut down gracefully.");
-
-/// Waits for SIGTERM (Unix) or Ctrl-C (all platforms) and resolves once either
-/// signal is received, allowing axum to finish in-flight requests before exit.
-async fn shutdown_signal() {
-    let sigterm = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler")
             .recv()
@@ -2797,12 +2811,17 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        _ = ctrl_c => {
+            tracing::info!("Received SIGINT (Ctrl-C), shutting down…");
+        },
+        _ = terminate => {
+            tracing::info!("Received SIGTERM, shutting down…");
+        },
     }
 
     tracing::info!("Shutdown signal received; notifying background workers");
     let _ = shutdown_tx.send(());
+}
 
 /// Await every worker handle, aborting any that hang past a short grace period.
 async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
@@ -2820,12 +2839,7 @@ async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
                     "Background worker did not exit within {:?}; aborted",
                     WORKER_JOIN_TIMEOUT
                 );
-    let sigterm = std::future::pending::<()>();
-
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Received SIGINT (Ctrl-C), shutting down…");
-        _ = sigterm => {
-            tracing::info!("Received SIGTERM, shutting down…");
+            }
         }
     }
 }
@@ -3034,7 +3048,9 @@ mod tests {
             .route("/api/v1/webhooks/incoming", post(incoming_webhook))
             .merge(protected)
             .layer(Extension(auth_state))
-            .layer(Extension(webhook_validation::InboundWebhookSecret(webhook_secret)))
+            .layer(Extension(webhook_validation::InboundWebhookSecret(
+                webhook_secret,
+            )))
             .with_state(app_state)
     }
 
@@ -3187,5 +3203,3 @@ async fn analyze_simulation(
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))
 }
-
-```

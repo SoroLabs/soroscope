@@ -199,9 +199,7 @@ impl OracleAggregator {
         });
 
         let pruned = Self::prune_samples(env, &samples, now, window);
-        env.storage()
-            .instance()
-            .set(&DataKey::TwapSamples, &pruned);
+        env.storage().instance().set(&DataKey::TwapSamples, &pruned);
         env.storage()
             .instance()
             .set(&DataKey::TwapWindowSeconds, &window);
@@ -210,7 +208,12 @@ impl OracleAggregator {
     /// Keep samples inside the window, plus the last sample that started
     /// before `window_start` so the price in effect at the window boundary
     /// is still weighted.
-    fn prune_samples(env: &Env, samples: &Vec<TwapSample>, now: u64, window: u64) -> Vec<TwapSample> {
+    fn prune_samples(
+        env: &Env,
+        samples: &Vec<TwapSample>,
+        now: u64,
+        window: u64,
+    ) -> Vec<TwapSample> {
         let window_start = now.saturating_sub(window);
         let mut pruned = Vec::new(env);
         let mut last_before: Option<TwapSample> = None;
@@ -309,7 +312,8 @@ impl OracleAggregator {
             let price = prices.get(idx).unwrap();
             let diff = Self::abs_diff(price, median);
             let exceeds_stddev = std > 0 && diff >= std.saturating_mul(STDDEV_MULTIPLIER);
-            let exceeds_pct = diff.saturating_mul(100) > median.saturating_mul(MAX_DEVIATION_PERCENT);
+            let exceeds_pct =
+                diff.saturating_mul(100) > median.saturating_mul(MAX_DEVIATION_PERCENT);
             if !exceeds_stddev && !exceeds_pct {
                 filtered.push_back(price);
             }

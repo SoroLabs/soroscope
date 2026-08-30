@@ -219,11 +219,7 @@ impl MultiYieldVault {
 
     /// Register a new AMM pool.  `deposit_is_a` tells the vault whether the
     /// deposit token is token_a (true) or token_b (false) in that pool.
-    pub fn register_pool(
-        e: Env,
-        pool: Address,
-        deposit_is_a: bool,
-    ) -> Result<(), Error> {
+    pub fn register_pool(e: Env, pool: Address, deposit_is_a: bool) -> Result<(), Error> {
         let vault = load_vault(&e)?;
         vault.admin.require_auth();
 
@@ -306,8 +302,11 @@ impl MultiYieldVault {
         }
 
         // Pull deposit token from user into vault.
-        soroban_sdk::token::Client::new(&e, &vault.deposit_token)
-            .transfer(&from, &e.current_contract_address(), &amount);
+        soroban_sdk::token::Client::new(&e, &vault.deposit_token).transfer(
+            &from,
+            &e.current_contract_address(),
+            &amount,
+        );
 
         // Validate weights sum
         let mut sum_weights: u32 = 0;
@@ -429,8 +428,11 @@ impl MultiYieldVault {
         save_pools(&e, &pools);
 
         // Send deposit token to user.
-        soroban_sdk::token::Client::new(&e, &vault.deposit_token)
-            .transfer(&e.current_contract_address(), &to, &total_received);
+        soroban_sdk::token::Client::new(&e, &vault.deposit_token).transfer(
+            &e.current_contract_address(),
+            &to,
+            &total_received,
+        );
 
         e.storage().persistent().set(&bal_key, &(cur - shares));
         e.storage()
@@ -543,7 +545,8 @@ impl MultiYieldVault {
 
         save_pools(&e, &pools);
 
-        e.events().publish(("rebalance",), (last_idx as u32, total_to_move));
+        e.events()
+            .publish(("rebalance",), (last_idx as u32, total_to_move));
         Ok(())
     }
 

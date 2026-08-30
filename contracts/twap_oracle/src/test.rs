@@ -15,7 +15,10 @@ fn test_initialize() {
     assert_eq!(client.initialize(&token_a, &token_b, &60), Ok(()));
 
     // Try to initialize again
-    assert_eq!(client.initialize(&token_a, &token_b, &60), Err(Error::AlreadyInitialized));
+    assert_eq!(
+        client.initialize(&token_a, &token_b, &60),
+        Err(Error::AlreadyInitialized)
+    );
 
     let (a, b) = client.get_tokens();
     assert_eq!(a, token_a);
@@ -74,13 +77,19 @@ fn test_update_too_soon() {
     client.update_price(&100);
 
     // Try update immediately
-    assert_eq!(client.update_price(&110), Err(Error::InsufficientTimeElapsed));
+    assert_eq!(
+        client.update_price(&110),
+        Err(Error::InsufficientTimeElapsed)
+    );
 
     // Advance time by 50 seconds
     e.ledger().with_mut(|li| li.timestamp = 1050);
 
     // Still not enough
-    assert_eq!(client.update_price(&110), Err(Error::InsufficientTimeElapsed));
+    assert_eq!(
+        client.update_price(&110),
+        Err(Error::InsufficientTimeElapsed)
+    );
 
     // Advance to 1060
     e.ledger().with_mut(|li| li.timestamp = 1060);
@@ -176,4 +185,3 @@ fn test_u128_wrapping_does_not_panic() {
     // get_twap should not panic either.
     let _twap = client.get_twap();
 }
-

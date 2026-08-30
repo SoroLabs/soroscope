@@ -38,7 +38,7 @@ use reqwest::Client;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
-use sysinfo::{Pid, ProcessExt, System, SystemExt};
+use sysinfo::{Pid, System};
 use tracing::{info, warn};
 
 /// Default alarm threshold, matching the spec from issue #592.
@@ -124,13 +124,13 @@ impl SysAlarmConfig {
             }
             Ok(_) => warn!(
                 value = raw,
-                env = ENV_THRESHOLD,
-                "Ignoring {env}: outside [0, 100] range"
+                env = %ENV_THRESHOLD,
+                "Ignoring threshold: outside [0, 100] range"
             ),
             Err(_) => warn!(
                 value = raw,
-                env = ENV_THRESHOLD,
-                "Ignoring {env}: not a valid floating point number"
+                env = %ENV_THRESHOLD,
+                "Ignoring threshold: not a valid floating point number"
             ),
         }
     }
@@ -142,8 +142,8 @@ impl SysAlarmConfig {
             }
             _ => warn!(
                 value = raw,
-                env = ENV_INTERVAL,
-                "Ignoring {env}: must be a positive integer number of seconds"
+                env = %ENV_INTERVAL,
+                "Ignoring interval: must be a positive integer number of seconds"
             ),
         }
     }
@@ -480,8 +480,7 @@ impl SysAlarmMonitor {
             Ok(response) => {
                 warn!(
                     status = response.status().as_u16(),
-                    url,
-                    "Sysalarm webhook returned non-success status"
+                    url, "Sysalarm webhook returned non-success status"
                 );
             }
             Err(err) => {
@@ -650,12 +649,8 @@ mod tests {
     #[test]
     fn config_from_env_reads_threshold_interval_and_webhook() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _restore = EnvRestore::capture(&[
-            ENV_THRESHOLD,
-            ENV_INTERVAL,
-            ENV_WEBHOOK,
-            ENV_DISABLE,
-        ]);
+        let _restore =
+            EnvRestore::capture(&[ENV_THRESHOLD, ENV_INTERVAL, ENV_WEBHOOK, ENV_DISABLE]);
 
         std::env::set_var(ENV_THRESHOLD, "92.5");
         std::env::set_var(ENV_INTERVAL, "15");

@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, Bytes, Env, Symbol, Vec, Map};
+use soroban_sdk::{contract, contractimpl, Bytes, Env, Map, Symbol, Vec};
 
 #[cfg(test)]
 mod test;
@@ -153,12 +153,8 @@ impl StorageHeavyContract {
         if len > 32 {
             panic!("Cannot unpack more than 32 boolean values from a u32");
         }
-        let mask: u32 = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(0u32);
-        
+        let mask: u32 = env.storage().persistent().get(&key).unwrap_or(0u32);
+
         let mut results = Vec::new(&env);
         for i in 0..len {
             results.push_back((mask & (1 << i)) != 0);
@@ -176,11 +172,7 @@ impl StorageHeavyContract {
         if flag_idx >= 32 {
             panic!("Flag index out of range for u32");
         }
-        let mut mask: u32 = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(0u32);
+        let mut mask: u32 = env.storage().persistent().get(&key).unwrap_or(0u32);
 
         if value {
             mask |= 1 << flag_idx;
@@ -206,7 +198,7 @@ impl StorageHeavyContract {
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Map::new(&env));
-        
+
         let mut results = Vec::new(&env);
         for i in 0..len {
             results.push_back(map.get(i).unwrap_or(false));
@@ -225,4 +217,3 @@ impl StorageHeavyContract {
         env.storage().persistent().set(&key, &map);
     }
 }
-

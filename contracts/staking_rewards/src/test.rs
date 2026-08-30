@@ -95,9 +95,9 @@ fn test_stake_and_yield_accumulation_no_decay() {
         &staking_token,
         &reward_token,
         &INITIAL_RATE,
-        &0i128,                    // epoch_decay_percent = 0 (no decay)
+        &0i128, // epoch_decay_percent = 0 (no decay)
         &EPOCH_LENGTH,
-        &10u32,                    // start_block = 10
+        &10u32, // start_block = 10
     );
 
     let user = Address::generate(&e);

@@ -1,7 +1,9 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{contract, contractimpl, contracttype, testutils::Ledger as _, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, testutils::Ledger as _, Address, Env, Vec,
+};
 
 // ---------------------------------------------------------------------------
 // Stub oracle contracts – each lives in its own module to prevent
@@ -156,7 +158,7 @@ fn test_aggregate_three_fresh_sources() {
 
     let sources = Vec::from_array(&env, [fresh_100, fresh_101, fresh_99]);
     // All three fresh; median of sorted [99, 100, 101] = 100.
-        assert_eq!(client.aggregate_price(&sources, &60), 100);
+    assert_eq!(client.aggregate_price(&sources, &60), 100);
 }
 
 #[test]
@@ -170,7 +172,7 @@ fn test_aggregate_ignores_outlier_keeps_fresh_median() {
 
     let sources = Vec::from_array(&env, [fresh_100, fresh_101, fresh_99, outlier]);
     // Outlier (150_000) is filtered as an extreme outlier; median = 100.
-        assert_eq!(client.aggregate_price(&sources, &60), 100);
+    assert_eq!(client.aggregate_price(&sources, &60), 100);
 }
 
 #[test]
@@ -184,7 +186,7 @@ fn test_aggregate_skips_unresponsive_source() {
 
     let sources = Vec::from_array(&env, [fresh_100, fresh_101, fresh_99, unresponsive]);
     // Unresponsive skipped; three fresh remain → median = 100.
-        assert_eq!(client.aggregate_price(&sources, &60), 100);
+    assert_eq!(client.aggregate_price(&sources, &60), 100);
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +206,7 @@ fn test_stale_source_excluded_when_three_fresh_remain() {
     // max_age_seconds = 60 → stale source (age 500 s) is excluded.
     // Three fresh sources remain → median = 100.
     let sources = Vec::from_array(&env, [fresh_100, fresh_101, fresh_99, stale]);
-        assert_eq!(client.aggregate_price(&sources, &60), 100);
+    assert_eq!(client.aggregate_price(&sources, &60), 100);
 }
 
 #[test]
@@ -327,7 +329,7 @@ fn test_aggregate_median_even_number_sources() {
     // 4 sources: 100, 101, 99, 101 → sorted: 99, 100, 101, 101
     // Median should be (100 + 101) / 2 = 100
     let sources = Vec::from_array(&env, [fresh_100, fresh_101, fresh_99, extra_101]);
-        assert_eq!(client.aggregate_price(&sources, &60), 100);
+    assert_eq!(client.aggregate_price(&sources, &60), 100);
 }
 
 // ---------------------------------------------------------------------------
@@ -391,7 +393,7 @@ fn test_stddev_filter_rejects_extreme_outlier() {
 
     let sources = Vec::from_array(&env, [fresh_100, fresh_101, fresh_99, outlier]);
     // 150_000 is many σ away from the median (~100) and is dropped.
-        assert_eq!(client.aggregate_price(&sources, &60), 100);
+    assert_eq!(client.aggregate_price(&sources, &60), 100);
 }
 
 #[test]
@@ -480,8 +482,5 @@ fn test_initialize_rejects_zero_window() {
     let env = Env::default();
     let aggregator_id = env.register(OracleAggregator, ());
     let client = OracleAggregatorClient::new(&env, &aggregator_id);
-    assert_eq!(
-        client.try_initialize(&0),
-        Err(Ok(Error::InvalidWindow))
-    );
+    assert_eq!(client.try_initialize(&0), Err(Ok(Error::InvalidWindow)));
 }

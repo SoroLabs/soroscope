@@ -105,26 +105,27 @@ impl BoundedTaskDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     #[tokio::test]
     async fn low_priority_tasks_are_dropped_once_saturated() {
         let dispatcher = BoundedTaskDispatcher::new(1);
-        let started = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 
-        // Occupy the single slot with a long-running task.
-        let held = started.clone();
+        // Occupy the single slot with a task that holds its permit until released.
         let outcome = dispatcher
             .dispatch(TaskPriority::Low, async move {
-                held.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
             })
             .await;
         assert_eq!(outcome, DispatchOutcome::Spawned);
 
-        // Give the spawned task a chance to acquire the permit.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Await the explicit notification that the task has started and acquired the permit.
+        started_rx
+            .await
+            .expect("first task must start and acquire permit");
 
         // The dispatcher is now saturated; a second low-priority task must
         // be dropped rather than queued.
@@ -135,33 +136,47 @@ mod tests {
             .await;
         assert_eq!(evicted, DispatchOutcome::Dropped);
         assert_eq!(dispatcher.dropped_count(), 1);
+
+        // Cleanly release the first task.
+        let _ = release_tx.send(());
     }
 
     #[tokio::test]
     async fn normal_priority_tasks_wait_for_a_free_slot_instead_of_dropping() {
         let dispatcher = BoundedTaskDispatcher::new(1);
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (first_release_tx, first_release_rx) = tokio::sync::oneshot::channel();
+        let (second_completed_tx, second_completed_rx) = tokio::sync::oneshot::channel();
 
-        dispatcher
-            .dispatch(TaskPriority::Low, async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+        // First task occupies the only slot
+        let outcome_1 = dispatcher
+            .dispatch(TaskPriority::Low, async move {
+                let _ = first_started_tx.send(());
+                let _ = first_release_rx.await;
             })
             .await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(outcome_1, DispatchOutcome::Spawned);
 
-        let ran = Arc::new(AtomicUsize::new(0));
-        let ran_clone = ran.clone();
-        let outcome = tokio::time::timeout(
-            Duration::from_millis(500),
-            dispatcher.dispatch(TaskPriority::Normal, async move {
-                ran_clone.fetch_add(1, Ordering::SeqCst);
-            }),
-        )
-        .await
-        .expect("normal-priority dispatch should not hang indefinitely");
+        first_started_rx
+            .await
+            .expect("first task must start and acquire permit");
 
-        assert_eq!(outcome, DispatchOutcome::Spawned);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        // Normal priority task is dispatched; it should wait for a free slot
+        let second_task = dispatcher.dispatch(TaskPriority::Normal, async move {
+            let _ = second_completed_tx.send(());
+        });
+
+        // Release the first task so the normal-priority task can proceed
+        let _ = first_release_tx.send(());
+
+        let outcome_2 = tokio::time::timeout(Duration::from_secs(5), second_task)
+            .await
+            .expect("normal-priority dispatch should not hang indefinitely");
+        assert_eq!(outcome_2, DispatchOutcome::Spawned);
+
+        second_completed_rx
+            .await
+            .expect("second task must complete after permit is released");
         assert_eq!(dispatcher.dropped_count(), 0);
     }
 

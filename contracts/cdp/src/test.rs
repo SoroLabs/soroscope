@@ -25,7 +25,9 @@ impl MockOracle {
     }
 
     pub fn set_volatility(env: Env, volatility_bps: i128) {
-        env.storage().instance().set(&OracleDataKey::Volatility, &volatility_bps);
+        env.storage()
+            .instance()
+            .set(&OracleDataKey::Volatility, &volatility_bps);
     }
 
     pub fn latest_price(env: Env) -> i128 {
@@ -43,15 +45,7 @@ impl MockOracle {
     }
 }
 
-fn setup() -> (
-    Env,
-    Address,
-    Address,
-    Address,
-    Address,
-    Address,
-    Address,
-) {
+fn setup() -> (Env, Address, Address, Address, Address, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -83,10 +77,10 @@ fn setup() -> (
         &800,
         &2_000,
         &8_000,
-        &1_000,   // low_volatility_threshold_bps (10%)
-        &5_000,   // high_volatility_threshold_bps (50%)
-        &15_000,  // base_collateral_floor_bps (150%)
-        &25_000,  // max_collateral_floor_bps (250%)
+        &1_000,  // low_volatility_threshold_bps (10%)
+        &5_000,  // high_volatility_threshold_bps (50%)
+        &15_000, // base_collateral_floor_bps (150%)
+        &25_000, // max_collateral_floor_bps (250%)
     );
 
     (
@@ -161,7 +155,10 @@ fn third_party_liquidation_burns_stable_and_seizes_collateral() {
 
     let quote = client.liquidate(&liquidator, &borrower, &20_000);
 
-    assert_eq!(client.stable_balance(&liquidator), before_balance - quote.repay_amount);
+    assert_eq!(
+        client.stable_balance(&liquidator),
+        before_balance - quote.repay_amount
+    );
     assert_eq!(
         collateral_client.balance(&liquidator),
         before_collateral + quote.collateral_to_seize
@@ -195,7 +192,7 @@ fn dynamic_collateral_floor_uses_base_floor_in_low_volatility() {
 
     // Set low volatility (5%)
     oracle.set_volatility(&500);
-    
+
     let floor = client.dynamic_collateral_floor();
     assert_eq!(floor, 15_000); // base floor
 }
@@ -208,7 +205,7 @@ fn dynamic_collateral_floor_uses_max_floor_in_high_volatility() {
 
     // Set high volatility (60%)
     oracle.set_volatility(&6_000);
-    
+
     let floor = client.dynamic_collateral_floor();
     assert_eq!(floor, 25_000); // max floor
 }
@@ -221,7 +218,7 @@ fn dynamic_collateral_floor_interpolates_in_medium_volatility() {
 
     // Set medium volatility (30% - halfway between 10% and 50%)
     oracle.set_volatility(&3_000);
-    
+
     let floor = client.dynamic_collateral_floor();
     // Should be halfway between 15_000 and 25_000 = 20_000
     assert_eq!(floor, 20_000);
@@ -235,13 +232,13 @@ fn mint_respects_dynamic_collateral_floor_in_high_volatility() {
 
     // Set high volatility to trigger max floor
     oracle.set_volatility(&6_000);
-    
+
     client.deposit_collateral(&borrower, &100_000);
-    
+
     // With 250% floor and price of 2, max debt is 100_000 * 2 / 2.5 = 80_000
     let result = client.mint_stable(&borrower, &80_000);
     assert_eq!(result.debt_amount, 80_000);
-    
+
     // Try to mint more - should fail due to dynamic floor
     let mint_result = client.mint_stable(&borrower, &1);
     assert!(mint_result.is_err());
@@ -255,7 +252,7 @@ fn current_volatility_returns_oracle_value() {
 
     oracle.set_volatility(&2_500);
     assert_eq!(client.current_volatility_bps(), 2_500);
-    
+
     oracle.set_volatility(&10_000);
     assert_eq!(client.current_volatility_bps(), 10_000);
 }

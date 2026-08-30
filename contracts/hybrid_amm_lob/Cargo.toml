@@ -3,9 +3,7 @@ name = "hybrid_amm_lob"
 version = "0.1.0"
 edition = "2021"
 
-# Standalone workspace: the repo-root Cargo.lock is currently unparseable, so
-# this contract keeps its own lock file to stay independently buildable.
-[workspace]
+
 
 [lib]
 crate-type = ["cdylib", "rlib"]

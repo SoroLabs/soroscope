@@ -2,15 +2,10 @@
 extern crate std;
 use super::*;
 
-use soroban_sdk::{
-    testutils::Address as _,
-    Address, BytesN, Env, IntoVal,
-};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, IntoVal};
 
 mod liquidity_pool {
-    soroban_sdk::contractimport!(
-        file = "../../target/wasm32v1-none/release/liquidity_pool.wasm"
-    );
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/liquidity_pool.wasm");
 }
 
 fn pool_wasm_hash(env: &Env) -> BytesN<32> {

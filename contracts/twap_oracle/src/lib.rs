@@ -60,11 +60,18 @@ impl TwapOracle {
         }
         e.storage().instance().set(&DataKey::TokenA, &token_a);
         e.storage().instance().set(&DataKey::TokenB, &token_b);
-        e.storage().instance().set(&DataKey::CumulativePrice, &0u128);
+        e.storage()
+            .instance()
+            .set(&DataKey::CumulativePrice, &0u128);
         e.storage().instance().set(&DataKey::TotalTime, &0u128);
-        e.storage().instance().set(&DataKey::LastUpdateTimestamp, &0u64);
+        e.storage()
+            .instance()
+            .set(&DataKey::LastUpdateTimestamp, &0u64);
         e.storage().instance().set(&DataKey::LastPrice, &0u128);
-        e.storage().instance().set(&DataKey::MinUpdateIntervalSeconds, &min_update_interval_seconds);
+        e.storage().instance().set(
+            &DataKey::MinUpdateIntervalSeconds,
+            &min_update_interval_seconds,
+        );
         Ok(())
     }
 
@@ -92,27 +99,51 @@ impl TwapOracle {
         }
 
         let now = e.ledger().timestamp();
-        let last_update: u64 = e.storage().instance().get(&DataKey::LastUpdateTimestamp).unwrap_or(0);
-        let min_interval: u64 = e.storage().instance().get(&DataKey::MinUpdateIntervalSeconds).unwrap_or(0);
+        let last_update: u64 = e
+            .storage()
+            .instance()
+            .get(&DataKey::LastUpdateTimestamp)
+            .unwrap_or(0);
+        let min_interval: u64 = e
+            .storage()
+            .instance()
+            .get(&DataKey::MinUpdateIntervalSeconds)
+            .unwrap_or(0);
 
         if last_update > 0 && now - last_update < min_interval {
             return Err(Error::InsufficientTimeElapsed);
         }
 
         let last_price: u128 = e.storage().instance().get(&DataKey::LastPrice).unwrap_or(0);
-        let cumulative: u128 = e.storage().instance().get(&DataKey::CumulativePrice).unwrap_or(0);
+        let cumulative: u128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::CumulativePrice)
+            .unwrap_or(0);
         let total_time: u128 = e.storage().instance().get(&DataKey::TotalTime).unwrap_or(0);
 
-        let elapsed = if last_update == 0 { 0 } else { now - last_update };
+        let elapsed = if last_update == 0 {
+            0
+        } else {
+            now - last_update
+        };
         let elapsed_u128 = elapsed as u128;
         // Use wrapping arithmetic for modulo overflow handling per u128 accumulator design.
         let new_cumulative = cumulative.wrapping_add(last_price.wrapping_mul(elapsed_u128));
         let new_total_time = total_time.wrapping_add(elapsed_u128);
 
-        e.storage().instance().set(&DataKey::CumulativePrice, &new_cumulative);
-        e.storage().instance().set(&DataKey::TotalTime, &new_total_time);
-        e.storage().instance().set(&DataKey::LastUpdateTimestamp, &now);
-        e.storage().instance().set(&DataKey::LastPrice, &(current_price as u128));
+        e.storage()
+            .instance()
+            .set(&DataKey::CumulativePrice, &new_cumulative);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalTime, &new_total_time);
+        e.storage()
+            .instance()
+            .set(&DataKey::LastUpdateTimestamp, &now);
+        e.storage()
+            .instance()
+            .set(&DataKey::LastPrice, &(current_price as u128));
 
         Ok(())
     }
@@ -129,7 +160,11 @@ impl TwapOracle {
     /// - The `as i128` cast on the division result assumes the TWAP fits within i128.
     ///   This is safe for all practical token prices given u128 range for the accumulator.
     pub fn get_twap(e: Env) -> i128 {
-        let cumulative: u128 = e.storage().instance().get(&DataKey::CumulativePrice).unwrap_or(0);
+        let cumulative: u128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::CumulativePrice)
+            .unwrap_or(0);
         let total_time: u128 = e.storage().instance().get(&DataKey::TotalTime).unwrap_or(0);
         if total_time == 0 {
             0

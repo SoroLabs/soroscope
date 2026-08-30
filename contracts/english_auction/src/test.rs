@@ -27,9 +27,7 @@ mod mock_token {
                 .get(&DataKey::Balance(to.clone()))
                 .unwrap_or(0);
             bal += amount;
-            env.storage()
-                .instance()
-                .set(&DataKey::Balance(to), &bal);
+            env.storage().instance().set(&DataKey::Balance(to), &bal);
         }
 
         pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
@@ -53,9 +51,7 @@ mod mock_token {
                 .get(&DataKey::Balance(to.clone()))
                 .unwrap_or(0);
             to_bal += amount;
-            env.storage()
-                .instance()
-                .set(&DataKey::Balance(to), &to_bal);
+            env.storage().instance().set(&DataKey::Balance(to), &to_bal);
         }
 
         pub fn balance(env: Env, id: Address) -> i128 {

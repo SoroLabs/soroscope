@@ -1,5 +1,4 @@
 //! Two-tier simulation cache: in-memory L1 + disk-persistent L2.
-#![allow(unused_imports)]
 //!
 //! The in-memory side (Moka) lives on [`crate::simulation::SimulationCache`]
 //! for backward compatibility; this module only ships the L2 layer plus the
@@ -7,18 +6,19 @@
 //! `with_disk_cache` to attach an L2 store — when it is set, reads walk
 //! L1 → L2 → miss (and promote L2 hits into L1), and writes populate both
 //! layers so state survives restarts.
-
-pub mod disk;
 //!
 //! `ContractCache` follows the same L1/L2 shape for active ledger entries:
 //! a thread-safe in-memory LRU cache (`ledger_memory`, configurable TTL)
 //! sits in front of the Sled-backed `ledger_tree`, so repeated reads for
 //! hot ledger entries avoid hitting disk.
 
-use crate::simulation::SimulationResult;
+#![allow(unused_imports)]
+
+pub mod disk;
+
+use crate::simulation::{SimulationResult, SorobanResources};
 use moka::future::Cache;
 use moka::sync::Cache as SyncCache;
-use crate::simulation::{SimulationResult, SorobanResources};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sled::{Db, Tree};
@@ -26,8 +26,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-
-pub mod disk;
 
 const CACHE_TTL_SECS: u64 = 3_600;
 const CACHE_MAX_CAPACITY: u64 = 1_000;
@@ -47,8 +45,6 @@ fn ledger_cache_ttl() -> Duration {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-
-#[derive(Debug, Serialize, Deserialize)]
 struct CacheEntry<T> {
     data: T,
     ledger_sequence: u64,
@@ -129,10 +125,6 @@ impl SimulationCache {
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
         let total = hits + misses;
-        let hit_rate_pct = hits
-            .checked_mul(100)
-            .and_then(|v| v.checked_div(total))
-            .unwrap_or(0);
         let hit_rate_pct = if total > 0 { hits * 100 / total } else { 0 };
         tracing::info!(
             cache.hits = hits,

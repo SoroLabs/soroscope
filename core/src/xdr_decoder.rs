@@ -65,9 +65,13 @@ pub struct XdrTransactionResultDecoder;
 impl XdrTransactionResultDecoder {
     /// Decodes the `resultMetaXdr` returned by Soroban RPC `getTransaction`.
     pub fn decode_result_meta(xdr: &str) -> Result<DecodedTransactionResult, XdrDecodeError> {
-        let result = TransactionResultMeta::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
-            XdrDecodeError::InvalidXdr { kind: "transaction result metadata", source }
-        })?;
+        let result =
+            TransactionResultMeta::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
+                XdrDecodeError::InvalidXdr {
+                    kind: "transaction result metadata",
+                    source,
+                }
+            })?;
         let meta = soroban_meta(&result.tx_apply_processing)
             .ok_or(XdrDecodeError::MissingSorobanMetadata)?;
         Ok(Self::decode_soroban_meta(meta))
@@ -75,22 +79,33 @@ impl XdrTransactionResultDecoder {
 
     /// Decodes standalone `SorobanTransactionMeta` XDR.
     pub fn decode_soroban_meta_xdr(xdr: &str) -> Result<DecodedTransactionResult, XdrDecodeError> {
-        let meta = SorobanTransactionMeta::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
-            XdrDecodeError::InvalidXdr { kind: "Soroban transaction metadata", source }
-        })?;
+        let meta =
+            SorobanTransactionMeta::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
+                XdrDecodeError::InvalidXdr {
+                    kind: "Soroban transaction metadata",
+                    source,
+                }
+            })?;
         Ok(Self::decode_soroban_meta(&meta))
     }
 
     /// Decodes host-function invocations from an RPC `envelopeXdr` value.
     pub fn decode_envelope(xdr: &str) -> Result<Vec<DecodedInvocation>, XdrDecodeError> {
-        let envelope = TransactionEnvelope::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
-            XdrDecodeError::InvalidXdr { kind: "transaction envelope", source }
-        })?;
+        let envelope =
+            TransactionEnvelope::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
+                XdrDecodeError::InvalidXdr {
+                    kind: "transaction envelope",
+                    source,
+                }
+            })?;
         Ok(decode_envelope(&envelope))
     }
 
     /// Decodes a result and optionally enriches it with invocation details.
-    pub fn decode(result_xdr: &str, envelope_xdr: Option<&str>) -> Result<DecodedTransactionResult, XdrDecodeError> {
+    pub fn decode(
+        result_xdr: &str,
+        envelope_xdr: Option<&str>,
+    ) -> Result<DecodedTransactionResult, XdrDecodeError> {
         let mut decoded = Self::decode_result_meta(result_xdr)?;
         if let Some(xdr) = envelope_xdr {
             decoded.invocations = Self::decode_envelope(xdr)?;
@@ -105,16 +120,21 @@ impl XdrTransactionResultDecoder {
                 non_refundable: fees.total_non_refundable_resource_fee_charged,
                 refundable: fees.total_refundable_resource_fee_charged,
                 rent: fees.rent_fee_charged,
-                total: fees.total_non_refundable_resource_fee_charged + fees.total_refundable_resource_fee_charged,
+                total: fees.total_non_refundable_resource_fee_charged
+                    + fees.total_refundable_resource_fee_charged,
             },
         };
         DecodedTransactionResult {
             invocations: Vec::new(),
             events: meta.events.iter().map(decode_event).collect(),
-            diagnostics: meta.diagnostic_events.iter().map(|diagnostic| DecodedDiagnosticEvent {
-                in_successful_contract_call: diagnostic.in_successful_contract_call,
-                event: decode_event(&diagnostic.event),
-            }).collect(),
+            diagnostics: meta
+                .diagnostic_events
+                .iter()
+                .map(|diagnostic| DecodedDiagnosticEvent {
+                    in_successful_contract_call: diagnostic.in_successful_contract_call,
+                    event: decode_event(&diagnostic.event),
+                })
+                .collect(),
             return_value: format_sc_val(&meta.return_value),
             fees,
         }
@@ -130,7 +150,9 @@ fn soroban_meta(meta: &TransactionMeta) -> Option<&SorobanTransactionMeta> {
 
 fn decode_envelope(envelope: &TransactionEnvelope) -> Vec<DecodedInvocation> {
     match envelope {
-        TransactionEnvelope::Tx(envelope) => decode_operations(&envelope.tx.source_account, &envelope.tx.operations),
+        TransactionEnvelope::Tx(envelope) => {
+            decode_operations(&envelope.tx.source_account, &envelope.tx.operations)
+        }
         TransactionEnvelope::TxFeeBump(envelope) => match &envelope.tx.inner_tx {
             soroban_sdk::xdr::FeeBumpTransactionInnerTx::Tx(inner) => {
                 decode_operations(&inner.tx.source_account, &inner.tx.operations)
@@ -140,19 +162,25 @@ fn decode_envelope(envelope: &TransactionEnvelope) -> Vec<DecodedInvocation> {
     }
 }
 
-fn decode_operations(source: &soroban_sdk::xdr::MuxedAccount, operations: &[Operation]) -> Vec<DecodedInvocation> {
-    operations.iter().filter_map(|operation| match &operation.body {
-        OperationBody::InvokeHostFunction(op) => match &op.host_function {
-            HostFunction::InvokeContract(args) => Some(DecodedInvocation {
-                invoker: format!("{source:?}"),
-                contract: format!("{:?}", args.contract_address),
-                function: format_symbol(&args.function_name),
-                arguments: args.args.iter().map(format_sc_val).collect(),
-            }),
+fn decode_operations(
+    source: &soroban_sdk::xdr::MuxedAccount,
+    operations: &[Operation],
+) -> Vec<DecodedInvocation> {
+    operations
+        .iter()
+        .filter_map(|operation| match &operation.body {
+            OperationBody::InvokeHostFunction(op) => match &op.host_function {
+                HostFunction::InvokeContract(args) => Some(DecodedInvocation {
+                    invoker: format!("{source:?}"),
+                    contract: format!("{:?}", args.contract_address),
+                    function: format_symbol(&args.function_name),
+                    arguments: args.args.iter().map(format_sc_val).collect(),
+                }),
+                _ => None,
+            },
             _ => None,
-        },
-        _ => None,
-    }).collect()
+        })
+        .collect()
 }
 
 fn decode_event(event: &ContractEvent) -> DecodedContractEvent {
@@ -184,7 +212,7 @@ fn format_sc_val(value: &soroban_sdk::xdr::ScVal) -> String {
         ScVal::I256(value) => format!("{value:?}"),
         ScVal::Symbol(value) => format!(":{}", format_symbol(value)),
         ScVal::String(value) => String::from_utf8_lossy(value.0.as_ref()).into_owned(),
-        ScVal::Bytes(value) => format!("0x{}", hex::encode(value.as_ref())),
+        ScVal::Bytes(value) => format!("0x{}", hex::encode(value.0.as_slice())),
         _ => format!("{value:?}"),
     }
 }

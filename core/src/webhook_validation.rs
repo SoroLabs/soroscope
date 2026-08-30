@@ -81,7 +81,9 @@ where
 
     async fn from_request(mut req: Request, state: &S) -> Result<Self, Self::Rejection> {
         // 1. Resolve the shared secret: check Extensions, fallback to environment variable.
-        let secret = if let Some(InboundWebhookSecret(s)) = req.extensions().get::<InboundWebhookSecret>().cloned() {
+        let secret = if let Some(InboundWebhookSecret(s)) =
+            req.extensions().get::<InboundWebhookSecret>().cloned()
+        {
             (*s).clone()
         } else if let Ok(s) = std::env::var("SOROSCOPE_INBOUND_WEBHOOK_SECRET") {
             if s.len() < 32 {
@@ -157,8 +159,8 @@ pub fn verify_signature(secret: &str, timestamp: &str, body: &[u8], signature: &
         Err(_) => return false,
     };
 
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts keys of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
     mac.update(timestamp.as_bytes());
     mac.update(b".");
     mac.update(body);
@@ -200,9 +202,7 @@ impl IntoResponse for WebhookValidationError {
             ),
             Self::TimestampExpired => (
                 StatusCode::UNAUTHORIZED,
-                format!(
-                    "Request timestamp expired (max skew: {MAX_TIMESTAMP_SKEW_SECS}s)"
-                ),
+                format!("Request timestamp expired (max skew: {MAX_TIMESTAMP_SKEW_SECS}s)"),
             ),
             Self::InvalidSignature => (
                 StatusCode::UNAUTHORIZED,
@@ -278,10 +278,13 @@ mod tests {
     async fn extractor_accepts_valid_signature() {
         let secret = Arc::new(SECRET.to_string());
         let app = Router::new()
-            .route("/test", post(|ValidatedWebhook(body): ValidatedWebhook| async move {
-                assert_eq!(body, BODY);
-                StatusCode::OK
-            }))
+            .route(
+                "/test",
+                post(|ValidatedWebhook(body): ValidatedWebhook| async move {
+                    assert_eq!(body, BODY);
+                    StatusCode::OK
+                }),
+            )
             .layer(Extension(InboundWebhookSecret(secret)));
 
         let ts = now_str();
@@ -304,9 +307,10 @@ mod tests {
     async fn extractor_rejects_missing_headers() {
         let secret = Arc::new(SECRET.to_string());
         let app = Router::new()
-            .route("/test", post(|ValidatedWebhook(_): ValidatedWebhook| async move {
-                StatusCode::OK
-            }))
+            .route(
+                "/test",
+                post(|ValidatedWebhook(_): ValidatedWebhook| async move { StatusCode::OK }),
+            )
             .layer(Extension(InboundWebhookSecret(secret)));
 
         let ts = now_str();
@@ -341,9 +345,10 @@ mod tests {
     async fn extractor_rejects_expired_timestamp() {
         let secret = Arc::new(SECRET.to_string());
         let app = Router::new()
-            .route("/test", post(|ValidatedWebhook(_): ValidatedWebhook| async move {
-                StatusCode::OK
-            }))
+            .route(
+                "/test",
+                post(|ValidatedWebhook(_): ValidatedWebhook| async move { StatusCode::OK }),
+            )
             .layer(Extension(InboundWebhookSecret(secret)));
 
         let expired_ts = (SystemTime::now()

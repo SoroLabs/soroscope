@@ -42,22 +42,32 @@ impl DutchAuction {
         if duration_ledgers == 0 {
             panic!("duration_ledgers must be greater than zero");
         }
-        
+
         let start_ledger = env.ledger().sequence();
         let end_ledger = start_ledger + duration_ledgers;
 
         env.storage().instance().set(&DataKey::Seller, &seller);
-        env.storage().instance().set(&DataKey::NftContract, &nft_contract);
+        env.storage()
+            .instance()
+            .set(&DataKey::NftContract, &nft_contract);
         env.storage().instance().set(&DataKey::TokenId, &token_id);
-        env.storage().instance().set(&DataKey::PaymentToken, &payment_token);
-        env.storage().instance().set(&DataKey::StartPrice, &start_price);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentToken, &payment_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::StartPrice, &start_price);
         env.storage().instance().set(&DataKey::EndPrice, &end_price);
-        env.storage().instance().set(&DataKey::StartLedger, &start_ledger);
-        env.storage().instance().set(&DataKey::EndLedger, &end_ledger);
+        env.storage()
+            .instance()
+            .set(&DataKey::StartLedger, &start_ledger);
+        env.storage()
+            .instance()
+            .set(&DataKey::EndLedger, &end_ledger);
         env.storage().instance().set(&DataKey::Sold, &false);
     }
 
-   /// Computes the current Dutch auction price via linear decay between
+    /// Computes the current Dutch auction price via linear decay between
     /// `start_price` and `end_price` (the floor), bounded so the price
     /// never falls below `end_price` and never overflows, regardless of
     /// how far past `end_ledger` the current ledger sequence is.
@@ -80,19 +90,14 @@ impl DutchAuction {
 
         // price_drop can be negative only if end_price > start_price,
         // which `initialize` now rejects — kept as checked math regardless.
-        let price_drop: i128 = start_price
-            .checked_sub(end_price)
-            .unwrap_or(0)
-            .max(0);
+        let price_drop: i128 = start_price.checked_sub(end_price).unwrap_or(0).max(0);
 
         let current_drop: i128 = price_drop
             .checked_mul(elapsed)
             .and_then(|v| v.checked_div(total_duration))
             .unwrap_or(price_drop); // overflow fallback: treat as fully decayed
 
-        let price = start_price
-            .checked_sub(current_drop)
-            .unwrap_or(end_price);
+        let price = start_price.checked_sub(current_drop).unwrap_or(end_price);
 
         // Explicit floor safeguard — price can never drop below end_price.
         if price < end_price {
@@ -112,13 +117,24 @@ impl DutchAuction {
 
         let current_price = Self::get_current_price(env.clone());
 
-        let payment_token: Address = env.storage().instance().get(&DataKey::PaymentToken).unwrap();
+        let payment_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentToken)
+            .unwrap();
 
         // Transfer payment from buyer to contract
         env.invoke_contract(
             &payment_token,
             &Symbol::new(&env, "transfer"),
-            Vec::from_array(&env, [buyer.to_val(), env.current_contract_address().to_val(), current_price.into_val(&env)]),
+            Vec::from_array(
+                &env,
+                [
+                    buyer.to_val(),
+                    env.current_contract_address().to_val(),
+                    current_price.into_val(&env),
+                ],
+            ),
         );
 
         // Transfer NFT to buyer
@@ -127,7 +143,14 @@ impl DutchAuction {
         env.invoke_contract(
             &nft_contract,
             &Symbol::new(&env, "transfer"),
-            Vec::from_array(&env, [env.current_contract_address().to_val(), buyer.to_val(), token_id.into_val(&env)]),
+            Vec::from_array(
+                &env,
+                [
+                    env.current_contract_address().to_val(),
+                    buyer.to_val(),
+                    token_id.into_val(&env),
+                ],
+            ),
         );
 
         // Transfer payment to seller
@@ -135,7 +158,14 @@ impl DutchAuction {
         env.invoke_contract(
             &payment_token,
             &Symbol::new(&env, "transfer"),
-            Vec::from_array(&env, [env.current_contract_address().to_val(), seller.to_val(), current_price.into_val(&env)]),
+            Vec::from_array(
+                &env,
+                [
+                    env.current_contract_address().to_val(),
+                    seller.to_val(),
+                    current_price.into_val(&env),
+                ],
+            ),
         );
 
         env.storage().instance().set(&DataKey::Sold, &true);
@@ -161,7 +191,14 @@ impl DutchAuction {
         env.invoke_contract(
             &nft_contract,
             &Symbol::new(&env, "transfer"),
-            Vec::from_array(&env, [env.current_contract_address().to_val(), seller.to_val(), token_id.into_val(&env)]),
+            Vec::from_array(
+                &env,
+                [
+                    env.current_contract_address().to_val(),
+                    seller.to_val(),
+                    token_id.into_val(&env),
+                ],
+            ),
         );
 
         env.storage().instance().set(&DataKey::Sold, &true);

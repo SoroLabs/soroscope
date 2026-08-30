@@ -27,9 +27,9 @@ pub struct StakingConfig {
     pub owner: Address,
     pub staking_token: Address,
     pub reward_token: Address,
-    pub initial_rate: Fixed,           // r0 — emission rate at epoch 0
-    pub epoch_decay_percent: Fixed,    // percentage reduction per epoch (e.g. 0.1 = 10%)
-    pub epoch_length: u32,             // blocks per epoch
+    pub initial_rate: Fixed,        // r0 — emission rate at epoch 0
+    pub epoch_decay_percent: Fixed, // percentage reduction per epoch (e.g. 0.1 = 10%)
+    pub epoch_length: u32,          // blocks per epoch
     pub start_block: u32,
     pub is_paused: bool,
 }
@@ -188,7 +188,9 @@ fn compute_epoch_rate(
         return Err(ContractError::InvalidInput);
     }
     let decay_factor = fixed_pow_int(base, epoch)?;
-    initial_rate.mul(decay_factor).map_err(|_| ContractError::Overflow)
+    initial_rate
+        .mul(decay_factor)
+        .map_err(|_| ContractError::Overflow)
 }
 
 fn ensure_epoch_snapshots(
@@ -202,9 +204,16 @@ fn ensure_epoch_snapshots(
     while epoch <= up_to_epoch {
         let key = DataKey::EpochSnapshot(epoch);
         if !e.storage().instance().has(&key) {
-            let rate = compute_epoch_rate(&config.initial_rate, &config.epoch_decay_percent, epoch)?;
+            let rate =
+                compute_epoch_rate(&config.initial_rate, &config.epoch_decay_percent, epoch)?;
             let start = epoch_start_block(config.start_block, config.epoch_length, epoch);
-            e.storage().instance().set(&key, &EpochSnapshot { rate, start_block: start });
+            e.storage().instance().set(
+                &key,
+                &EpochSnapshot {
+                    rate,
+                    start_block: start,
+                },
+            );
         }
         epoch += 1;
     }
@@ -258,7 +267,9 @@ fn calculate_multiplier(
         if overlap_end > overlap_start {
             let blocks = (overlap_end - overlap_start) as i128;
             let blocks_fixed = Fixed::from_int(blocks).map_err(|_| ContractError::Overflow)?;
-            let exponent = rate.mul(blocks_fixed).map_err(|_| ContractError::Overflow)?;
+            let exponent = rate
+                .mul(blocks_fixed)
+                .map_err(|_| ContractError::Overflow)?;
             let factor = exponent.exp().map_err(|_| ContractError::Overflow)?;
             mult = mult.mul(factor).map_err(|_| ContractError::Overflow)?;
         }
@@ -316,7 +327,10 @@ impl StakingRewards {
         let rate0 = compute_epoch_rate(&config.initial_rate, &config.epoch_decay_percent, 0)?;
         e.storage().instance().set(
             &DataKey::EpochSnapshot(0),
-            &EpochSnapshot { rate: rate0, start_block },
+            &EpochSnapshot {
+                rate: rate0,
+                start_block,
+            },
         );
 
         e.storage().instance().set(&DataKey::Config, &config);
@@ -360,11 +374,17 @@ impl StakingRewards {
             .ok_or(ContractError::Overflow)?;
 
         // Update total staked
-        let mut total_staked: i128 = e.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        let mut total_staked: i128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
         total_staked = total_staked
             .checked_add(amount)
             .ok_or(ContractError::Overflow)?;
-        e.storage().instance().set(&DataKey::TotalStaked, &total_staked);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalStaked, &total_staked);
 
         e.storage()
             .persistent()
@@ -407,11 +427,17 @@ impl StakingRewards {
             .ok_or(ContractError::Overflow)?;
 
         // Update total staked
-        let mut total_staked: i128 = e.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        let mut total_staked: i128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
         total_staked = total_staked
             .checked_sub(amount)
             .ok_or(ContractError::Overflow)?;
-        e.storage().instance().set(&DataKey::TotalStaked, &total_staked);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalStaked, &total_staked);
 
         if state.staked_amount == 0 && state.accrued_rewards == 0 {
             e.storage()
@@ -512,7 +538,11 @@ impl StakingRewards {
         let staked_amount = state.staked_amount;
 
         // Update total staked
-        let mut total_staked: i128 = e.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        let mut total_staked: i128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
         total_staked = total_staked
             .checked_sub(staked_amount)
             .ok_or(ContractError::Overflow)?;
@@ -525,7 +555,11 @@ impl StakingRewards {
         }
 
         // Calculate emergency unbonding penalty fee if configured
-        let penalty_fee_bps: u32 = e.storage().instance().get(&DataKey::PenaltyFeeBps).unwrap_or(0);
+        let penalty_fee_bps: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::PenaltyFeeBps)
+            .unwrap_or(0);
         let penalty = (staked_amount as u128 * penalty_fee_bps as u128 / 10000) as i128;
         let payout = staked_amount - penalty;
 
@@ -562,13 +596,18 @@ impl StakingRewards {
             return Err(ContractError::InvalidInput);
         }
 
-        e.storage().instance().set(&DataKey::PenaltyFeeBps, &fee_bps);
+        e.storage()
+            .instance()
+            .set(&DataKey::PenaltyFeeBps, &fee_bps);
         Ok(())
     }
 
     /// Gets emergency unbonding penalty fee in basis points.
     pub fn get_penalty_fee(e: Env) -> u32 {
-        e.storage().instance().get(&DataKey::PenaltyFeeBps).unwrap_or(0)
+        e.storage()
+            .instance()
+            .get(&DataKey::PenaltyFeeBps)
+            .unwrap_or(0)
     }
 
     /// Pause staking operations (admin only).
