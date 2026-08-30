@@ -1,7 +1,24 @@
 import Head from 'next/head';
 import Link from 'next/link';
-import { useCallback, useEffect, useState } from 'react';
-import { ArrowLeft, CheckCircle2, Loader2, RotateCcw, Save, XCircle } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ArrowLeft,
+  CheckCircle2,
+  Globe,
+  Loader2,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  Signal,
+  Wifi,
+  WifiOff,
+  XCircle,
+  Zap,
+  TrendingUp,
+  TrendingDown,
+  Activity,
+} from 'lucide-react';
+import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip } from 'recharts';
 
 import { useNetwork } from '../context/NetworkContext';
 import { API_URL } from '../lib/api';
@@ -17,7 +34,98 @@ import type { UserSettings } from '../lib/userSettings';
 
 type TestState = { status: 'idle' | 'testing' | 'ok' | 'fail'; message?: string; latencyMs?: number };
 
+interface PingResult {
+  timestamp: number;
+  latency: number;
+  success: boolean;
+}
+
+interface PingSession {
+  url: string;
+  results: PingResult[];
+}
+
+type ConnectionQuality = 'excellent' | 'good' | 'fair' | 'poor' | 'offline';
+
 const IDLE: TestState = { status: 'idle' };
+
+function getConnectionQuality(latencyMs: number | null): ConnectionQuality {
+  if (latencyMs === null) return 'offline';
+  if (latencyMs < 50) return 'excellent';
+  if (latencyMs < 100) return 'good';
+  if (latencyMs < 200) return 'fair';
+  return 'poor';
+}
+
+function getQualityColor(quality: ConnectionQuality): string {
+  switch (quality) {
+    case 'excellent':
+      return 'text-emerald-400';
+    case 'good':
+      return 'text-green-400';
+    case 'fair':
+      return 'text-yellow-400';
+    case 'poor':
+      return 'text-orange-400';
+    case 'offline':
+      return 'text-red-400';
+  }
+}
+
+function getQualityLabel(quality: ConnectionQuality): string {
+  switch (quality) {
+    case 'excellent':
+      return 'Excellent';
+    case 'good':
+      return 'Good';
+    case 'fair':
+      return 'Fair';
+    case 'poor':
+      return 'Poor';
+    case 'offline':
+      return 'Offline';
+  }
+}
+
+function getQualityBg(quality: ConnectionQuality): string {
+  switch (quality) {
+    case 'excellent':
+      return 'bg-emerald-500/20 border-emerald-500/30';
+    case 'good':
+      return 'bg-green-500/20 border-green-500/30';
+    case 'fair':
+      return 'bg-yellow-500/20 border-yellow-500/30';
+    case 'poor':
+      return 'bg-orange-500/20 border-orange-500/30';
+    case 'offline':
+      return 'bg-red-500/20 border-red-500/30';
+  }
+}
+
+function calculateStats(results: PingResult[]): { min: number; max: number; avg: number; p95: number; loss: number } {
+  const successful = results.filter((r) => r.success);
+  const latencies = successful.map((r) => r.latency).sort((a, b) => a - b);
+  const total = results.length;
+  const failed = total - successful.length;
+  const loss = total > 0 ? (failed / total) * 100 : 0;
+
+  if (latencies.length === 0) {
+    return { min: 0, max: 0, avg: 0, p95: 0, loss };
+  }
+
+  const sum = latencies.reduce((a, b) => a + b, 0);
+  const avg = sum / latencies.length;
+  const p95Index = Math.floor(latencies.length * 0.95);
+  const p95 = latencies[p95Index] || latencies[latencies.length - 1];
+
+  return {
+    min: latencies[0],
+    max: latencies[latencies.length - 1],
+    avg: Math.round(avg),
+    p95,
+    loss: parseFloat(loss.toFixed(1)),
+  };
+}
 
 /** Probe an endpoint and report whether it answered. */
 async function probeEndpoint(url: string, body: object | null, timeoutMs: number): Promise<TestState> {
@@ -58,6 +166,10 @@ export default function SettingsPage() {
   const [saved, setSaved] = useState(false);
   const [rpcTest, setRpcTest] = useState<TestState>(IDLE);
   const [indexerTest, setIndexerTest] = useState<TestState>(IDLE);
+  const [pingSession, setPingSession] = useState<PingSession | null>(null);
+  const [isPinging, setIsPinging] = useState(false);
+  const pingCount = 10;
+  const pingInterval = 500;
 
   // LocalStorage is only readable after mount (SSR has no window).
   useEffect(() => {
@@ -68,7 +180,10 @@ export default function SettingsPage() {
     setSettings((prev) => ({ ...prev, [key]: value }));
     setSaved(false);
     setErrors((prev) => ({ ...prev, [key]: undefined }));
-    if (key === 'rpcUrl') setRpcTest(IDLE);
+    if (key === 'rpcUrl') {
+      setRpcTest(IDLE);
+      setPingSession(null);
+    }
     if (key === 'indexerUrl') setIndexerTest(IDLE);
   }, []);
 
@@ -91,6 +206,7 @@ export default function SettingsPage() {
     setSaved(false);
     setRpcTest(IDLE);
     setIndexerTest(IDLE);
+    setPingSession(null);
   }, []);
 
   const testRpc = useCallback(async () => {
@@ -109,6 +225,45 @@ export default function SettingsPage() {
         settings.requestTimeoutMs,
       ),
     );
+  }, [settings.rpcUrl, settings.requestTimeoutMs]);
+
+  const startPing = useCallback(async () => {
+    const target = validateEndpointUrl(settings.rpcUrl);
+    if (!target.valid || target.normalized === '') {
+      setRpcTest({ status: 'fail', message: target.error ?? 'Enter an RPC URL to ping' });
+      return;
+    }
+
+    setIsPinging(true);
+    const results: PingResult[] = [];
+
+    for (let i = 0; i < pingCount; i++) {
+      const started = Date.now();
+      try {
+        const response = await fetch(target.normalized, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
+          signal: AbortSignal.timeout(settings.requestTimeoutMs),
+        });
+        const latency = Date.now() - started;
+        results.push({
+          timestamp: Date.now(),
+          latency,
+          success: response.ok || response.status === 404,
+        });
+      } catch {
+        results.push({
+          timestamp: Date.now(),
+          latency: settings.requestTimeoutMs,
+          success: false,
+        });
+      }
+      await new Promise((resolve) => setTimeout(resolve, pingInterval));
+    }
+
+    setPingSession({ url: target.normalized, results });
+    setIsPinging(false);
   }, [settings.rpcUrl, settings.requestTimeoutMs]);
 
   const testIndexer = useCallback(async () => {
@@ -188,6 +343,138 @@ export default function SettingsPage() {
                 className="mt-3 w-40 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
               />
             </div>
+          </div>
+
+          {/* Diagnostic Ping Tool */}
+          <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Activity className="h-4 w-4 text-cyan-400" />
+                <h3 className="text-sm font-medium text-slate-200">Diagnostic Ping Tool</h3>
+              </div>
+              <button
+                type="button"
+                onClick={startPing}
+                disabled={isPinging || !settings.rpcUrl}
+                className="inline-flex min-h-[36px] items-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-3 text-xs font-medium text-slate-200 transition-colors hover:bg-slate-700 disabled:opacity-60"
+              >
+                {isPinging ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5" />
+                )}
+                {isPinging ? 'Pinging...' : 'Run Ping Test'}
+              </button>
+            </div>
+            <p className="mt-1 text-xs text-slate-500">
+              Send {pingCount} sequential requests to measure latency, jitter, and packet loss.
+            </p>
+
+            {pingSession && (
+              <div className="mt-4 space-y-4">
+                {/* Quality Indicator */}
+                {(() => {
+                  const stats = calculateStats(pingSession.results);
+                  const latest = pingSession.results[pingSession.results.length - 1];
+                  const quality = getConnectionQuality(latest?.success ? latest.latency : null);
+                  return (
+                    <div className={`rounded-xl border p-4 ${getQualityBg(quality)}`}>
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          {quality === 'offline' ? (
+                            <WifiOff className="h-5 w-5 text-red-400" />
+                          ) : quality === 'poor' ? (
+                            <WifiOff className="h-5 w-5 text-orange-400" />
+                          ) : (
+                            <Wifi className={`h-5 w-5 ${getQualityColor(quality)}`} />
+                          )}
+                          <span className={`text-lg font-bold ${getQualityColor(quality)}`}>
+                            {getQualityLabel(quality)}
+                          </span>
+                        </div>
+                        <span className="text-xs text-slate-400">
+                          Latest: {latest?.success ? `${latest.latency}ms` : 'Failed'}
+                        </span>
+                      </div>
+                      <div className="mt-3 grid grid-cols-4 gap-3 text-center">
+                        <div className="rounded-lg bg-slate-950/50 p-2">
+                          <div className="text-xs text-slate-500">Min</div>
+                          <div className="text-sm font-semibold text-emerald-400">{stats.min}ms</div>
+                        </div>
+                        <div className="rounded-lg bg-slate-950/50 p-2">
+                          <div className="text-xs text-slate-500">Avg</div>
+                          <div className="text-sm font-semibold text-cyan-400">{stats.avg}ms</div>
+                        </div>
+                        <div className="rounded-lg bg-slate-950/50 p-2">
+                          <div className="text-xs text-slate-500">P95</div>
+                          <div className="text-sm font-semibold text-yellow-400">{stats.p95}ms</div>
+                        </div>
+                        <div className="rounded-lg bg-slate-950/50 p-2">
+                          <div className="text-xs text-slate-500">Loss</div>
+                          <div className={`text-sm font-semibold ${stats.loss > 0 ? 'text-red-400' : 'text-emerald-400'}`}>
+                            {stats.loss}%
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Latency Chart */}
+                <div className="h-32">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={pingSession.results.map((r, i) => ({ ...r, index: i + 1 }))}>
+                      <defs>
+                        <linearGradient id="latencyGradient" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.3} />
+                          <stop offset="95%" stopColor="#06b6d4" stopOpacity={0} />
+                        </linearGradient>
+                      </defs>
+                      <XAxis dataKey="index" stroke="#64748b" fontSize={10} tickLine={false} />
+                      <YAxis
+                        stroke="#64748b"
+                        fontSize={10}
+                        tickLine={false}
+                        tickFormatter={(v) => `${v}ms`}
+                      />
+                      <Tooltip
+                        contentStyle={{
+                          backgroundColor: '#0f172a',
+                          borderColor: '#1e293b',
+                          borderRadius: '0.5rem',
+                          fontSize: '12px',
+                        }}
+                        formatter={(value: number, name: string) => [
+                          `${value}ms`,
+                          name === 'latency' ? 'Latency' : name,
+                        ]}
+                        labelFormatter={(label) => `Ping #${label}`}
+                      />
+                      <Area
+                        type="monotone"
+                        dataKey="latency"
+                        stroke="#06b6d4"
+                        strokeWidth={2}
+                        fill="url(#latencyGradient)"
+                        dot={(props) => {
+                          const { cx, cy, payload } = props as any;
+                          return (
+                            <circle
+                              cx={cx}
+                              cy={cy}
+                              r={3}
+                              fill={payload.success ? '#06b6d4' : '#ef4444'}
+                              stroke="#0f172a"
+                              strokeWidth={1}
+                            />
+                          );
+                        }}
+                      />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="mt-8 flex flex-wrap items-center gap-3">
