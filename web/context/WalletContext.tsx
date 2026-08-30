@@ -140,6 +140,16 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
     setBalanceRefreshTick((t) => t + 1);
   }, []);
 
+  const resetWalletSession = useCallback(() => {
+    setAddress(null);
+    setSelectedWalletId(null);
+    setIsConnecting(false);
+    setError(null);
+    clearWalletState();
+    localStorage.removeItem("inheritx_wallet_address");
+    localStorage.removeItem("inheritx_wallet_id");
+  }, [clearWalletState]);
+
   const supportedWallets = [
     { id: "freighter", name: "Freighter", icon: "https://stellar.creit.tech/wallet-icons/freighter.png" },
     { id: "albedo", name: "Albedo", icon: "https://stellar.creit.tech/wallet-icons/albedo.png" },
@@ -176,6 +186,8 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
   };
 
   const disconnect = async () => {
+    resetWalletSession();
+
     if (kit) {
       try {
         await kit.disconnect();
@@ -183,14 +195,6 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
         console.error("Disconnect error:", err);
       }
     }
-    setAddress(null);
-    setSelectedWalletId(null);
-    setError(null);
-    // Drop cached balances and any in-flight balance request so a reconnect
-    // (possibly to a different account) never briefly shows the old holdings.
-    clearWalletState();
-    localStorage.removeItem("inheritx_wallet_address");
-    localStorage.removeItem("inheritx_wallet_id");
   };
 
   const openModal = () => {
