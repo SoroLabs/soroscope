@@ -1504,6 +1504,21 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
+async fn healthz() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
+    let providers_healthy = !state.provider_registry.healthy_providers().await.is_empty();
+    let db_healthy = state.fee_store.get_sample_count().await.is_ok();
+    
+    if providers_healthy && db_healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 async fn registry_providers(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<crate::rpc_provider::ProviderHealthReport>> {
@@ -1928,6 +1943,8 @@ async fn main() {
             }),
         )
         .route("/health", get(health_check))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_handler))
         .route("/auth/challenge", post(auth::challenge_handler))
         .route("/auth/verify", post(auth::verify_handler))
