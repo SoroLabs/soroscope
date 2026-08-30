@@ -2752,8 +2752,10 @@ async fn main() {
 
     // ── Graceful shutdown (#573: SIGTERM / SIGINT) ────────────────────
     // ── Spawn gRPC server on its dedicated port ──────────────────────────
+    // TLS is enabled automatically when GRPC_TLS_CERT / GRPC_TLS_KEY are set
+    // (Issue #918).
     tokio::spawn(async move {
-        grpc::serve(grpc_addr, grpc_bus).await;
+        grpc::serve_with_tls_from_env(grpc_addr, grpc_bus).await;
     });
 
     axum::serve(listener, app)
