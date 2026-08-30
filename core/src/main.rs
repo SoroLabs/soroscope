@@ -1,11 +1,13 @@
-```rust
-#![allow(dead_code)]
+#![deny(warnings)]
 
 mod auth;
 mod benchmarks;
 mod cache;
 mod call_trace_parser;
 mod comparison;
+mod contract_registry;
+mod cors;
+mod engine;
 mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
@@ -24,6 +26,7 @@ mod rpc_throttle;
 mod runner;
 mod simulation;
 mod simulation_service;
+mod sys_alarms;
 mod task_queue;
 mod trace_propagation;
 mod wasm_branch_analysis;
@@ -64,16 +67,6 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-// CLI Argument Handling
-use crate::fee_analytics::{FeeAnalyticsEngine, MarketConditions, ModelBreakdown};
-use crate::fee_collector::{FeeCollector, FeeCollectorConfig};
-use crate::fee_store::FeeStore;
-use crate::gas_golfing::{GasGolfingAnalyzer, GasGolfingReport};
-use crate::insights::InsightsEngine;
-use crate::jobs::{JobQueue, JobQueueConfig, JobWorker};
-use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
-use crate::simulation::{SimulationEngine, SimulationMode, SimulationResult};
-use crate::ws::SimulationBus;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -2318,16 +2311,17 @@ async fn main() {
             "Starting historical ledger re-indexing"
         );
 
-        let db_pool = sqlx::SqlitePool::connect(&config.database_url)
-            .await
-            .expect("Failed to connect to database");
+        let fee_store = Arc::new(
+            FeeStore::connect(&config.database_url)
+                .await
+                .expect("Failed to connect to database"),
+        );
 
         sqlx::migrate!()
-            .run(&db_pool)
+            .run(fee_store.pool())
             .await
             .expect("Failed to run database migrations");
 
-        let fee_store = Arc::new(FeeStore::new(db_pool));
         let providers = build_providers(&config);
         let registry = Arc::new(ProviderRegistry::new(providers));
 
@@ -2439,13 +2433,15 @@ async fn main() {
     let database_url = &config.database_url;
     tracing::info!(database_url = %database_url, "Initializing database");
 
-    let db_pool = sqlx::SqlitePool::connect(database_url)
-        .await
-        .expect("Failed to connect to database");
+    let fee_store = Arc::new(
+        FeeStore::connect(database_url)
+            .await
+            .expect("Failed to connect to database"),
+    );
 
     // Run migrations
     sqlx::migrate!()
-        .run(&db_pool)
+        .run(fee_store.pool())
         .await
         .expect("Failed to run database migrations");
 
@@ -2453,7 +2449,6 @@ async fn main() {
 
     let metrics = Arc::new(AppMetrics::new().expect("Failed to initialize Prometheus metrics"));
 
-    let fee_store = Arc::new(FeeStore::new(db_pool.clone()));
     let fee_analytics_engine = FeeAnalyticsEngine::new();
     let job_queue_config = JobQueueConfig {
         job_timeout_secs: config.job_timeout_secs,
@@ -3186,6 +3181,4 @@ async fn analyze_simulation(
 ) -> Result<Json<AnalysisResult>, AppError> {
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))
-}
-
-```
+}
