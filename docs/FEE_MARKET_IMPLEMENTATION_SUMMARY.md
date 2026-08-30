@@ -182,7 +182,7 @@ curl http://localhost:8080/fees/recommend
 
 ### View Swagger UI:
 ```
-http://localhost:8080/swagger-ui
+http://localhost:8080/docs
 ```
 
 ## 📈 Performance Characteristics
@@ -292,7 +292,7 @@ CREATE TABLE transaction_fee_records (
 
 ## 📚 Documentation
 
-- **API Documentation**: Available at `/swagger-ui`
+- **API Documentation**: Available at `/docs`
 - **Detailed Guide**: `core/FEE_MARKET_README.md`
 - **Code Comments**: Comprehensive inline documentation
 - **Test Examples**: Unit tests demonstrate usage

@@ -38,7 +38,7 @@ use reqwest::Client;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
-use sysinfo::{Pid, ProcessExt, System, SystemExt};
+use sysinfo::{Pid, System};
 use tracing::{info, warn};
 
 /// Default alarm threshold, matching the spec from issue #592.
@@ -124,13 +124,13 @@ impl SysAlarmConfig {
             }
             Ok(_) => warn!(
                 value = raw,
-                env = ENV_THRESHOLD,
-                "Ignoring {env}: outside [0, 100] range"
+                env_var = ENV_THRESHOLD,
+                "Ignoring {ENV_THRESHOLD}: outside [0, 100] range"
             ),
             Err(_) => warn!(
                 value = raw,
-                env = ENV_THRESHOLD,
-                "Ignoring {env}: not a valid floating point number"
+                env_var = ENV_THRESHOLD,
+                "Ignoring {ENV_THRESHOLD}: not a valid floating point number"
             ),
         }
     }
@@ -142,8 +142,8 @@ impl SysAlarmConfig {
             }
             _ => warn!(
                 value = raw,
-                env = ENV_INTERVAL,
-                "Ignoring {env}: must be a positive integer number of seconds"
+                env_var = ENV_INTERVAL,
+                "Ignoring {ENV_INTERVAL}: must be a positive integer number of seconds"
             ),
         }
     }

@@ -106,15 +106,15 @@ impl FeeCollector {
                     tracing::info!("Fee collector shutting down");
                     break;
                 }
-                _ = interval.tick() => {
-                        result = self.collect_latest_fees() => {
-                            if let Err(e) = result {
-                                tracing::error!(error = %e, "Failed to collect fee data");
-            interval.tick().await;
+                _ = interval.tick() => {}
+            }
 
+            // Only the instance holding the leader lease performs collection,
+            // so extra replicas don't duplicate writes to the fee store.
             if !self.leader_lock.try_acquire_or_renew().await {
                 tracing::debug!("not leader this cycle, skipping fee collection");
                 continue;
+            }
 
             let started_at = Instant::now();
             let result = self.collect_latest_fees().await;
@@ -125,11 +125,18 @@ impl FeeCollector {
 
             match result {
                 Ok(true) => {
+                    self.metrics
                         .events_processed_total
+                        .with_label_values(&["fee_collector"])
                         .inc();
+                }
                 Ok(false) => {}
                 Err(e) => {
+                    tracing::error!(error = %e, "Failed to collect fee data");
+                    self.metrics
                         .indexing_errors_total
+                        .with_label_values(&["fee_collector"])
+                        .inc();
                 }
             }
         }

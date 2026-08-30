@@ -1,4 +1,3 @@
-```rust
 #![allow(dead_code)]
 
 mod auth;
@@ -6,6 +5,7 @@ mod benchmarks;
 mod cache;
 mod call_trace_parser;
 mod comparison;
+mod contract_registry;
 mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
@@ -24,6 +24,7 @@ mod rpc_throttle;
 mod runner;
 mod simulation;
 mod simulation_service;
+mod sys_alarms;
 mod task_queue;
 mod trace_propagation;
 mod wasm_branch_analysis;
@@ -65,15 +66,6 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 // CLI Argument Handling
-use crate::fee_analytics::{FeeAnalyticsEngine, MarketConditions, ModelBreakdown};
-use crate::fee_collector::{FeeCollector, FeeCollectorConfig};
-use crate::fee_store::FeeStore;
-use crate::gas_golfing::{GasGolfingAnalyzer, GasGolfingReport};
-use crate::insights::InsightsEngine;
-use crate::jobs::{JobQueue, JobQueueConfig, JobWorker};
-use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
-use crate::simulation::{SimulationEngine, SimulationMode, SimulationResult};
-use crate::ws::SimulationBus;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -252,6 +244,8 @@ fn default_max_ledger_age() -> u32 {
 
 fn default_event_bus_capacity() -> usize {
     256
+}
+
 fn default_allowed_origins() -> String {
     // Empty string means: fall back to allow-all (*).
     // Operators set ALLOWED_ORIGINS=http://localhost:3000,https://app.example.com
@@ -520,23 +514,40 @@ impl AppMetrics {
             &["host"],
         )?;
         let host_memory_usage_percent = prometheus::GaugeVec::new(
+            Opts::new(
                 "host_memory_usage_percent",
                 "Host-wide memory usage percentage (0-100) sampled by the system alarm monitor",
+            ),
+            &["host"],
+        )?;
         let process_memory_bytes = prometheus::GaugeVec::new(
+            Opts::new(
                 "process_memory_bytes",
                 "Resident memory size of the SoroScope process in bytes",
+            ),
             &["process"],
+        )?;
         let indexing_latency_seconds = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "indexing_latency_seconds",
                 "Latency of ledger indexing/collection cycles in seconds",
+            ),
             &["stage"],
+        )?;
         let events_processed_total = IntCounterVec::new(
+            Opts::new(
                 "events_processed_total",
                 "Total number of ledger events successfully processed",
+            ),
+            &["source"],
+        )?;
         let indexing_errors_total = IntCounterVec::new(
+            Opts::new(
                 "indexing_errors_total",
                 "Total number of indexing cycle failures",
+            ),
+            &["stage"],
+        )?;
         let job_queue_depth = prometheus::GaugeVec::new(
             Opts::new("job_queue_depth", "Current depth of background job queues"),
             &["queue"],
@@ -635,6 +646,8 @@ pub struct TestnetAverages {
     /// Average CPU instructions for typical Soroban transactions
     pub cpu_instructions: u64,
     /// Average RAM bytes for typical Soroban transactions
+    pub ram_bytes: u64,
+    /// Average ledger read bytes for typical Soroban transactions
     pub ledger_read_bytes: u64,
     /// Average ledger write bytes for typical Soroban transactions
     pub ledger_write_bytes: u64,
@@ -1228,6 +1241,16 @@ async fn analyze_wasm(
     Ok(Json(report))
 }
 
+/// `/metrics` - Prometheus scrape endpoint in the text exposition format.
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    tag = "Operations",
+    responses(
+        (status = 200, description = "Prometheus metrics in text exposition format", body = String),
+        (status = 500, description = "Failed to encode the metric registry")
+    )
+)]
 async fn metrics_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1747,9 +1770,12 @@ async fn fee_analytics(
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        analyze, analyze_wasm, optimize_limits, compare_handler,
-        auth::challenge_handler, auth::verify_handler, auth::jwks_handler,
-        fee_recommend, fee_history, fee_analytics, batch_contract_state
+        analyze, analyze_wasm, analyze_wasm_branches, optimize_limits,
+        compare_handler, analyze_gas_golfing,
+        auth::challenge_handler, auth::verify_handler,
+        auth::emergency_pause_handler, auth::jwks_handler,
+        fee_recommend, fee_history, fee_analytics, batch_contract_state,
+        health_check, healthz, readyz, metrics_handler, incoming_webhook
     ),
     components(schemas(
         AnalyzeRequest, AnalyzeWasmRequest, AnalyzeWasmBranchesRequest,
@@ -1771,13 +1797,17 @@ async fn fee_analytics(
         crate::fee_analytics::MarketConditions,
         crate::fee_analytics::ModelBreakdown,
         crate::fee_analytics::TrendDirection,
-        BatchStateItem, BatchStateRequest, ContractStateResult, BatchStateResponse
+        BatchStateItem, BatchStateRequest, ContractStateResult, BatchStateResponse,
+        GasGolfingReport,
+        HealthStatusResponse, ReadinessResponse, ReadinessChecks,
+        TestnetAverages
     )),
     tags(
         (name = "Analysis", description = "Soroban contract resource analysis endpoints"),
         (name = "Auth", description = "SEP-10 wallet authentication"),
         (name = "Fee Market", description = "Stellar/Soroban fee market analysis and prediction"),
-        (name = "Streaming", description = "WebSocket real-time simulation progress streaming")
+        (name = "Streaming", description = "WebSocket real-time simulation progress streaming"),
+        (name = "Operations", description = "Health probes, Prometheus metrics and inbound webhooks")
     ),
     info(
         title = "SoroScope API",
@@ -1901,6 +1931,23 @@ fn group_batch_entries(
     }
 }
 
+/// `/api/v1/webhooks/incoming` - accepts signed inbound webhook payloads.
+///
+/// The raw body is authenticated by the `ValidatedWebhook` extractor, which
+/// verifies the HMAC signature header before the handler ever runs.
+#[utoipa::path(
+    post,
+    path = "/api/v1/webhooks/incoming",
+    tag = "Operations",
+    request_body(
+        content = String,
+        description = "Raw webhook payload, authenticated via its HMAC signature header"
+    ),
+    responses(
+        (status = 200, description = "Payload accepted"),
+        (status = 401, description = "Missing or invalid signature")
+    )
+)]
 async fn incoming_webhook(
     ValidatedWebhook(body): ValidatedWebhook,
 ) -> impl IntoResponse {
@@ -1908,16 +1955,65 @@ async fn incoming_webhook(
     StatusCode::OK
 }
 
+/// `/health` - simple text liveness string used by uptime checks.
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "Operations",
+    responses(
+        (status = 200, description = "Service is running", body = String, example = json!("OK"))
+    )
+)]
 async fn health_check() -> &'static str {
     "OK"
+}
+
+/// Liveness payload returned by `/healthz`.
+#[derive(Serialize, ToSchema)]
+struct HealthStatusResponse {
+    /// Always `"ok"` while the process is able to serve requests.
+    #[schema(example = "ok")]
+    status: String,
+}
+
+/// Per-dependency readiness checks reported by `/readyz`.
+#[derive(Serialize, ToSchema)]
+struct ReadinessChecks {
+    /// `"ok"` when at least one Soroban RPC provider is healthy,
+    /// `"unavailable"` otherwise.
+    #[schema(example = "ok")]
+    rpc: String,
+}
+
+/// Readiness payload returned by `/readyz`.
+#[derive(Serialize, ToSchema)]
+struct ReadinessResponse {
+    /// `"ready"` when every dependency check passed, `"not_ready"` otherwise.
+    #[schema(example = "ready")]
+    status: String,
+    /// Individual dependency check results.
+    checks: ReadinessChecks,
 }
 
 /// `/healthz` — Kubernetes liveness probe.
 ///
 /// Returns 200 OK as long as the process is running. No external dependency
 /// checks are performed; a live process is always considered alive.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "Operations",
+    responses(
+        (status = 200, description = "Process is alive", body = HealthStatusResponse)
+    )
+)]
 async fn healthz() -> impl IntoResponse {
-    (StatusCode::OK, axum::Json(serde_json::json!({"status": "ok"})))
+    (
+        StatusCode::OK,
+        axum::Json(HealthStatusResponse {
+            status: "ok".to_string(),
+        }),
+    )
 }
 
 /// `/readyz` — Kubernetes readiness probe.
@@ -1925,6 +2021,15 @@ async fn healthz() -> impl IntoResponse {
 /// Evaluates DB and RPC connectivity. Returns 200 when all checks pass, or
 /// 503 when at least one dependency is unavailable (the pod should be removed
 /// from the load-balancer rotation until it recovers).
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "Operations",
+    responses(
+        (status = 200, description = "All dependencies reachable", body = ReadinessResponse),
+        (status = 503, description = "At least one dependency is unavailable", body = ReadinessResponse)
+    )
+)]
 async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let rpc_healthy = state
         .provider_registry
@@ -1936,22 +2041,22 @@ async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if rpc_healthy {
         (
             StatusCode::OK,
-            axum::Json(serde_json::json!({
-                "status": "ready",
-                "checks": {
-                    "rpc": "ok"
-                }
-            })),
+            axum::Json(ReadinessResponse {
+                status: "ready".to_string(),
+                checks: ReadinessChecks {
+                    rpc: "ok".to_string(),
+                },
+            }),
         )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({
-                "status": "not ready",
-                "checks": {
-                    "rpc": "unhealthy"
-                }
-            })),
+            axum::Json(ReadinessResponse {
+                status: "not_ready".to_string(),
+                checks: ReadinessChecks {
+                    rpc: "unavailable".to_string(),
+                },
+            }),
         )
     }
 }
@@ -1989,16 +2094,20 @@ async fn main() {
 
     // ── Tracing init (#572: JSON format + x-request-id correlation) ────
     let log_json = env::var("LOG_FORMAT").map(|v| v.to_lowercase() == "json").unwrap_or(false);
-    let filter = EnvFilter::from_default_env();
+    // `rust_log` comes from the loaded config (RUST_LOG env var, default
+    // "info"), so the log level is tunable without a rebuild.
+    let filter = build_env_filter(&config.rust_log);
     if log_json {
         tracing_subscriber::registry()
             .with(filter)
             .with(tracing_subscriber::fmt::layer().json())
             .init();
     } else {
+        tracing_subscriber::registry()
+            .with(filter)
             .with(tracing_subscriber::fmt::layer())
+            .init();
     }
-        .with(build_env_filter(&config.rust_log))
 
     tracing::info!(rust_log = %config.rust_log, "SoroScope Starting...");
     tracing::info!("SoroScope initialized with config: {:?}", config);
@@ -2013,6 +2122,36 @@ async fn main() {
     }
 
     let args: Vec<String> = env::args().collect();
+
+    // ── CLI: openapi subcommand ──────────────────────────────────────────
+    //
+    // Writes the generated OpenAPI 3.0 document to disk so client SDKs can be
+    // generated in CI without booting the server. Defaults to
+    // `openapi.json` in the working directory; override with `--out <path>`.
+    if args.len() > 1 && args[1] == "openapi" {
+        let out_path = args
+            .iter()
+            .position(|a| a == "--out")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| "openapi.json".to_string());
+
+        let spec = match ApiDoc::openapi().to_pretty_json() {
+            Ok(spec) => spec,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to serialize the OpenAPI document");
+                std::process::exit(1);
+            }
+        };
+
+        if let Err(e) = std::fs::write(&out_path, spec) {
+            tracing::error!(path = %out_path, error = %e, "Failed to write the OpenAPI spec");
+            std::process::exit(1);
+        }
+
+        tracing::info!(path = %out_path, "OpenAPI spec written");
+        return;
+    }
 
     if args.len() > 1 && args[1] == "benchmark" {
         tracing::info!("Starting SoroScope Benchmark...");
@@ -2337,10 +2476,25 @@ async fn main() {
             request_timeout: std::time::Duration::from_secs(30),
         };
 
+        // The reindex path drives `fetch_and_store_ledger` directly rather
+        // than running the collection loop, but the constructor still needs a
+        // metrics handle and a leader lease, so build throwaway ones here.
+        let reindex_metrics =
+            Arc::new(AppMetrics::new().expect("Failed to initialize metrics registry"));
+        let reindex_redis_client = redis::Client::open(config.redis_url.as_str())
+            .expect("Failed to create Redis client for leader lock");
+        let reindex_leader_lock = Arc::new(leader_lock::RedisLeaderLock::new(
+            reindex_redis_client,
+            "soroscope:leader:reindex",
+            std::time::Duration::from_secs(30),
+        ));
+
         let collector = Arc::new(FeeCollector::new(
             Arc::clone(&registry),
             Arc::clone(&fee_store),
             collector_config,
+            reindex_metrics,
+            reindex_leader_lock,
         ));
 
         let total = end - start + 1;
@@ -2467,7 +2621,7 @@ async fn main() {
     let simulation_bus = SimulationBus::with_capacity(config.event_bus_capacity);
 
     // Spawn background cleanup task
-    job_queue.spawn_cleanup_task();
+    job_queue.spawn_cleanup_task(shutdown_tx.subscribe());
 
     let job_worker = JobWorker::new(
         job_queue.clone(),
@@ -2628,7 +2782,6 @@ async fn main() {
         fee_analytics_engine,
         fee_store,
         metrics: Arc::clone(&app_metrics),
-        metrics,
         simulation_bus,
     });
 
@@ -2662,8 +2815,9 @@ async fn main() {
     let graphql_schema =
         graphql::build_schema(app_state.job_queue.clone(), app_state.engine.clone());
 
-    let cors = CorsLayer::new().allow_origin(Any);
-    let cors = soroscope_core::cors::build_cors_layer(&config.cors_allowed_origins);
+    // CORS policy is driven by ALLOWED_ORIGINS. An empty value keeps the
+    // permissive allow-all default used for local development; a
+    // comma-separated list restricts access to exactly those origins.
     let cors = {
         let raw = config.allowed_origins.trim().to_string();
         if raw.is_empty() {
@@ -2677,6 +2831,7 @@ async fn main() {
                 .filter_map(|s| s.trim().parse::<HeaderValue>().ok())
                 .collect();
             CorsLayer::new().allow_origin(origins)
+        }
     };
 
     let protected = Router::new()
@@ -2689,6 +2844,11 @@ async fn main() {
         .route_layer(middleware::from_fn(auth::auth_middleware));
 
     let app = Router::new()
+        // Interactive Swagger UI. `/docs` is the documented entry point;
+        // `/swagger-ui` is kept as an alias so existing bookmarks and any
+        // deployment probes pointing at the old path keep working. Both serve
+        // the same generated spec from `/api-docs/openapi.json`.
+        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route(
             "/",
@@ -2746,7 +2906,7 @@ async fn main() {
         listener.local_addr().unwrap()
     );
     tracing::info!(
-        "Swagger UI available at http://{}/swagger-ui",
+        "Swagger UI available at http://{}/docs",
         listener.local_addr().unwrap()
     );
 
@@ -2770,23 +2930,18 @@ async fn main() {
     tracing::info!("All background workers stopped");
 }
 
-/// Wait for Ctrl+C / SIGTERM, then broadcast shutdown to all worker loops.
+/// Waits for Ctrl-C (all platforms) or SIGTERM (Unix), then broadcasts the
+/// shutdown signal to every background worker loop so axum can finish
+/// in-flight requests before the process exits.
 async fn shutdown_signal(shutdown_tx: tokio::sync::broadcast::Sender<()>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
+            .await
             .expect("failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]
     let terminate = async {
-        .with_graceful_shutdown(shutdown_signal())
-
-    tracing::info!("Server shut down gracefully.");
-
-/// Waits for SIGTERM (Unix) or Ctrl-C (all platforms) and resolves once either
-/// signal is received, allowing axum to finish in-flight requests before exit.
-async fn shutdown_signal() {
-    let sigterm = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler")
             .recv()
@@ -2797,12 +2952,17 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        _ = ctrl_c => {
+            tracing::info!("Received SIGINT (Ctrl-C), shutting down");
+        }
+        _ = terminate => {
+            tracing::info!("Received SIGTERM, shutting down");
+        }
     }
 
     tracing::info!("Shutdown signal received; notifying background workers");
     let _ = shutdown_tx.send(());
+}
 
 /// Await every worker handle, aborting any that hang past a short grace period.
 async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
@@ -2820,12 +2980,107 @@ async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
                     "Background worker did not exit within {:?}; aborted",
                     WORKER_JOIN_TIMEOUT
                 );
-    let sigterm = std::future::pending::<()>();
+            }
+        }
+    }
+}
 
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Received SIGINT (Ctrl-C), shutting down…");
-        _ = sigterm => {
-            tracing::info!("Received SIGTERM, shutting down…");
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAPI document tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod openapi_tests {
+    use super::*;
+
+    /// Every route that the REST API exposes and documents must appear in the
+    /// generated document. This is the check that catches a handler which was
+    /// annotated with `#[utoipa::path]` but never added to `ApiDoc`'s
+    /// `paths(...)` list -- utoipa silently omits those.
+    const DOCUMENTED_ROUTES: &[(&str, &str)] = &[
+        ("/analyze", "post"),
+        ("/analyze/wasm", "post"),
+        ("/analyze/wasm/branches", "post"),
+        ("/analyze/optimize-limits", "post"),
+        ("/analyze/compare", "post"),
+        ("/analyze/gas-golfing", "post"),
+        ("/auth/challenge", "post"),
+        ("/auth/verify", "post"),
+        ("/auth/emergency-pause", "post"),
+        ("/auth/jwks", "get"),
+        ("/fees/recommend", "get"),
+        ("/fees/history", "get"),
+        ("/fees/analytics", "get"),
+        ("/api/v1/contracts/batch-state", "post"),
+        ("/api/v1/webhooks/incoming", "post"),
+        ("/health", "get"),
+        ("/healthz", "get"),
+        ("/readyz", "get"),
+        ("/metrics", "get"),
+    ];
+
+    #[test]
+    fn openapi_document_serializes() {
+        let json = ApiDoc::openapi()
+            .to_pretty_json()
+            .expect("the OpenAPI document must serialize");
+        assert!(json.contains("\"openapi\""), "missing openapi version field");
+        assert!(json.contains("SoroScope API"), "missing the API title");
+    }
+
+    #[test]
+    fn every_documented_route_is_present() {
+        let doc = ApiDoc::openapi();
+        let value: serde_json::Value =
+            serde_json::to_value(&doc).expect("document must convert to JSON");
+        let paths = value
+            .get("paths")
+            .and_then(|p| p.as_object())
+            .expect("document must expose a paths object");
+
+        for (path, method) in DOCUMENTED_ROUTES {
+            let entry = paths
+                .get(*path)
+                .unwrap_or_else(|| panic!("route {path} is missing from the OpenAPI document"));
+            assert!(
+                entry.get(*method).is_some(),
+                "route {path} is documented without its {method} operation"
+            );
+        }
+    }
+
+    #[test]
+    fn operations_declare_a_tag_and_responses() {
+        let value = serde_json::to_value(ApiDoc::openapi()).expect("serializes");
+        let paths = value["paths"].as_object().expect("paths object");
+
+        for (path, method) in DOCUMENTED_ROUTES {
+            let operation = &paths[*path][*method];
+            assert!(
+                operation["tags"].as_array().is_some_and(|t| !t.is_empty()),
+                "{path} {method} has no tag, so it would not be grouped in the UI"
+            );
+            assert!(
+                operation["responses"]
+                    .as_object()
+                    .is_some_and(|r| !r.is_empty()),
+                "{path} {method} documents no responses"
+            );
+        }
+    }
+
+    #[test]
+    fn health_schemas_are_registered() {
+        let value = serde_json::to_value(ApiDoc::openapi()).expect("serializes");
+        let schemas = value["components"]["schemas"]
+            .as_object()
+            .expect("components.schemas object");
+
+        for name in ["HealthStatusResponse", "ReadinessResponse", "ReadinessChecks"] {
+            assert!(
+                schemas.contains_key(name),
+                "schema {name} is referenced by an operation but never registered"
+            );
         }
     }
 }
@@ -3187,5 +3442,3 @@ async fn analyze_simulation(
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))
 }
-
-```

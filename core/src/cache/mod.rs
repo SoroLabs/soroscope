@@ -1,5 +1,4 @@
 //! Two-tier simulation cache: in-memory L1 + disk-persistent L2.
-#![allow(unused_imports)]
 //!
 //! The in-memory side (Moka) lives on [`crate::simulation::SimulationCache`]
 //! for backward compatibility; this module only ships the L2 layer plus the
@@ -7,15 +6,13 @@
 //! `with_disk_cache` to attach an L2 store — when it is set, reads walk
 //! L1 → L2 → miss (and promote L2 hits into L1), and writes populate both
 //! layers so state survives restarts.
-
-pub mod disk;
 //!
 //! `ContractCache` follows the same L1/L2 shape for active ledger entries:
 //! a thread-safe in-memory LRU cache (`ledger_memory`, configurable TTL)
 //! sits in front of the Sled-backed `ledger_tree`, so repeated reads for
 //! hot ledger entries avoid hitting disk.
+#![allow(unused_imports)]
 
-use crate::simulation::SimulationResult;
 use moka::future::Cache;
 use moka::sync::Cache as SyncCache;
 use crate::simulation::{SimulationResult, SorobanResources};
@@ -47,8 +44,6 @@ fn ledger_cache_ttl() -> Duration {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-
-#[derive(Debug, Serialize, Deserialize)]
 struct CacheEntry<T> {
     data: T,
     ledger_sequence: u64,
