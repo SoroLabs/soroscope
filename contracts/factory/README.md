@@ -2,6 +2,38 @@
 
 The Liquidity Pool Factory is responsible for deploying new liquidity pool contracts for unique token pairs on Soroban.
 
+## Universal Contract Factory Instance Registrar
+
+The factory maintains a central registry of all deployed contracts (pools, vaults, and token contracts) to provide a complete ecosystem overview.
+
+### Registry Storage
+
+For each created contract, the factory stores the following metadata:
+
+- **Contract ID**: The unique Soroban contract identifier
+- **Creator**: The address that deployed the contract
+- **Created At**: Ledger timestamp of creation
+- **Contract Type**: `Pool`, `Vault`, or `Token`
+
+The registry is implemented as a persistent map using Soroban storage.
+
+### Query Functions
+
+The following query functions are exposed for indexers and external consumers:
+
+- `get_contract_creator(contract_id)` → `Address`
+- `get_contract_creation_time(contract_id)` → `u64`
+- `get_contract_type(contract_id)` → `ContractType`
+- `get_contracts_by_creator(creator)` → `Vec<ContractId>`
+- `get_contracts_by_type(contract_type)` → `Vec<ContractId>`
+- `get_all_contracts()` → `Vec<ContractId>`
+
+These functions enable efficient indexing of the entire ecosystem deployed through the factory.
+
+### Integration
+
+When a new contract is deployed via the factory, it is automatically registered in the instance registrar. No additional action is required from the deployer.
+
 ## Emergency Guard Integration
 
 To enhance protocol security, the factory integrates with the `EmergencyGuard` contract to provide standardized emergency pause and admin management capabilities.
