@@ -33,7 +33,7 @@
 //! ```
 
 use emergency_guard::{EmergencyGuard, PauseType};
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 #[cfg(test)]
 mod test;
@@ -302,7 +302,7 @@ impl FlashLoanVault {
         set_total_deposited(&e, deposited + amount);
 
         e.events().publish(
-            (String::from_str(&e, "vault_deposit"), from.clone()),
+            (Symbol::new(&e, "vault_deposit"), from.clone()),
             VaultDepositEvent {
                 admin: from,
                 amount,
@@ -340,7 +340,7 @@ impl FlashLoanVault {
         set_total_deposited(&e, deposited - amount);
 
         e.events().publish(
-            (String::from_str(&e, "vault_withdraw"), to.clone()),
+            (Symbol::new(&e, "vault_withdraw"), to.clone()),
             VaultWithdrawEvent { admin: to, amount },
         );
 
@@ -361,7 +361,7 @@ impl FlashLoanVault {
         e.storage().instance().set(&DataKey::FeeBps, &fee_bps);
 
         e.events().publish(
-            (String::from_str(&e, "fee_changed"), admin.clone()),
+            (Symbol::new(&e, "fee_changed"), admin.clone()),
             FeeChangedEvent {
                 admin,
                 old_fee_bps: old_fee,
@@ -508,7 +508,7 @@ impl FlashLoanVault {
 
         // 13. Emit event.
         e.events().publish(
-            (String::from_str(&e, "flash_loan"), receiver.clone()),
+            (Symbol::new(&e, "flash_loan"), receiver.clone()),
             FlashLoanEvent {
                 receiver,
                 token: token_addr,
@@ -619,7 +619,7 @@ impl FlashLoanVault {
 
         // 12. Emit same event as flash_loan for observability.
         e.events().publish(
-            (String::from_str(&e, "borrow"), borrower.clone()),
+            (Symbol::new(&e, "borrow"), borrower.clone()),
             FlashLoanEvent {
                 receiver: borrower,
                 token: token_addr,

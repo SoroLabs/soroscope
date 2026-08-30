@@ -8,7 +8,7 @@ use crate::storage_types::{
     ApprovalEvent, CancelEvent, DepositEvent, Error, EscrowConfig, GuardianRotationEvent,
     MutualCancelEvent, ReleaseEvent,
 };
-use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, token, Address, Env, Symbol, Vec};
 
 #[contract]
 pub struct TimelockEscrow;
@@ -78,7 +78,7 @@ impl TimelockEscrow {
         write_config(&e, &config);
 
         e.events().publish(
-            (String::from_str(&e, "deposit"), config.depositor.clone()),
+            (Symbol::new(&e, "deposit"), config.depositor.clone()),
             DepositEvent {
                 depositor: config.depositor,
                 token: config.token,
@@ -109,7 +109,7 @@ impl TimelockEscrow {
         let count = approval_count(new_bitmap);
 
         e.events().publish(
-            (String::from_str(&e, "approval"), guardian.clone()),
+            (Symbol::new(&e, "approval"), guardian.clone()),
             ApprovalEvent {
                 guardian,
                 guardian_index: idx,
@@ -149,7 +149,7 @@ impl TimelockEscrow {
         write_config(&e, &config);
 
         e.events().publish(
-            (String::from_str(&e, "release"), config.beneficiary.clone()),
+            (Symbol::new(&e, "release"), config.beneficiary.clone()),
             ReleaseEvent {
                 beneficiary: config.beneficiary,
                 token: config.token,
@@ -200,7 +200,7 @@ impl TimelockEscrow {
         write_config(&e, &config);
 
         e.events().publish(
-            (String::from_str(&e, "cancel"), config.depositor.clone()),
+            (Symbol::new(&e, "cancel"), config.depositor.clone()),
             CancelEvent {
                 depositor: config.depositor,
                 token: config.token,
@@ -249,7 +249,7 @@ impl TimelockEscrow {
 
         e.events().publish(
             (
-                String::from_str(&e, "mutual_cancel"),
+                Symbol::new(&e, "mutual_cancel"),
                 config.depositor.clone(),
                 config.beneficiary.clone(),
             ),
@@ -305,7 +305,7 @@ impl TimelockEscrow {
         write_epoch(&e, new_epoch);
 
         e.events().publish(
-            (String::from_str(&e, "guardian_rotation"),),
+            (Symbol::new(&e, "guardian_rotation"),),
             GuardianRotationEvent {
                 old_guardians,
                 new_guardians,

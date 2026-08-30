@@ -4,7 +4,7 @@ use emergency_guard::{
     DefaultEmergencyGuard, EmergencyGuard, EmergencyGuardTrait, GuardError, PauseType,
 };
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, vec, Address, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, vec, Address, Env, String, Symbol, Vec,
 };
 
 #[cfg(test)]
@@ -672,7 +672,7 @@ impl LiquidityPool {
         pool.fee_bps = fee_bps;
         save_pool(&e, &pool);
         e.events().publish(
-            (String::from_str(&e, "fee_changed"), admin.clone()),
+            (Symbol::new(&e, "fee_changed"), admin.clone()),
             FeeChangedEvent {
                 admin,
                 old_fee_bps: old_fee,
@@ -765,7 +765,7 @@ impl LiquidityPool {
         let scheduled_by = e.current_contract_address();
         e.events().publish(
             (
-                String::from_str(&e, "fee_update_scheduled"),
+                Symbol::new(&e, "fee_update_scheduled"),
                 scheduled_by.clone(),
             ),
             FeeUpdateScheduledEvent {
@@ -797,7 +797,7 @@ impl LiquidityPool {
         save_pool(&e, &pool);
         e.storage().instance().remove(&DataKey::PendingFeeUpdate);
         e.events().publish(
-            (String::from_str(&e, "fee_changed"), pool.admin.clone()),
+            (Symbol::new(&e, "fee_changed"), pool.admin.clone()),
             FeeChangedEvent {
                 admin: pool.admin,
                 old_fee_bps: old_fee,
@@ -912,7 +912,7 @@ impl LiquidityPool {
             .instance()
             .set(&DataKey::TotalStaked, &(total_staked + amount));
         e.events().publish(
-            (String::from_str(&e, "stake"), user.clone()),
+            (Symbol::new(&e, "stake"), user.clone()),
             StakeEvent {
                 user,
                 amount_staked: amount,
@@ -949,7 +949,7 @@ impl LiquidityPool {
             .instance()
             .set(&DataKey::TotalStaked, &(total_staked - amount));
         e.events().publish(
-            (String::from_str(&e, "unstake"), user.clone()),
+            (Symbol::new(&e, "unstake"), user.clone()),
             UnstakeEvent {
                 user,
                 amount_unstaked: amount,
@@ -980,7 +980,7 @@ impl LiquidityPool {
             .persistent()
             .extend_ttl(&DataKey::UserRewards(user.clone()), 100, 100);
         e.events().publish(
-            (String::from_str(&e, "claim_rewards"), user.clone()),
+            (Symbol::new(&e, "claim_rewards"), user.clone()),
             ClaimRewardsEvent {
                 user,
                 rewards_amount: pending,
@@ -1052,7 +1052,7 @@ impl LiquidityPool {
         pool.reserve_b += amount_b;
         save_pool(&e, &pool);
         e.events().publish(
-            (String::from_str(&e, "deposit"), to.clone()),
+            (Symbol::new(&e, "deposit"), to.clone()),
             DepositEvent {
                 user: to,
                 amount_a,
@@ -1234,7 +1234,7 @@ impl LiquidityPool {
         }
         save_pool(e, &pool);
         e.events().publish(
-            (String::from_str(e, "swap"), to.clone()),
+            (Symbol::new(e, "swap"), to.clone()),
             SwapEvent {
                 user: to,
                 token_in: sides.token_in,
@@ -1284,7 +1284,7 @@ impl LiquidityPool {
             &amount_b,
         );
         e.events().publish(
-            (String::from_str(&e, "withdraw"), to.clone()),
+            (Symbol::new(&e, "withdraw"), to.clone()),
             WithdrawEvent {
                 user: to,
                 shares_burned: share_amount,
@@ -1313,7 +1313,7 @@ impl LiquidityPool {
         pool.total_shares -= amount;
         save_pool(&e, &pool);
         e.events().publish(
-            (String::from_str(&e, "burn"), from.clone()),
+            (Symbol::new(&e, "burn"), from.clone()),
             BurnEvent {
                 user: from,
                 shares_burned: amount,

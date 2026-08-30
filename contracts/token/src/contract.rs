@@ -6,7 +6,7 @@ use crate::balance::{
 };
 use crate::metadata::{read_decimal, read_name, read_symbol, write_metadata};
 use emergency_guard::{EmergencyGuard, GuardError, PauseType};
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, String, Symbol, Vec};
 
 fn require_not_paused(e: &Env, operation: u32) {
     if EmergencyGuard::is_paused(e.clone(), operation) {
@@ -186,7 +186,7 @@ impl TokenTrait for Token {
         spend_balance(&e, from.clone(), amount);
 
         e.events().publish(
-            (String::from_str(&e, "burn"), from.clone()),
+            (Symbol::new(&e, "burn"), from.clone()),
             BurnEvent {
                 burner: from.clone(),
                 target_account: from,
@@ -206,7 +206,7 @@ impl TokenTrait for Token {
         spend_balance(&e, from.clone(), amount);
 
         e.events().publish(
-            (String::from_str(&e, "burn"), from.clone()),
+            (Symbol::new(&e, "burn"), from.clone()),
             BurnEvent {
                 burner: spender,
                 target_account: from,
