@@ -11,8 +11,3 @@ soroban-sdk.workspace = true
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-soroban-sdk = "27.0.3"
-
-soroban-sdk = { version = "27.0.3", features = ["testutils"] }
-
-[workspace]
