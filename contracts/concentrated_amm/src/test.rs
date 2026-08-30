@@ -489,3 +489,26 @@ fn test_partial_burn() {
     let (a2, b2) = client.burn(&lp, &-100i32, &100i32, &(liq - half));
     assert!(a2 > 0 || b2 > 0, "remaining burn should also recover tokens");
 }
+
+#[test]
+fn test_gas_consumption_benchmark() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (token_a, token_b, admin_a, admin_b) = setup_tokens(&e);
+    let client = setup_amm(&e, &token_a, &token_b);
+
+    let lp = Address::generate(&e);
+    let trader = Address::generate(&e);
+
+    admin_a.mint(&lp, &10_000_000);
+    admin_b.mint(&lp, &10_000_000);
+    admin_a.mint(&trader, &1_000_000);
+    admin_b.mint(&trader, &1_000_000);
+
+    client.mint(&lp, &-500i32, &500i32, &5_000_000u128, &5_000_000u128);
+
+    let (amt_in, amt_out) = client.swap(&trader, &true, &10_000u128);
+    assert!(amt_in > 0);
+    assert!(amt_out > 0);
+}
