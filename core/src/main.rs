@@ -2750,14 +2750,17 @@ async fn main() {
         listener.local_addr().unwrap()
     );
 
-    // ── Graceful shutdown (#573: SIGTERM / SIGINT) ────────────────────
+// ── Graceful shutdown (#573: SIGTERM / SIGINT) ────────────────────
     // ── Spawn gRPC server on its dedicated port ──────────────────────────
-    tokio::spawn(async move {
+    let grpc_handle = tokio::spawn(async move {
         grpc::serve(grpc_addr, grpc_bus).await;
     });
 
+    // Create a shutdown signal that also closes the DB pools
+    let shutdown_signal_fut = shutdown_signal(shutdown_tx.clone(), app_state.clone());
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
+        .with_graceful_shutdown(shutdown_signal_fut)
         .await
         .expect("Server failed to start");
 
@@ -2768,41 +2771,55 @@ async fn main() {
     );
     join_worker_handles(worker_handles).await;
     tracing::info!("All background workers stopped");
+
+    // Wait for gRPC server to finish (it will exit when the bus is closed)
+    let _ = grpc_handle.await;
+    tracing::info!("gRPC server stopped");
 }
 
 /// Wait for Ctrl+C / SIGTERM, then broadcast shutdown to all worker loops.
-async fn shutdown_signal(shutdown_tx: tokio::sync::broadcast::Sender<()>) {
+async fn shutdown_signal(
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    app_state: Arc<AppState>,
+) {
+    // Wait for shutdown signal
+    let sigterm = async {
+        #[cfg(unix)]
+        {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler")
+                .recv()
+                .await;
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<()>().await;
+        }
+    };
+
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .expect("failed to install Ctrl+C handler");
     };
 
-    #[cfg(unix)]
-    let terminate = async {
-        .with_graceful_shutdown(shutdown_signal())
-
-    tracing::info!("Server shut down gracefully.");
-
-/// Waits for SIGTERM (Unix) or Ctrl-C (all platforms) and resolves once either
-/// signal is received, allowing axum to finish in-flight requests before exit.
-async fn shutdown_signal() {
-    let sigterm = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        _ = ctrl_c => {
+            tracing::info!("Received SIGINT (Ctrl-C), shutting down…");
+        }
+        _ = sigterm => {
+            tracing::info!("Received SIGTERM, shutting down…");
+        }
     }
 
     tracing::info!("Shutdown signal received; notifying background workers");
     let _ = shutdown_tx.send(());
+
+    // Close database connections cleanly
+    tracing::info!("Closing database connections...");
+    app_state.job_queue.close().await;
+    app_state.fee_store.close().await;
+    tracing::info!("Database connections closed");
+}
 
 /// Await every worker handle, aborting any that hang past a short grace period.
 async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
@@ -2820,12 +2837,7 @@ async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
                     "Background worker did not exit within {:?}; aborted",
                     WORKER_JOIN_TIMEOUT
                 );
-    let sigterm = std::future::pending::<()>();
-
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Received SIGINT (Ctrl-C), shutting down…");
-        _ = sigterm => {
-            tracing::info!("Received SIGTERM, shutting down…");
+            }
         }
     }
 }
