@@ -191,11 +191,19 @@ mod tests {
         };
 
         let sym = |s: &str| -> ScVal {
-            let string_m: StringM = s.as_bytes().to_vec().try_into().unwrap();
+            // ScSymbol wraps StringM<32>, so the length bound must be
+            // named explicitly rather than defaulting to StringM<u32::MAX>.
+            let string_m: StringM<32> = s.as_bytes().to_vec().try_into().unwrap();
             ScVal::Symbol(ScSymbol(string_m))
         };
 
-        let topics: VecM<ScVal> = vec![sym(topic0), sym("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"), sym(fn_name)]
+        // topics[1] is the contract address. It is a 56-character strkey, which
+        // does not fit in an ScSymbol (max 32 chars), so it must be encoded as
+        // an ScVal::Address rather than a symbol.
+        let contract_addr = ScVal::Address(soroban_sdk::xdr::ScAddress::Contract(
+            soroban_sdk::xdr::Hash([0u8; 32]),
+        ));
+        let topics: VecM<ScVal> = vec![sym(topic0), contract_addr, sym(fn_name)]
             .try_into()
             .unwrap();
 
