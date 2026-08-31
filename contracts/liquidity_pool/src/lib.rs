@@ -30,13 +30,6 @@ pub enum Error {
     InsufficientShares = 6,
     InsufficientAllowance = 7,
     SlippageExceeded = 8,
-    InsufficientLiquidity = 2,
-    SlippageExceeded = 3,
-    InsufficientShares = 4,
-    NotInitialized = 5,
-    InsufficientBalance = 6,
-    Unauthorized = 7,
-    InsufficientAllowance = 8,
     InvalidFee = 9,
     OracleNotConfigured = 10,
     InvalidOraclePrice = 11,
@@ -209,101 +202,6 @@ pub enum DataKey {
     AccumulatedRewardPerShare,
 }
 
-fn sqrt(x: i128) -> i128 {
-    if x == 0 {
-        return 0;
-    Guard,
-    Oracle,
-    PendingFeeUpdate,
-/// Grouped pool state — stored as a single instance key to reduce storage footprint.
-#[contracttype]
-#[derive(Clone)]
-pub struct PoolState {
-    pub admin: Address,
-    pub token_a: Address,
-    pub token_b: Address,
-    pub reserve_a: i128,
-    pub reserve_b: i128,
-    pub total_shares: i128,
-    pub fee_bps: i128,
-}
-
-/// Storage keys.
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    /// Single-entry key for all grouped pool state.
-    Pool,
-    /// Per-user LP share balance (persistent storage).
-    Balance(Address),
-    /// ERC-20-style allowances (persistent storage).
-    Allowance(AllowanceDataKey),
-    /// LP fee in basis points (charged on deposit/withdrawal)
-    LpFeeBps,
-    Admin,
-    Guard,
-    Oracle,
-    PendingFeeUpdate,
-}
-
-fn load_pool(e: &Env) -> Result<PoolState, Error> {
-    e.storage()
-        .instance()
-        .get::<_, PoolState>(&DataKey::Pool)
-        .ok_or(Error::NotInitialized)
-}
-
-fn save_pool(e: &Env, pool: &PoolState) {
-    e.storage().instance().set(&DataKey::Pool, pool);
-}
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-pub const MAX_FEE_BPS: i128 = 100;
-pub const DEFAULT_BASE_FEE_BPS: i128 = 30;
-pub const DEFAULT_FEE_TIMELOCK_LEDGERS: u32 = 120;
-
-pub const LOW_VOLATILITY_THRESHOLD_BPS: i128 = 100;
-pub const MEDIUM_VOLATILITY_THRESHOLD_BPS: i128 = 250;
-pub const HIGH_VOLATILITY_THRESHOLD_BPS: i128 = 500;
-
-pub const LOW_VOLATILITY_FEE_BPS: i128 = 40;
-pub const MEDIUM_VOLATILITY_FEE_BPS: i128 = 70;
-pub const HIGH_VOLATILITY_FEE_BPS: i128 = 100;
-
-// ── Oracle trait ──────────────────────────────────────────────────────────────
-
-#[soroban_sdk::contractclient(name = "PriceOracleClient")]
-pub trait PriceOracle {
-    fn latest_price(e: Env) -> i128;
-}
-
-fn sqrt(x: i128) -> i128 {
-    if x == 0 {
-        return 0;
-    }
-
-    let mut z = (x + 1) / 2;
-    let mut y = x;
-
-    while z < y {
-        y = z;
-        z = (x / z + z) / 2;
-    }
-
-    y
-}
-
-    Admin,
-    GuardAdmins,
-    GuardThreshold,
-    GuardPauseState,
-    Balance(Address),
-    Allowance(AllowanceDataKey),
-    OracleConfig,
-    LastOraclePrice,
-    LastVolatilityBps,
-    PendingFeeUpdate,
-}
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn sqrt(x: i128) -> i128 {
@@ -1071,50 +969,6 @@ impl LiquidityPool {
     pub fn swap(e: Env, to: Address, buy_a: bool, out: i128, in_max: i128) -> Result<i128, Error> {
         require_not_paused(&e, PauseType::SWAP)?;
         to.require_auth();
-
-        let mut pool = load_pool(&e)?;
-        let (reserve_in, reserve_out, token_in, token_out) = if buy_a {
-            (
-                pool.reserve_b,
-                pool.reserve_a,
-                pool.token_b.clone(),
-                pool.token_a.clone(),
-            )
-        } else {
-        };
-
-        if out >= reserve_out {
-            return Err(Error::InsufficientLiquidity);
-        }
-
-        let fee_scale = 10_000i128 - pool.fee_bps;
-        let numerator = reserve_in
-            .checked_mul(out)
-            .ok_or(Error::InsufficientLiquidity)?
-            .checked_mul(10_000)
-            .ok_or(Error::InsufficientLiquidity)?;
-        let denominator = (reserve_out - out)
-            .checked_mul(fee_scale)
-
-        // Constant-product invariant preservation.
-        //
-        // The required input is `numerator / denominator`, but integer division
-        // truncates toward zero. The previous implementation used
-        // `numerator / denominator + 1`, which unconditionally adds a whole unit
-        // — even when the division is already exact. That systematically
-        // over-charges the trader by one base unit on every exact-division swap,
-        // leaking value into the pool and breaking round-trip price parity
-        // (a swap followed by its inverse no longer returns the original amount).
-        // The correct rule is ceiling division: charge the *smallest* integer
-        // input that still keeps `k' = new_reserve_in * new_reserve_out` at or
-        // above the old invariant `k`. When the division is exact the ceiling is
-        // the quotient itself (no surcharge); otherwise it rounds up by one unit,
-        // rounding in the pool's favour just enough to cover the truncated
-        // remainder. This matches Uniswap-v2's `getAmountIn` semantics.
-        if denominator <= 0 {
-        let amount_in = if numerator % denominator == 0 {
-            numerator / denominator
-            numerator / denominator + 1
 
         let pool = load_pool(&e)?;
         let sides = swap_sides(&pool, buy_a);
