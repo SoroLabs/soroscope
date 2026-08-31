@@ -1,4 +1,3 @@
-```rust
 #![allow(dead_code)]
 
 mod auth;
@@ -65,15 +64,6 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 // CLI Argument Handling
-use crate::fee_analytics::{FeeAnalyticsEngine, MarketConditions, ModelBreakdown};
-use crate::fee_collector::{FeeCollector, FeeCollectorConfig};
-use crate::fee_store::FeeStore;
-use crate::gas_golfing::{GasGolfingAnalyzer, GasGolfingReport};
-use crate::insights::InsightsEngine;
-use crate::jobs::{JobQueue, JobQueueConfig, JobWorker};
-use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
-use crate::simulation::{SimulationEngine, SimulationMode, SimulationResult};
-use crate::ws::SimulationBus;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -252,6 +242,8 @@ fn default_max_ledger_age() -> u32 {
 
 fn default_event_bus_capacity() -> usize {
     256
+}
+
 fn default_allowed_origins() -> String {
     // Empty string means: fall back to allow-all (*).
     // Operators set ALLOWED_ORIGINS=http://localhost:3000,https://app.example.com
@@ -478,6 +470,21 @@ pub(crate) struct AppMetrics {
     indexing_errors_total: IntCounterVec,
     /// Depth of background job queues, by queue name.
     job_queue_depth: prometheus::GaugeVec,
+    // ── Operational HTTP/server metrics (issue #37) ──────────────────────
+    /// Total HTTP requests served, by method, matched route and status code.
+    ///
+    /// The route label is the *matched* axum path (`/api/v1/contracts/:id`)
+    /// rather than the raw URI, so high-cardinality path parameters cannot
+    /// explode the series count.
+    http_requests_total: IntCounterVec,
+    /// Wall-clock HTTP request duration in seconds, by method and route.
+    http_request_duration_seconds: HistogramVec,
+    /// HTTP requests currently being served.
+    http_requests_in_flight: prometheus::IntGauge,
+    /// Simulation requests currently executing.
+    active_simulations: prometheus::IntGauge,
+    /// Instant the metrics registry (and therefore the server) was created.
+    started_at: std::time::Instant,
 }
 
 impl AppMetrics {
@@ -520,27 +527,77 @@ impl AppMetrics {
             &["host"],
         )?;
         let host_memory_usage_percent = prometheus::GaugeVec::new(
+            Opts::new(
                 "host_memory_usage_percent",
                 "Host-wide memory usage percentage (0-100) sampled by the system alarm monitor",
+            ),
+            &["host"],
+        )?;
         let process_memory_bytes = prometheus::GaugeVec::new(
+            Opts::new(
                 "process_memory_bytes",
                 "Resident memory size of the SoroScope process in bytes",
+            ),
             &["process"],
+        )?;
         let indexing_latency_seconds = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "indexing_latency_seconds",
                 "Latency of ledger indexing/collection cycles in seconds",
+            ),
             &["stage"],
+        )?;
         let events_processed_total = IntCounterVec::new(
+            Opts::new(
                 "events_processed_total",
                 "Total number of ledger events successfully processed",
+            ),
+            &["stage"],
+        )?;
         let indexing_errors_total = IntCounterVec::new(
+            Opts::new(
                 "indexing_errors_total",
                 "Total number of indexing cycle failures",
+            ),
+            &["stage"],
+        )?;
         let job_queue_depth = prometheus::GaugeVec::new(
             Opts::new("job_queue_depth", "Current depth of background job queues"),
             &["queue"],
         )?;
+
+        // ── Operational HTTP/server metrics (issue #37) ──────────────────
+        let http_requests_total = IntCounterVec::new(
+            Opts::new(
+                "http_requests_total",
+                "Total number of HTTP requests by method, matched route and status code",
+            ),
+            &["method", "route", "status"],
+        )?;
+        let http_request_duration_seconds = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "http_request_duration_seconds",
+                "HTTP request latency in seconds by method and matched route",
+            )
+            // Web-request oriented buckets: sub-millisecond health checks up
+            // to multi-second simulations.
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["method", "route"],
+        )?;
+        let http_requests_in_flight = prometheus::IntGauge::new(
+            "http_requests_in_flight",
+            "Number of HTTP requests currently being served",
+        )?;
+        let active_simulations = prometheus::IntGauge::new(
+            "active_simulations",
+            "Number of simulation requests currently executing",
+        )?;
+        registry.register(Box::new(http_requests_total.clone()))?;
+        registry.register(Box::new(http_request_duration_seconds.clone()))?;
+        registry.register(Box::new(http_requests_in_flight.clone()))?;
+        registry.register(Box::new(active_simulations.clone()))?;
 
         registry.register(Box::new(simulation_latency_seconds.clone()))?;
         registry.register(Box::new(rpc_error_count_total.clone()))?;
@@ -567,7 +624,55 @@ impl AppMetrics {
             events_processed_total,
             indexing_errors_total,
             job_queue_depth,
+            http_requests_total,
+            http_request_duration_seconds,
+            http_requests_in_flight,
+            active_simulations,
+            started_at: std::time::Instant::now(),
         })
+    }
+
+    /// Seconds elapsed since the metrics registry (and server) started.
+    fn uptime_seconds(&self) -> f64 {
+        self.started_at.elapsed().as_secs_f64()
+    }
+
+    /// Record one completed HTTP request.
+    ///
+    /// `route` should be the matched axum path template, not the raw URI, so
+    /// path parameters do not create unbounded label cardinality.
+    fn observe_http_request(&self, method: &str, route: &str, status: u16, latency: f64) {
+        // `status` is formatted once and reused for the counter label.
+        let status = status.to_string();
+        self.http_requests_total
+            .with_label_values(&[method, route, &status])
+            .inc();
+        self.http_request_duration_seconds
+            .with_label_values(&[method, route])
+            .observe(latency);
+    }
+
+    /// Increment the active-simulation gauge, returning a guard that
+    /// decrements it on drop.
+    ///
+    /// Using a guard keeps the gauge correct even when a handler returns early
+    /// via `?` or the request future is cancelled mid-flight.
+    pub(crate) fn simulation_in_progress(&self) -> ActiveSimulationGuard {
+        self.active_simulations.inc();
+        ActiveSimulationGuard {
+            gauge: self.active_simulations.clone(),
+        }
+    }
+}
+
+/// Decrements the active-simulation gauge when dropped.
+pub(crate) struct ActiveSimulationGuard {
+    gauge: prometheus::IntGauge,
+}
+
+impl Drop for ActiveSimulationGuard {
+    fn drop(&mut self) {
+        self.gauge.dec();
     }
 }
 
@@ -971,6 +1076,9 @@ async fn analyze(
 
     // Track simulation latency
     let start_time = std::time::Instant::now();
+    // Gauge is held for the whole simulation, including cache lookup and
+    // RPC round-trip, and released automatically on early return.
+    let _active = state.metrics.simulation_in_progress();
 
     let (result, cache_status): (SimulationResult, &'static str) =
         if let Some(cached) = state.cache.get(&cache_key).await {
@@ -1228,6 +1336,42 @@ async fn analyze_wasm(
     Ok(Json(report))
 }
 
+/// Records request count, status code and latency for every HTTP request.
+///
+/// Registered as a global layer so it observes *all* routes uniformly. The
+/// matched route template is read from axum's [`MatchedPath`] extension; when
+/// no route matches (a 404) the label collapses to a literal `unmatched` so a
+/// scanner probing random URLs cannot create unbounded label cardinality.
+async fn track_http_metrics(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().as_str().to_owned();
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_owned());
+
+    // The in-flight gauge is bracketed around `next.run` so it reflects
+    // concurrency rather than cumulative volume.
+    state.metrics.http_requests_in_flight.inc();
+    let started = std::time::Instant::now();
+    let response = next.run(req).await;
+    let latency = started.elapsed().as_secs_f64();
+    state.metrics.http_requests_in_flight.dec();
+
+    state.metrics.observe_http_request(
+        &method,
+        &route,
+        response.status().as_u16(),
+        latency,
+    );
+
+    response
+}
+
 async fn metrics_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1237,8 +1381,17 @@ async fn metrics_handler(
     encoder
         .encode(&metric_families, &mut buffer)
         .map_err(|e| AppError::Internal(format!("Failed to encode Prometheus metrics: {}", e)))?;
-    let output = String::from_utf8(buffer)
+    let mut output = String::from_utf8(buffer)
         .map_err(|e| AppError::Internal(format!("Metrics output encoding error: {}", e)))?;
+
+    // Uptime is derived at scrape time rather than kept current by a ticker,
+    // so it is appended to the encoded body instead of living in the registry.
+    output.push_str("# HELP process_uptime_seconds Seconds elapsed since the SoroScope server started\n");
+    output.push_str("# TYPE process_uptime_seconds gauge\n");
+    output.push_str(&format!(
+        "process_uptime_seconds {}\n",
+        state.metrics.uptime_seconds()
+    ));
     Ok((
         StatusCode::OK,
         [("Content-Type", encoder.format_type().to_string())],
@@ -1996,9 +2149,11 @@ async fn main() {
             .with(tracing_subscriber::fmt::layer().json())
             .init();
     } else {
+        tracing_subscriber::registry()
+            .with(filter)
             .with(tracing_subscriber::fmt::layer())
+            .init();
     }
-        .with(build_env_filter(&config.rust_log))
 
     tracing::info!(rust_log = %config.rust_log, "SoroScope Starting...");
     tracing::info!("SoroScope initialized with config: {:?}", config);
@@ -2677,6 +2832,7 @@ async fn main() {
                 .filter_map(|s| s.trim().parse::<HeaderValue>().ok())
                 .collect();
             CorsLayer::new().allow_origin(origins)
+        }
     };
 
     let protected = Router::new()
@@ -2725,6 +2881,13 @@ async fn main() {
             get(graphql::graphql_playground).post(graphql::graphql_handler),
         )
         .layer(Extension(graphql_schema))
+        // ── Operational HTTP metrics (issue #37) ──────────────────────
+        // Placed outside the route layers so every request — including
+        // unmatched 404s and rejected auth — is counted exactly once.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&app_state),
+            track_http_metrics,
+        ))
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -2774,19 +2937,12 @@ async fn main() {
 async fn shutdown_signal(shutdown_tx: tokio::sync::broadcast::Sender<()>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
+            .await
             .expect("failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]
     let terminate = async {
-        .with_graceful_shutdown(shutdown_signal())
-
-    tracing::info!("Server shut down gracefully.");
-
-/// Waits for SIGTERM (Unix) or Ctrl-C (all platforms) and resolves once either
-/// signal is received, allowing axum to finish in-flight requests before exit.
-async fn shutdown_signal() {
-    let sigterm = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler")
             .recv()
@@ -2797,12 +2953,17 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        _ = ctrl_c => {
+            tracing::info!("Received SIGINT (Ctrl-C), shutting down");
+        },
+        _ = terminate => {
+            tracing::info!("Received SIGTERM, shutting down");
+        },
     }
 
     tracing::info!("Shutdown signal received; notifying background workers");
     let _ = shutdown_tx.send(());
+}
 
 /// Await every worker handle, aborting any that hang past a short grace period.
 async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
@@ -2820,12 +2981,7 @@ async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
                     "Background worker did not exit within {:?}; aborted",
                     WORKER_JOIN_TIMEOUT
                 );
-    let sigterm = std::future::pending::<()>();
-
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Received SIGINT (Ctrl-C), shutting down…");
-        _ = sigterm => {
-            tracing::info!("Received SIGTERM, shutting down…");
+            }
         }
     }
 }
@@ -2833,6 +2989,130 @@ async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Integration Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Unit tests for the operational metrics exporter (issue #37).
+#[cfg(test)]
+mod operational_metrics_tests {
+    use super::*;
+    use prometheus::Encoder;
+
+    /// Gather the registry and render it in Prometheus text format.
+    fn render(metrics: &AppMetrics) -> String {
+        let encoder = prometheus::TextEncoder::new();
+        let mut buf = Vec::new();
+        encoder.encode(&metrics.registry.gather(), &mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn registry_builds_without_duplicate_registration() {
+        // `AppMetrics::new` returns Err if two collectors share a name, so a
+        // successful build is itself the assertion.
+        AppMetrics::new().expect("metrics registry should build");
+    }
+
+    #[test]
+    fn http_requests_are_counted_by_method_route_and_status() {
+        let m = AppMetrics::new().unwrap();
+        m.observe_http_request("GET", "/health", 200, 0.002);
+        m.observe_http_request("GET", "/health", 200, 0.003);
+        m.observe_http_request("POST", "/analyze", 500, 1.5);
+
+        let out = render(&m);
+        assert!(out.contains(
+            r#"http_requests_total{method="GET",route="/health",status="200"} 2"#
+        ));
+        assert!(out.contains(
+            r#"http_requests_total{method="POST",route="/analyze",status="500"} 1"#
+        ));
+    }
+
+    #[test]
+    fn request_latency_is_observed_into_the_histogram() {
+        let m = AppMetrics::new().unwrap();
+        m.observe_http_request("GET", "/health", 200, 0.002);
+
+        let out = render(&m);
+        assert!(out.contains(r#"http_request_duration_seconds_count{method="GET",route="/health"} 1"#));
+        // 2ms falls in the 0.005 bucket but not the 0.001 one.
+        assert!(out.contains(r#"le="0.005"} 1"#));
+    }
+
+    #[test]
+    fn active_simulation_gauge_tracks_concurrency() {
+        let m = AppMetrics::new().unwrap();
+        assert_eq!(m.active_simulations.get(), 0);
+
+        let a = m.simulation_in_progress();
+        let b = m.simulation_in_progress();
+        assert_eq!(m.active_simulations.get(), 2);
+
+        drop(a);
+        assert_eq!(m.active_simulations.get(), 1);
+        drop(b);
+        assert_eq!(m.active_simulations.get(), 0);
+    }
+
+    #[test]
+    fn active_simulation_gauge_is_released_on_early_return() {
+        let m = AppMetrics::new().unwrap();
+
+        // Simulates a handler that bails out with `?` partway through.
+        fn failing_handler(m: &AppMetrics) -> Result<(), &'static str> {
+            let _guard = m.simulation_in_progress();
+            Err("simulation failed")
+        }
+
+        assert!(failing_handler(&m).is_err());
+        assert_eq!(
+            m.active_simulations.get(),
+            0,
+            "guard must decrement even when the handler returns early"
+        );
+    }
+
+    #[test]
+    fn rpc_error_counter_is_labelled_by_endpoint_and_type() {
+        let m = AppMetrics::new().unwrap();
+        m.rpc_error_count_total
+            .with_label_values(&["/analyze", "timeout"])
+            .inc();
+
+        let out = render(&m);
+        assert!(out.contains(
+            r#"rpc_error_count_total{endpoint="/analyze",error_type="timeout"} 1"#
+        ));
+    }
+
+    #[test]
+    fn uptime_is_non_negative_and_monotonic() {
+        let m = AppMetrics::new().unwrap();
+        let first = m.uptime_seconds();
+        assert!(first >= 0.0);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(m.uptime_seconds() >= first);
+    }
+
+    #[test]
+    fn exposition_includes_system_and_process_metrics() {
+        let m = AppMetrics::new().unwrap();
+        m.host_cpu_usage_percent.with_label_values(&["local"]).set(12.5);
+        m.host_memory_usage_percent.with_label_values(&["local"]).set(48.0);
+        m.process_memory_bytes.with_label_values(&["soroscope"]).set(1024.0);
+
+        let out = render(&m);
+        assert!(out.contains("host_cpu_usage_percent"));
+        assert!(out.contains("host_memory_usage_percent"));
+        assert!(out.contains("process_memory_bytes"));
+    }
+
+    #[test]
+    fn in_flight_gauge_is_exported() {
+        let m = AppMetrics::new().unwrap();
+        m.http_requests_in_flight.inc();
+        assert!(render(&m).contains("http_requests_in_flight 1"));
+    }
+}
 
 #[cfg(any())]
 mod tests {
@@ -3188,4 +3468,3 @@ async fn analyze_simulation(
     Ok(Json(result))
 }
 
-```
