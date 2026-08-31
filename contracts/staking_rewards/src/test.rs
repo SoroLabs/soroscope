@@ -284,6 +284,52 @@ fn test_zero_stake_security() {
     assert_eq!(pending_after, accrued);
 }
 
+/// Regression test for issue #124: the reward-index calculation must never
+/// panic with a subtraction underflow when the user's staked balance is zero
+/// (or after a full withdrawal leaves a zero balance with accrued rewards).
+#[test]
+fn test_zero_stake_no_underflow() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    // Stake, accrue rewards, then withdraw everything, leaving balance = 0.
+    client.stake(&user, &STAKE_AMOUNT);
+    advance_ledger(&e, 10);
+    client.withdraw(&user, &STAKE_AMOUNT);
+    assert_eq!(client.get_staked_balance(&user), 0);
+
+    let accrued = client.get_accrued_rewards(&user);
+    assert!(accrued > 0);
+
+    // With zero stake, advancing across several epochs must not underflow or
+    // panic — pending rewards simply stay pinned to the accrued carryover.
+    for _ in 0..3 {
+        advance_ledger(&e, 10);
+        assert_eq!(client.get_pending_rewards(&user), accrued);
+        assert_eq!(client.get_accrued_rewards(&user), accrued);
+        assert_eq!(client.get_staked_balance(&user), 0);
+    }
+
+    // Claiming with a zero balance returns the accrued rewards without panic.
+    assert_eq!(client.claim(&user), accrued);
+    assert_eq!(client.get_accrued_rewards(&user), 0);
+
+    // Re-staking from zero balance is also underflow-safe.
+    staking_client.mint(&user, &STAKE_AMOUNT);
+    client.stake(&user, &STAKE_AMOUNT);
+    assert_eq!(client.get_staked_balance(&user), STAKE_AMOUNT);
+    advance_ledger(&e, 5);
+    assert!(client.get_pending_rewards(&user) > 0);
+
+    // A never-before-seen user with no stake reports zero, not an error/panic.
+    let stranger = Address::generate(&e);
+    assert_eq!(client.get_staked_balance(&stranger), 0);
+    assert_eq!(client.get_pending_rewards(&stranger), 0);
+}
+
 #[test]
 fn test_multi_epoch_accumulation() {
     let (e, client, _, staking_token, _) = setup();
@@ -325,7 +371,6 @@ fn test_emergency_withdraw() {
 
     assert!(client.get_pending_rewards(&user) > 0);
 
-    client.set_paused(&true);
     // Pause staking to simulate extreme conditions
     client.pause_staking();
 
