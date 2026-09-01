@@ -36,6 +36,17 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "✅ Tests OK`n" -ForegroundColor Green
 
+# ── Step 4: Docker Compose Validation ─────────────────────────────────────────
+if (Get-Command docker-compose -ErrorAction SilentlyContinue) {
+    Write-Host "[4/4] Validating docker-compose.yml..." -ForegroundColor Yellow
+    docker-compose config -q
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "`n❌ Docker Compose configuration failed." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "✅ Docker Compose config OK`n" -ForegroundColor Green
+}
+
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host " All checks passed! Safe to push. 🚀" -ForegroundColor Cyan
 Write-Host "========================================`n" -ForegroundColor Cyan
