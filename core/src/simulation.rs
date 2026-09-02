@@ -970,6 +970,54 @@ struct ResourceCost {
     cpu_insns: String,
     mem_bytes: String,
 }
+
+#[allow(dead_code)]
+/// Extracts Soroban host budget limits from CLI log output.
+///
+/// Soroban CLI v21 changed the budget line from the legacy
+/// `budget: instructions: <cpu>, memory: <mem>` format to
+/// `budget: cpu: <cpu>, mem: <mem>`. Some RPC cost logs use
+/// `cost: cpu_insns: <cpu>, mem_bytes: <mem>` as well. This parser
+/// accepts all three formats and returns `(cpu_instructions, ram_bytes)`.
+fn extract_soroban_budget_limits(log: &str) -> Option<(u64, u64)> {
+    let budget_line = log.lines().find(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("budget") || lower.contains("cpu_insns") || lower.contains("mem_bytes")
+    })?;
+
+    let cpu_patterns = [
+        r"\binstructions\b[^\d]*(\d+)",
+        r"\bcpu\b[^\d]*(\d+)",
+        r"\bcpu_insns\b[^\d]*(\d+)",
+    ];
+    let mem_patterns = [
+        r"\bmemory\b[^\d]*(\d+)",
+        r"\bmem\b[^\d]*(\d+)",
+        r"\bmem_bytes\b[^\d]*(\d+)",
+    ];
+
+    let cpu = cpu_patterns.iter().find_map(|pattern| {
+        regex::Regex::new(pattern)
+            .ok()?
+            .captures(budget_line)?
+            .get(1)?
+            .as_str()
+            .parse()
+            .ok()
+    })?;
+    let mem = mem_patterns.iter().find_map(|pattern| {
+        regex::Regex::new(pattern)
+            .ok()?
+            .captures(budget_line)?
+            .get(1)?
+            .as_str()
+            .parse()
+            .ok()
+    })?;
+
+    Some((cpu, mem))
+}
+
 // ── Multi-account authorization ───────────────────────────────────────────────
 
 /// Represents one signer in a multi-account authorization scenario.
@@ -3821,6 +3869,38 @@ mod tests {
         assert_eq!(
             engine.extract_footprint_from_xdr("SGVsbG8gV29ybGQ="),
             (0, 0)
+        );
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_v21_format() {
+        let log = "INFO soroban_cli: budget: cpu: 100000, mem: 2048";
+        assert_eq!(extract_soroban_budget_limits(log), Some((100000, 2048)));
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_legacy_format() {
+        let log = "budget: instructions: 500000, memory: 4096";
+        assert_eq!(extract_soroban_budget_limits(log), Some((500000, 4096)));
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_rpc_cost_format() {
+        let log = "cost: cpu_insns: 123, mem_bytes: 456";
+        assert_eq!(extract_soroban_budget_limits(log), Some((123, 456)));
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_reversed_legacy_order() {
+        let log = "budget: memory: 100, instructions: 200";
+        assert_eq!(extract_soroban_budget_limits(log), Some((200, 100)));
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_missing_values_returns_none() {
+        assert_eq!(
+            extract_soroban_budget_limits("budget: cpu: 123"),
+            None
         );
     }
 
