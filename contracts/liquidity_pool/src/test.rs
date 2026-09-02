@@ -2316,6 +2316,21 @@ fn test_swap_exact_in_input_too_small_to_fill() {
 }
 
 #[test]
+fn test_swap_exact_in_prevents_1_stroop_micro_swap_exploit() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1_000_000, 1_000_000);
+
+    assert_eq!(client.get_amount_out(&false, &1), 0);
+    let input_for_one = client.get_amount_in(&false, &1);
+    assert!(input_for_one > 1, "1 stroop must require a positive pool-favoring input: {input_for_one}");
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &1, &0),
+        Err(Ok(Error::InsufficientLiquidity))
+    );
+}
+
+#[test]
 fn test_swap_exact_in_respects_swap_pause() {
     let e = Env::default();
     e.mock_all_auths();

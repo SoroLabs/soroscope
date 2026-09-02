@@ -293,15 +293,15 @@ fn swap_sides(pool: &PoolState, buy_a: bool) -> SwapSides {
 /// Output produced by `amount_in`, constant product net of the pool fee.
 ///
 /// `out = (in_after_fee * reserve_out) / (reserve_in * 10_000 + in_after_fee)`
-/// with `in_after_fee = amount_in * (10_000 - fee_bps)`. Division truncates, so
-/// rounding dust stays with the pool rather than the caller.
+/// with `in_after_fee = amount_in * (10_000 - fee_bps)`. Integer division
+/// truncates toward zero, so dust stays with the pool rather than the caller.
 fn amount_out_for_in(
     amount_in: i128,
     reserve_in: i128,
     reserve_out: i128,
     fee_bps: i128,
 ) -> Result<i128, Error> {
-    if reserve_in <= 0 || reserve_out <= 0 {
+    if amount_in <= 0 || reserve_in <= 0 || reserve_out <= 0 {
         return Err(Error::InsufficientLiquidity);
     }
     let in_after_fee = amount_in
@@ -317,15 +317,16 @@ fn amount_out_for_in(
         .ok_or(Error::InsufficientLiquidity)?;
     Ok(numerator / denominator)
 }
-/// Input required to receive exactly `amount_out`, rounded up by one so the
-/// constant-product invariant is never weakened by truncation.
+
+/// Input required to receive exactly `amount_out`, rounded up so the pool never
+/// loses value due to integer truncation.
 fn amount_in_for_out(
     amount_out: i128,
     reserve_in: i128,
     reserve_out: i128,
     fee_bps: i128,
 ) -> Result<i128, Error> {
-    if amount_out >= reserve_out {
+    if amount_out <= 0 || amount_out >= reserve_out || reserve_in <= 0 || reserve_out <= 0 {
         return Err(Error::InsufficientLiquidity);
     }
     let numerator = reserve_in
@@ -336,7 +337,12 @@ fn amount_in_for_out(
     let denominator = (reserve_out - amount_out)
         .checked_mul(10_000 - fee_bps)
         .ok_or(Error::InsufficientLiquidity)?;
-    Ok((numerator / denominator) + 1)
+    let quotient = numerator / denominator;
+    Ok(if numerator % denominator == 0 {
+        quotient
+    } else {
+        quotient + 1
+    })
 }
 /// Point `DataKey::Admin` (and `PoolState::admin`) at `replacement` when
 /// `departing` is the current primary admin. No-op otherwise.
@@ -970,6 +976,11 @@ impl LiquidityPool {
     pub fn swap(e: Env, to: Address, buy_a: bool, out: i128, in_max: i128) -> Result<i128, Error> {
         require_not_paused(&e, PauseType::SWAP)?;
         to.require_auth();
+
+        if out <= 0 || in_max < 0 {
+            return Err(Error::InvalidAmount);
+        }
+
         let pool = load_pool(&e)?;
         let sides = swap_sides(&pool, buy_a);
         let amount_in = amount_in_for_out(out, sides.reserve_in, sides.reserve_out, pool.fee_bps)?;
