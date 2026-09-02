@@ -70,6 +70,15 @@ export interface CallNode {
   contract_id: string;
   function: string;
   children: CallNode[];
+  /**
+   * Gas attributed to this call. Optional because graphs produced before the
+   * backend reported per-call gas do not carry it; the visualizer renders
+   * those edges neutrally rather than implying they were free.
+   */
+  gas_used?: number | null;
+  /** Decoded call arguments, when the backend supplies them. */
+  args?: unknown[];
+  return_value?: unknown;
 }
 
 export interface CallGraph {
