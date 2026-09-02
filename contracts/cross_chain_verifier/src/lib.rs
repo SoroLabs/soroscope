@@ -300,16 +300,17 @@ impl CrossChainVerifier {
         let mut i = 0;
         while i < proof.len() {
             let sibling = proof.get(i).unwrap().to_array();
-            let is_left_sibling = proof_flags.get(i).unwrap();
+            // Deterministically order sibling hashes so the computed root
+            // matches the Soroban verifier's canonical Merkle ordering.
+            let (left, right) = if sibling <= current_hash {
+                (sibling, current_hash)
+            } else {
+                (current_hash, sibling)
+            };
 
             let mut combined = [0u8; 64];
-            if is_left_sibling {
-                combined[0..32].copy_from_slice(&sibling);
-                combined[32..64].copy_from_slice(&current_hash);
-            } else {
-                combined[0..32].copy_from_slice(&current_hash);
-                combined[32..64].copy_from_slice(&sibling);
-            }
+            combined[0..32].copy_from_slice(&left);
+            combined[32..64].copy_from_slice(&right);
 
             let combined_bytes = Bytes::from_slice(env, &combined);
             current_hash = env.crypto().sha256(&combined_bytes).to_array();

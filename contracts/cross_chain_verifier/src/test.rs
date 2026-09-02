@@ -85,21 +85,8 @@ fn test_verify_message_success() {
     let sibling2 = BytesN::from_array(&env, &[4; 32]);
 
     // Manually construct the root
-    let mut combined_1 = [0u8; 64];
-    combined_1[0..32].copy_from_slice(&sibling1.to_array());
-    combined_1[32..64].copy_from_slice(&leaf.to_array());
-    let hash_1 = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined_1))
-        .to_array();
-
-    let mut combined_2 = [0u8; 64];
-    combined_2[0..32].copy_from_slice(&hash_1);
-    combined_2[32..64].copy_from_slice(&sibling2.to_array());
-    let final_root = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined_2))
-        .to_array();
+    let hash_1 = merkle_hash_pair(&env, &sibling1.to_array(), &leaf.to_array());
+    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
 
     let expected_root_bytes = BytesN::from_array(&env, &final_root);
 
@@ -135,15 +122,8 @@ fn test_verify_message_and_consume_nonce() {
     let sibling1 = BytesN::from_array(&env, &[3; 32]);
     let sibling2 = BytesN::from_array(&env, &[4; 32]);
 
-    let mut combined_1 = [0u8; 64];
-    combined_1[0..32].copy_from_slice(&sibling1.to_array());
-    combined_1[32..64].copy_from_slice(&leaf.to_array());
-    let hash_1 = env.crypto().sha256(&Bytes::from_slice(&env, &combined_1)).to_array();
-
-    let mut combined_2 = [0u8; 64];
-    combined_2[0..32].copy_from_slice(&hash_1);
-    combined_2[32..64].copy_from_slice(&sibling2.to_array());
-    let final_root = env.crypto().sha256(&Bytes::from_slice(&env, &combined_2)).to_array();
+    let hash_1 = merkle_hash_pair(&env, &sibling1.to_array(), &leaf.to_array());
+    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
 
     let expected_root_bytes = BytesN::from_array(&env, &final_root);
     let block_height = 100;
@@ -177,15 +157,8 @@ fn test_replay_nonce_panics() {
     let sibling1 = BytesN::from_array(&env, &[3; 32]);
     let sibling2 = BytesN::from_array(&env, &[4; 32]);
 
-    let mut combined_1 = [0u8; 64];
-    combined_1[0..32].copy_from_slice(&sibling1.to_array());
-    combined_1[32..64].copy_from_slice(&leaf.to_array());
-    let hash_1 = env.crypto().sha256(&Bytes::from_slice(&env, &combined_1)).to_array();
-
-    let mut combined_2 = [0u8; 64];
-    combined_2[0..32].copy_from_slice(&hash_1);
-    combined_2[32..64].copy_from_slice(&sibling2.to_array());
-    let final_root = env.crypto().sha256(&Bytes::from_slice(&env, &combined_2)).to_array();
+    let hash_1 = merkle_hash_pair(&env, &sibling1.to_array(), &leaf.to_array());
+    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
 
     let expected_root_bytes = BytesN::from_array(&env, &final_root);
     let block_height = 100;
@@ -335,13 +308,7 @@ fn test_remove_authorized_signer() {
 
     // Build a root that commits to both leaves (2-level tree)
     // Level 1: combine leaf1 with leaf2
-    let mut combined = [0u8; 64];
-    combined[0..32].copy_from_slice(&leaf1.to_array());
-    combined[32..64].copy_from_slice(&leaf2.to_array());
-    let branch = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined))
-        .to_array();
+    let branch = merkle_hash_pair(&env, &leaf1.to_array(), &leaf2.to_array());
     let root = BytesN::from_array(&env, &branch);
 
     let block_height = 100;
@@ -507,15 +474,8 @@ fn test_verify_signed_message_success_ed25519() {
     let sibling1 = BytesN::from_array(&env, &[3; 32]);
     let sibling2 = BytesN::from_array(&env, &[4; 32]);
 
-    let mut combined_1 = [0u8; 64];
-    combined_1[0..32].copy_from_slice(&sibling1.to_array());
-    combined_1[32..64].copy_from_slice(&message_hash.to_array());
-    let hash_1 = env.crypto().sha256(&Bytes::from_slice(&env, &combined_1)).to_array();
-
-    let mut combined_2 = [0u8; 64];
-    combined_2[0..32].copy_from_slice(&hash_1);
-    combined_2[32..64].copy_from_slice(&sibling2.to_array());
-    let final_root = env.crypto().sha256(&Bytes::from_slice(&env, &combined_2)).to_array();
+    let hash_1 = merkle_hash_pair(&env, &sibling1.to_array(), &message_hash.to_array());
+    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
 
     let expected_root = BytesN::from_array(&env, &final_root);
     let block_height = 100;
@@ -587,15 +547,8 @@ fn test_verify_signed_message_accepts_valid_signature() {
     let sibling1 = BytesN::from_array(&env, &[11; 32]);
     let sibling2 = BytesN::from_array(&env, &[13; 32]);
 
-    let mut combined_1 = [0u8; 64];
-    combined_1[0..32].copy_from_slice(&sibling1.to_array());
-    combined_1[32..64].copy_from_slice(&leaf.to_array());
-    let hash_1 = env.crypto().sha256(&Bytes::from_slice(&env, &combined_1)).to_array();
-
-    let mut combined_2 = [0u8; 64];
-    combined_2[0..32].copy_from_slice(&hash_1);
-    combined_2[32..64].copy_from_slice(&sibling2.to_array());
-    let final_root = env.crypto().sha256(&Bytes::from_slice(&env, &combined_2)).to_array();
+    let hash_1 = merkle_hash_pair(&env, &sibling1.to_array(), &leaf.to_array());
+    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
 
     let expected_root = BytesN::from_array(&env, &final_root);
     let block_height = 200;
@@ -763,10 +716,7 @@ fn setup_valid_proof(
     let leaf = BytesN::from_array(env, &[2u8; 32]);
     let sibling = BytesN::from_array(env, &[3u8; 32]);
 
-    let mut combined = [0u8; 64];
-    combined[0..32].copy_from_slice(&sibling.to_array());
-    combined[32..64].copy_from_slice(&leaf.to_array());
-    let root_arr = env.crypto().sha256(&Bytes::from_slice(env, &combined)).to_array();
+    let root_arr = merkle_hash_pair(env, &sibling.to_array(), &leaf.to_array());
     let root = BytesN::from_array(env, &root_arr);
 
     let block_height: u32 = 42;
@@ -896,4 +846,16 @@ fn test_verify_signed_message_panics_when_paused() {
     let proof = soroban_sdk::Vec::new(&env);
     let flags = soroban_sdk::Vec::new(&env);
     client.verify_signed_message(&signed_message, &100u32, &proof, &flags);
+}
+
+fn merkle_hash_pair(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut combined = [0u8; 64];
+    if left <= right {
+        combined[0..32].copy_from_slice(left);
+        combined[32..64].copy_from_slice(right);
+    } else {
+        combined[0..32].copy_from_slice(right);
+        combined[32..64].copy_from_slice(left);
+    }
+    env.crypto().sha256(&Bytes::from_slice(env, &combined)).to_array()
 }

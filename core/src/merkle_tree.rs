@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 pub struct ProofNode {
     /// The sibling hash at this level.
     pub hash: [u8; 32],
-    /// Whether the current leaf path node is the left child.
+    /// Whether the current path node's hash sorts before the sibling hash.
     pub is_left: bool,
 }
 
@@ -42,9 +42,9 @@ impl MerkleProof {
 
         for node in &self.proof {
             current = if node.is_left {
-                MerkleTree::hash_pair(&current, &node.hash)
+                MerkleTree::hash_concat(&current, &node.hash)
             } else {
-                MerkleTree::hash_pair(&node.hash, &current)
+                MerkleTree::hash_concat(&node.hash, &current)
             };
         }
 
@@ -123,8 +123,7 @@ impl MerkleTree {
 
         for level in 0..self.nodes.len() - 1 {
             let level_nodes = &self.nodes[level];
-            let is_left = path_index.is_multiple_of(2);
-            let sibling_index = if is_left {
+            let sibling_index = if path_index.is_multiple_of(2) {
                 path_index + 1
             } else {
                 path_index - 1
@@ -135,6 +134,7 @@ impl MerkleTree {
             } else {
                 level_nodes[path_index]
             };
+            let is_left = level_nodes[path_index] <= sibling_hash;
 
             proof.push(ProofNode {
                 hash: sibling_hash,
@@ -163,9 +163,9 @@ impl MerkleTree {
 
         for node in &proof.proof {
             current = if node.is_left {
-                Self::hash_pair(&current, &node.hash)
+                Self::hash_concat(&current, &node.hash)
             } else {
-                Self::hash_pair(&node.hash, &current)
+                Self::hash_concat(&node.hash, &current)
             };
         }
 
@@ -214,6 +214,14 @@ impl MerkleTree {
             hasher.update(right);
             hasher.update(left);
         }
+        let digest = hasher.finalize();
+        digest.into()
+    }
+
+    fn hash_concat(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(left);
+        hasher.update(right);
         let digest = hasher.finalize();
         digest.into()
     }
