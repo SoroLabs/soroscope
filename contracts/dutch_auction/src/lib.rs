@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec};
 
 #[contracttype]
 pub enum DataKey {
@@ -115,7 +115,7 @@ impl DutchAuction {
         let payment_token: Address = env.storage().instance().get(&DataKey::PaymentToken).unwrap();
 
         // Transfer payment from buyer to contract
-        env.invoke_contract(
+        env.invoke_contract::<()>(
             &payment_token,
             &Symbol::new(&env, "transfer"),
             Vec::from_array(&env, [buyer.to_val(), env.current_contract_address().to_val(), current_price.into_val(&env)]),
@@ -124,7 +124,7 @@ impl DutchAuction {
         // Transfer NFT to buyer
         let nft_contract: Address = env.storage().instance().get(&DataKey::NftContract).unwrap();
         let token_id: i128 = env.storage().instance().get(&DataKey::TokenId).unwrap();
-        env.invoke_contract(
+        env.invoke_contract::<()>(
             &nft_contract,
             &Symbol::new(&env, "transfer"),
             Vec::from_array(&env, [env.current_contract_address().to_val(), buyer.to_val(), token_id.into_val(&env)]),
@@ -132,7 +132,7 @@ impl DutchAuction {
 
         // Transfer payment to seller
         let seller: Address = env.storage().instance().get(&DataKey::Seller).unwrap();
-        env.invoke_contract(
+        env.invoke_contract::<()>(
             &payment_token,
             &Symbol::new(&env, "transfer"),
             Vec::from_array(&env, [env.current_contract_address().to_val(), seller.to_val(), current_price.into_val(&env)]),
@@ -158,7 +158,7 @@ impl DutchAuction {
 
         let nft_contract: Address = env.storage().instance().get(&DataKey::NftContract).unwrap();
         let token_id: i128 = env.storage().instance().get(&DataKey::TokenId).unwrap();
-        env.invoke_contract(
+        env.invoke_contract::<()>(
             &nft_contract,
             &Symbol::new(&env, "transfer"),
             Vec::from_array(&env, [env.current_contract_address().to_val(), seller.to_val(), token_id.into_val(&env)]),

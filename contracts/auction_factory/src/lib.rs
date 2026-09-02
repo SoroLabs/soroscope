@@ -2,10 +2,12 @@
 
 use emergency_guard::{EmergencyGuard, GuardError};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, IntoVal, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, token, xdr::ToXdr, Address, BytesN, Env,
+    IntoVal, Symbol, Vec,
 };
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuctionType {
     English,
     Dutch,
@@ -14,6 +16,58 @@ pub enum AuctionType {
 #[contracttype]
 pub enum DataKey {
     Auction(Address), // Auction address -> type
+    AuctionByIndex(u32),
+    AuctionCount,
+    DeploymentFee,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeploymentFee {
+    pub token: Address,
+    pub recipient: Address,
+    pub amount: i128,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum FactoryError {
+    InvalidFee = 1,
+    FeeNotConfigured = 2,
+    Unauthorized = 3,
+}
+
+const MAX_PAGE_SIZE: u32 = 100;
+
+fn collect_deployment_fee(env: &Env, seller: &Address) -> Result<(), FactoryError> {
+    let fee: DeploymentFee = env
+        .storage()
+        .persistent()
+        .get(&DataKey::DeploymentFee)
+        .ok_or(FactoryError::FeeNotConfigured)?;
+
+    seller.require_auth();
+    token::Client::new(env, &fee.token).transfer(seller, &fee.recipient, &fee.amount);
+    Ok(())
+}
+
+fn register_auction(env: &Env, address: &Address, auction_type: &AuctionType) {
+    let index: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::AuctionCount)
+        .unwrap_or(0);
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Auction(address.clone()), auction_type);
+    env.storage()
+        .persistent()
+        .set(&DataKey::AuctionByIndex(index), address);
+    env.storage()
+        .persistent()
+        .set(&DataKey::AuctionCount, &(index + 1));
 }
 
 #[contract]
@@ -73,6 +127,36 @@ impl AuctionFactory {
         EmergencyGuard::is_admin_public(env, addr)
     }
 
+    /// Set the fixed SEP-41 token fee charged for every auction deployment.
+    pub fn configure_deployment_fee(
+        env: Env,
+        approvers: Vec<Address>,
+        token: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), FactoryError> {
+        if amount <= 0 {
+            return Err(FactoryError::InvalidFee);
+        }
+
+        EmergencyGuard::validate_multi_sig(env.clone(), approvers)
+            .map_err(|_| FactoryError::Unauthorized)?;
+
+        env.storage().persistent().set(
+            &DataKey::DeploymentFee,
+            &DeploymentFee {
+                token,
+                recipient,
+                amount,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn get_deployment_fee(env: Env) -> Option<DeploymentFee> {
+        env.storage().persistent().get(&DataKey::DeploymentFee)
+    }
+
     // ── Auction deployment ───────────────────────────────────────────────────
 
     pub fn create_english_auction(
@@ -85,7 +169,9 @@ impl AuctionFactory {
         reserve_price: i128,
         duration_ledgers: u32,
         english_wasm_hash: BytesN<32>,
-    ) -> Address {
+    ) -> Result<Address, FactoryError> {
+        collect_deployment_fee(&env, &seller)?;
+
         // Generate salt based on seller, nft, token_id, and type
         let salt = env.crypto().sha256(
             &(
@@ -122,13 +208,9 @@ impl AuctionFactory {
             init_args,
         );
 
-        // Store the auction type
-        env.storage().persistent().set(
-            &DataKey::Auction(deployed_address.clone()),
-            &AuctionType::English,
-        );
+        register_auction(&env, &deployed_address, &AuctionType::English);
 
-        deployed_address
+        Ok(deployed_address)
     }
 
     pub fn create_dutch_auction(
@@ -141,7 +223,9 @@ impl AuctionFactory {
         end_price: i128,
         duration_ledgers: u32,
         dutch_wasm_hash: BytesN<32>,
-    ) -> Address {
+    ) -> Result<Address, FactoryError> {
+        collect_deployment_fee(&env, &seller)?;
+
         let salt = env.crypto().sha256(
             &(
                 seller.clone(),
@@ -177,18 +261,43 @@ impl AuctionFactory {
             init_args,
         );
 
-        env.storage().persistent().set(
-            &DataKey::Auction(deployed_address.clone()),
-            &AuctionType::Dutch,
-        );
+        register_auction(&env, &deployed_address, &AuctionType::Dutch);
 
-        deployed_address
+        Ok(deployed_address)
     }
 
     pub fn get_auction_type(env: Env, auction_address: Address) -> Option<AuctionType> {
         env.storage()
             .persistent()
             .get(&DataKey::Auction(auction_address))
+    }
+
+    pub fn get_auction_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AuctionCount)
+            .unwrap_or(0)
+    }
+
+    pub fn get_auction_by_index(env: Env, index: u32) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AuctionByIndex(index))
+    }
+
+    /// Return a bounded page of deployed auction addresses for indexers.
+    pub fn get_auctions(env: Env, start: u32, limit: u32) -> Vec<Address> {
+        let count = Self::get_auction_count(env.clone());
+        let end = start.saturating_add(limit.min(MAX_PAGE_SIZE)).min(count);
+        let mut auctions = Vec::new(&env);
+
+        for index in start..end {
+            if let Some(address) = Self::get_auction_by_index(env.clone(), index) {
+                auctions.push_back(address);
+            }
+        }
+
+        auctions
     }
 }
 
