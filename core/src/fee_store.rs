@@ -6,7 +6,6 @@ use sqlx::{
 };
 use std::str::FromStr;
 use thiserror::Error;
-use tracing;
 use utoipa::ToSchema;
 use uuid::Uuid;
 

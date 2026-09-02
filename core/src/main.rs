@@ -2311,17 +2311,16 @@ async fn main() {
             "Starting historical ledger re-indexing"
         );
 
-        let fee_store = Arc::new(
-            FeeStore::connect(&config.database_url)
-                .await
-                .expect("Failed to connect to database"),
-        );
+        let db_pool = sqlx::SqlitePool::connect(&config.database_url)
+            .await
+            .expect("Failed to connect to database");
 
         sqlx::migrate!()
-            .run(fee_store.pool())
+            .run(&db_pool)
             .await
             .expect("Failed to run database migrations");
 
+        let fee_store = Arc::new(FeeStore::new(db_pool));
         let providers = build_providers(&config);
         let registry = Arc::new(ProviderRegistry::new(providers));
 
@@ -2433,15 +2432,13 @@ async fn main() {
     let database_url = &config.database_url;
     tracing::info!(database_url = %database_url, "Initializing database");
 
-    let fee_store = Arc::new(
-        FeeStore::connect(database_url)
-            .await
-            .expect("Failed to connect to database"),
-    );
+    let db_pool = sqlx::SqlitePool::connect(database_url)
+        .await
+        .expect("Failed to connect to database");
 
     // Run migrations
     sqlx::migrate!()
-        .run(fee_store.pool())
+        .run(&db_pool)
         .await
         .expect("Failed to run database migrations");
 
@@ -2449,6 +2446,7 @@ async fn main() {
 
     let metrics = Arc::new(AppMetrics::new().expect("Failed to initialize Prometheus metrics"));
 
+    let fee_store = Arc::new(FeeStore::new(db_pool.clone()));
     let fee_analytics_engine = FeeAnalyticsEngine::new();
     let job_queue_config = JobQueueConfig {
         job_timeout_secs: config.job_timeout_secs,

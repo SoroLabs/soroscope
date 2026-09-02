@@ -3,7 +3,6 @@ name = "soroscope-core"
 version = "0.1.0"
 edition = "2021"
 
-
 [lib]
 name = "soroscope_core"
 path = "src/lib.rs"
@@ -38,7 +37,7 @@ prometheus = "0.14"
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "request-id", "set-header", "compression-full"] }
 utoipa = { version = "4", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "7", features = ["axum", "vendored"] }
+utoipa-swagger-ui = { version = "7", features = ["axum"] }
 base64 = "0.22"
 hex = "0.4"
 stellar-strkey = "0.0.9"

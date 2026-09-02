@@ -13,11 +13,9 @@
 //! hot ledger entries avoid hitting disk.
 #![allow(unused_imports)]
 
-#![allow(unused_imports)]
-
 pub mod disk;
 
-use crate::simulation::{SimulationResult, SorobanResources};
+use crate::simulation::SimulationResult;
 use moka::future::Cache;
 use moka::sync::Cache as SyncCache;
 use serde::{Deserialize, Serialize};
@@ -126,7 +124,10 @@ impl SimulationCache {
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
         let total = hits + misses;
-        let hit_rate_pct = if total > 0 { hits * 100 / total } else { 0 };
+        let hit_rate_pct = hits
+            .checked_mul(100)
+            .and_then(|v| v.checked_div(total))
+            .unwrap_or(0);
         tracing::info!(
             cache.hits = hits,
             cache.misses = misses,
