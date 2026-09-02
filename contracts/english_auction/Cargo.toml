@@ -1,8 +1,13 @@
 [package]
-name = "soroban-english-auction-contract"
+name = "english_auction"
 version = "0.1.0"
 edition = "2021"
 publish = false
+
+[workspace]
+
+[workspace.dependencies]
+soroban-sdk = "22.0.0"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -12,7 +17,6 @@ soroban-sdk.workspace = true
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-token-contract = { package = "soroban-token-contract", path = "../token" }
 
 [features]
 testutils = []

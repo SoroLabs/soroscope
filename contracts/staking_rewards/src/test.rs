@@ -594,3 +594,29 @@ fn test_granular_pause_staking() {
     client.stake(&user, &STAKE_AMOUNT);
     assert_eq!(client.get_staked_balance(&user), STAKE_AMOUNT * 2);
 }
+
+#[test]
+fn test_emergency_withdraw_with_penalty_fee() {
+    let (e, client, owner, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    client.stake(&user, &STAKE_AMOUNT);
+    assert_eq!(client.get_staked_balance(&user), STAKE_AMOUNT);
+
+    // Set 10% penalty fee (1000 bps)
+    assert_eq!(client.get_penalty_fee(), 0);
+    client.set_penalty_fee(&1000);
+    assert_eq!(client.get_penalty_fee(), 1000);
+
+    // Emergency withdraw with 10% penalty
+    let payout = client.emergency_withdraw(&user);
+    // STAKE_AMOUNT is 10,000; 10% penalty is 1,000; payout should be 9,000
+    assert_eq!(payout, 9_000);
+    assert_eq!(client.get_staked_balance(&user), 0);
+
+    let token_balance = token::Client::new(&e, &staking_token).balance(&user);
+    assert_eq!(token_balance, 9_000);
+}

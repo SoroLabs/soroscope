@@ -16,6 +16,7 @@ pub enum DataKey {
     UserState(Address),
     TotalStaked,
     EpochSnapshot(u32),
+    PenaltyFeeBps,
 }
 
 // ── Configuration Struct ──────────────────────────────────────
@@ -293,7 +294,6 @@ impl StakingRewards {
         }
 
         if epoch_length == 0 {
-        if !(0..=SCALE).contains(&decay_rate) {
             return Err(ContractError::InvalidInput);
         }
 
@@ -365,17 +365,6 @@ impl StakingRewards {
             .checked_add(amount)
             .ok_or(ContractError::Overflow)?;
         e.storage().instance().set(&DataKey::TotalStaked, &total_staked);
-        let mut total_staked: i128 = e
-            .storage()
-            .instance()
-            .get(&DataKey::TotalStaked)
-            .unwrap_or(0);
-        total_staked = total_staked
-            .checked_add(amount)
-            .ok_or(ContractError::Overflow)?;
-        e.storage()
-            .instance()
-            .set(&DataKey::TotalStaked, &total_staked);
 
         e.storage()
             .persistent()
@@ -423,17 +412,6 @@ impl StakingRewards {
             .checked_sub(amount)
             .ok_or(ContractError::Overflow)?;
         e.storage().instance().set(&DataKey::TotalStaked, &total_staked);
-        let mut total_staked: i128 = e
-            .storage()
-            .instance()
-            .get(&DataKey::TotalStaked)
-            .unwrap_or(0);
-        total_staked = total_staked
-            .checked_sub(amount)
-            .ok_or(ContractError::Overflow)?;
-        e.storage()
-            .instance()
-            .set(&DataKey::TotalStaked, &total_staked);
 
         if state.staked_amount == 0 && state.accrued_rewards == 0 {
             e.storage()
@@ -535,11 +513,6 @@ impl StakingRewards {
 
         // Update total staked
         let mut total_staked: i128 = e.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
-        let mut total_staked: i128 = e
-            .storage()
-            .instance()
-            .get(&DataKey::TotalStaked)
-            .unwrap_or(0);
         total_staked = total_staked
             .checked_sub(staked_amount)
             .ok_or(ContractError::Overflow)?;
@@ -551,26 +524,51 @@ impl StakingRewards {
             return Ok(0);
         }
 
+        // Calculate emergency unbonding penalty fee if configured
+        let penalty_fee_bps: u32 = e.storage().instance().get(&DataKey::PenaltyFeeBps).unwrap_or(0);
+        let penalty = (staked_amount as u128 * penalty_fee_bps as u128 / 10000) as i128;
+        let payout = staked_amount - penalty;
+
         // Wipe user state entirely (forfeiting rewards)
         e.storage().persistent().remove(&state_key);
         e.storage().instance().extend_ttl(10000, 10000);
 
-        // Transfer staking tokens back to user
-        token::Client::new(&e, &config.staking_token).transfer(
-            &e.current_contract_address(),
-            &user,
-            &staked_amount,
-        );
+        // Transfer payout of staking tokens back to user
+        if payout > 0 {
+            token::Client::new(&e, &config.staking_token).transfer(
+                &e.current_contract_address(),
+                &user,
+                &payout,
+            );
+        }
 
         e.events().publish(
             (String::from_str(&e, "emergency_withdraw"), user.clone()),
             EmergencyWithdrawEvent {
                 user,
-                amount: staked_amount,
+                amount: payout,
             },
         );
 
-        Ok(staked_amount)
+        Ok(payout)
+    }
+
+    /// Sets emergency unbonding penalty fee in basis points (owner only, max 10000 = 100%).
+    pub fn set_penalty_fee(e: Env, fee_bps: u32) -> Result<(), ContractError> {
+        let config = Self::get_config(e.clone())?;
+        config.owner.require_auth();
+
+        if fee_bps > 10000 {
+            return Err(ContractError::InvalidInput);
+        }
+
+        e.storage().instance().set(&DataKey::PenaltyFeeBps, &fee_bps);
+        Ok(())
+    }
+
+    /// Gets emergency unbonding penalty fee in basis points.
+    pub fn get_penalty_fee(e: Env) -> u32 {
+        e.storage().instance().get(&DataKey::PenaltyFeeBps).unwrap_or(0)
     }
 
     /// Pause staking operations (admin only).

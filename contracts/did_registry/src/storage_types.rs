@@ -56,6 +56,14 @@ pub struct DIDMetadata {
     pub revocation_bitmap: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DIDUpdated {
+    pub did: String,
+    pub action: String,
+    pub timestamp: u64,
+}
+
 // Storage keys
 pub const DID_DOCUMENT: Symbol = Symbol::short("DID_DOC");
 pub const DID_METADATA: Symbol = Symbol::short("DID_META");

@@ -289,3 +289,83 @@ fn test_did_without_expiration_remains_valid() {
     let retrieved = client.get_did_document(&did);
     assert_eq!(retrieved.id, did);
 }
+
+#[test]
+fn test_rotate_and_remove_verification_method() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let did = String::from_str(&env, "did:soroban:test1234");
+    let document = DIDDocument {
+        context: Vec::from_array(&env, [String::from_str(&env, "https://www.w3.org/ns/did/v1")]),
+        id: did.clone(),
+        verification_method: Vec::new(&env),
+        authentication: Vec::new(&env),
+        assertion_method: Vec::new(&env),
+        key_agreement: Vec::new(&env),
+        capability_invocation: Vec::new(&env),
+        capability_delegation: Vec::new(&env),
+        service: Vec::new(&env),
+    };
+
+    client.register_did(&did, &document, &None);
+
+    let method_id = String::from_str(&env, "key-1");
+    let method = VerificationMethod {
+        id: method_id.clone(),
+        type_: String::from_str(&env, "Ed25519VerificationKey2020"),
+        controller: owner.clone(),
+        public_key_multibase: Bytes::from_array(&env, &[1, 2, 3]),
+    };
+
+    client.add_verification_method(&did, &method);
+
+    // Rotate key
+    let new_key = Bytes::from_array(&env, &[9, 8, 7]);
+    client.rotate_verification_method(&did, &method_id, &new_key);
+
+    let doc_after_rotation = client.get_did_document(&did);
+    assert_eq!(
+        doc_after_rotation.verification_method.get(0).unwrap().public_key_multibase,
+        new_key
+    );
+
+    // Remove key
+    client.remove_verification_method(&did, &method_id);
+    let doc_after_removal = client.get_did_document(&did);
+    assert_eq!(doc_after_removal.verification_method.len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "invalid DID URI format")]
+fn test_invalid_did_uri() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let invalid_did = String::from_str(&env, "http://invalid-uri");
+    let document = DIDDocument {
+        context: Vec::new(&env),
+        id: invalid_did.clone(),
+        verification_method: Vec::new(&env),
+        authentication: Vec::new(&env),
+        assertion_method: Vec::new(&env),
+        key_agreement: Vec::new(&env),
+        capability_invocation: Vec::new(&env),
+        capability_delegation: Vec::new(&env),
+        service: Vec::new(&env),
+    };
+
+    client.register_did(&invalid_did, &document, &None);
+}
