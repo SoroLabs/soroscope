@@ -1,5 +1,5 @@
-use crate::storage_types::{DataKey, Proposal, ProposalAction, ProposalState};
-use soroban_sdk::{Address, Env, String, Vec};
+use crate::storage_types::DataKey, Proposal, ProposalAction, ProposalState;
+use soroban_sdk::Address, Env, String, Vec;
 
 pub fn read_proposal(e: &Env, id: u32) -> Proposal {
     let key = DataKey::Proposal(id);
@@ -22,6 +22,9 @@ pub fn create_proposal(
     config.proposal_count += 1;
     let proposal_id = config.proposal_count;
     crate::admin::write_config(e, &config);
+
+    // Snapshot voting power at creation
+    crate::voting::snapshot_voting_power(e, proposal_id);
 
     let proposal = Proposal {
         id: proposal_id,
@@ -53,7 +56,7 @@ pub fn start_voting(e: &Env, proposal_id: u32) {
     proposal.state = ProposalState::Voting;
     proposal.start_time = current_time;
     proposal.end_time = current_time + config.voting_period;
-    proposal.quorum_required = crate::voting::calculate_quorum(e, &config);
+    proposal.quorum_required = crate::voting::calculate_quorum(e, proposal_id, &config);
 
     write_proposal(e, &proposal);
 }
@@ -61,12 +64,13 @@ pub fn start_voting(e: &Env, proposal_id: u32) {
 pub fn vote(e: &Env, proposal_id: u32, voter: Address, support: bool) {
     let mut proposal = read_proposal(e, proposal_id);
     assert!(matches!(proposal.state, ProposalState::Voting));
-    assert!(!crate::voting::has_voted(e, proposal_id, voter.clone()));
+    assert!(crate::voting::has_voted(e, proposal_id, voter.clone()));
 
     let current_time = e.ledger().timestamp();
     assert!(current_time >= proposal.start_time && current_time <= proposal.end_time);
 
-    let voting_power = crate::voting::get_effective_voting_power(e, voter.clone());
+    let voting_power = crate::voting::get_snapshot_voting_power(e, proposal_id, voter.clone());
+    assert!(voting_power > 0, "No voting power");
 
     if support {
         proposal.for_votes += voting_power;
@@ -85,7 +89,6 @@ pub fn queue_proposal(e: &Env, proposal_id: u32) {
     let current_time = e.ledger().timestamp();
     assert!(current_time > proposal.end_time);
 
-    // Check if proposal passed
     assert!(proposal.for_votes > proposal.against_votes);
     assert!(proposal.for_votes >= proposal.quorum_required);
 
@@ -103,10 +106,7 @@ pub fn execute_proposal(e: &Env, proposal_id: u32) {
     let current_time = e.ledger().timestamp();
     assert!(current_time >= proposal.queued_time + config.timelock_delay);
 
-    // Execute actions (simplified - in real implementation, would call contracts)
     for action in proposal.actions.iter() {
-        // Here we would execute the contract call
-        // For now, just log it
         e.events().publish(("proposal_executed", proposal_id), action.clone());
     }
 
@@ -127,15 +127,11 @@ pub fn cancel_proposal(e: &Env, proposal_id: u32) {
 pub fn veto_proposal(e: &Env, security_council: Address, proposal_id: u32) {
     let mut proposal = read_proposal(e, proposal_id);
 
-    // Can only veto proposals that are Queued (in timelock period)
     assert!(matches!(proposal.state, ProposalState::Queued));
 
-    // Verify caller is Security Council
-    let stored_council: Address = e.storage().instance().get(&DataKey::SecurityCouncil)
-        .expect("Security Council not set");
+    let stored_council: Address = e.storage().instance().get(&DataKey::SecurityCouncil).expect("Security Council not set");
     assert!(stored_council == security_council, "Caller is not Security Council");
 
-    // Check if proposal is still in timelock period (not yet executable)
     let config = crate::admin::read_config(e);
     let current_time = e.ledger().timestamp();
     assert!(current_time < proposal.queued_time + config.timelock_delay, "Timelock period has passed");
