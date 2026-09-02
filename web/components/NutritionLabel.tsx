@@ -1,5 +1,6 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { Activity, Cpu, Database, HardDrive } from 'lucide-react';
+import { NutritionLabelSkeleton } from './NutritionLabelSkeleton';
 
 interface ResourceMetric {
     label: string;
@@ -25,6 +26,12 @@ export const NutritionLabel: React.FC<NutritionLabelProps> = ({
     ledger_write_bytes,
     transaction_size_bytes,
 }) => {
+    const [isMounted, setIsMounted] = useState(false);
+
+    useEffect(() => {
+        setIsMounted(true);
+    }, []);
+
     // Soroban Limits (Approximate / Configurable)
     const LIMITS = {
         CPU: 100_000_000, // 100M instructions
@@ -80,6 +87,10 @@ export const NutritionLabel: React.FC<NutritionLabelProps> = ({
     const formatNumber = (num: number) => {
         return new Intl.NumberFormat('en-US', { notation: "compact", compactDisplay: "short" }).format(num);
     };
+
+    if (!isMounted) {
+        return <NutritionLabelSkeleton />;
+    }
 
     return (
         <div className="bg-[var(--bg-card)] border border-[var(--border-default)] rounded-lg p-4 sm:p-6 font-mono">
