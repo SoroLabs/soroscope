@@ -13,7 +13,6 @@ import {
   Search,
   Settings,
 } from "lucide-react";
-import { Menu, X, Layers, History, Activity, List, Sun, Moon, TrendingUp } from "lucide-react";
 import { useTheme } from "next-themes";
 import { ConnectButton } from "./ConnectButton";
 import { NetworkSwitcher } from "./NetworkSwitcher";
@@ -26,8 +25,6 @@ const NAV_TABS: { id: NavTab; label: string; Icon: typeof Layers }[] = [
   { id: "history", label: "History", Icon: History },
   { id: "transactions", label: "Transactions", Icon: List },
 ];
-export type NavTab = "explorer" | "history" | "transactions" | "analytics";
-
 interface HeaderNavProps {
   tab: NavTab;
   setTab: (tab: NavTab) => void;
@@ -166,22 +163,6 @@ export function HeaderNav({ tab, setTab }: HeaderNavProps) {
               {label}
             </button>
           ))}
-            onClick={() => setTab("explorer")}
-              tab === "explorer"
-            <Layers className="h-4 w-4" />
-            Result
-            onClick={() => setTab("history")}
-              tab === "history"
-            <History className="h-4 w-4" />
-            History
-            onClick={() => setTab("transactions")}
-              tab === "transactions"
-            <List className="h-4 w-4" />
-            Transactions
-            onClick={() => setTab("analytics")}
-              tab === "analytics"
-            <TrendingUp className="h-4 w-4" />
-            LP Analytics
         </div>
       </div>
 

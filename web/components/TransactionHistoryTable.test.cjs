@@ -148,7 +148,7 @@ function formatCSV(transactions) {
     escape(new Date(tx.timestamp).toISOString()),
     escape(tx.fee ? `${tx.fee}` : '0'),
   ]);
-  return [headers.join(','), ...rows.map((row) => row.join(','))].join('\n');
+  return [headers.map(h => `"${h}"`).join(','), ...rows.map((row) => row.join(','))].join('\n');
 }
 
 function formatJSON(transactions) {

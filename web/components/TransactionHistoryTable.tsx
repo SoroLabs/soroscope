@@ -2,8 +2,7 @@
 
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import clsx from 'clsx';
-import { ExternalLink, Loader2, Download } from 'lucide-react';
-import { ExternalLink, Loader2, Search } from 'lucide-react';
+import { ExternalLink, Loader2, Download, Search } from 'lucide-react';
 import type { TransactionRecord, TransactionStatus } from '../lib/sorobantypes';
 import { paginate } from '../lib/paginationUtils';
 import { DEFAULT_TRANSACTION_FILTER, filterTransactions, type TransactionFilter } from '../lib/transactionFilters';
