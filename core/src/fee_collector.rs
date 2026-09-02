@@ -106,37 +106,35 @@ impl FeeCollector {
                     tracing::info!("Fee collector shutting down");
                     break;
                 }
-                _ = interval.tick() => {}
-            }
+                _ = interval.tick() => {
+                    if !self.leader_lock.try_acquire_or_renew().await {
+                        tracing::debug!("not leader this cycle, skipping fee collection");
+                        continue;
+                    }
 
-            // Only the instance holding the leader lease performs collection,
-            // so extra replicas don't duplicate writes to the fee store.
-            if !self.leader_lock.try_acquire_or_renew().await {
-                tracing::debug!("not leader this cycle, skipping fee collection");
-                continue;
-            }
-
-            let started_at = Instant::now();
-            let result = self.collect_latest_fees().await;
-            self.metrics
-                .indexing_latency_seconds
-                .with_label_values(&["fee_collector"])
-                .observe(started_at.elapsed().as_secs_f64());
-
-            match result {
-                Ok(true) => {
+                    let started_at = Instant::now();
+                    let result = self.collect_latest_fees().await;
                     self.metrics
-                        .events_processed_total
+                        .indexing_latency_seconds
                         .with_label_values(&["fee_collector"])
-                        .inc();
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to collect fee data");
-                    self.metrics
-                        .indexing_errors_total
-                        .with_label_values(&["fee_collector"])
-                        .inc();
+                        .observe(started_at.elapsed().as_secs_f64());
+
+                    match result {
+                        Ok(true) => {
+                            self.metrics
+                                .events_processed_total
+                                .with_label_values(&["fee_collector"])
+                                .inc();
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to collect fee data");
+                            self.metrics
+                                .indexing_errors_total
+                                .with_label_values(&["fee_collector"])
+                                .inc();
+                        }
+                    }
                 }
             }
         }
@@ -520,6 +518,13 @@ mod tests {
             .await
             .expect("in-memory sqlite");
         let store = Arc::new(FeeStore::new(pool));
+        let metrics = Arc::new(AppMetrics::new().expect("metrics"));
+        let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+        let leader_lock = Arc::new(RedisLeaderLock::new(
+            redis_client,
+            "test_fee_collector",
+            Duration::from_secs(10),
+        ));
         let collector = Arc::new(FeeCollector::new(
             registry,
             store,
@@ -528,6 +533,8 @@ mod tests {
                 batch_size: 1,
                 request_timeout: Duration::from_millis(50),
             },
+            metrics,
+            leader_lock,
         ));
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);

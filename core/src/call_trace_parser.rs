@@ -191,8 +191,6 @@ mod tests {
         };
 
         let sym = |s: &str| -> ScVal {
-            // ScSymbol wraps StringM<32>, so the length bound must be
-            // named explicitly rather than defaulting to StringM<u32::MAX>.
             let string_m: StringM<32> = s.as_bytes().to_vec().try_into().unwrap();
             ScVal::Symbol(ScSymbol(string_m))
         };

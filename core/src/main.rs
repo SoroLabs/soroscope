@@ -5,6 +5,7 @@ mod cache;
 mod call_trace_parser;
 mod comparison;
 mod contract_registry;
+mod cors;
 mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
@@ -31,6 +32,8 @@ mod webhook_validation;
 mod webhooks;
 mod worker_pool;
 mod ws;
+mod xdr_decoder;
+
 use crate::cache::{ContractCache, SimulationCache};
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
 use crate::errors::AppError;
@@ -61,7 +64,6 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-// CLI Argument Handling
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -510,7 +512,7 @@ impl AppMetrics {
                 "events_processed_total",
                 "Total number of ledger events successfully processed",
             ),
-            &["source"],
+            &["stage"],
         )?;
         let indexing_errors_total = IntCounterVec::new(
             Opts::new(
@@ -934,7 +936,6 @@ fn to_report(
         protocol_version: result.protocol_version,
         testnet_averages: TestnetAverages {
             cpu_instructions: 3_000_000,
-            ram_bytes: 512_000,
             ledger_read_bytes: 2_048,
             ledger_write_bytes: 1_024,
             transaction_size_bytes: 600,
@@ -1835,27 +1836,11 @@ fn group_batch_entries(
     }
 }
 
-/// `/api/v1/webhooks/incoming` - accepts signed inbound webhook payloads.
-///
-/// The raw body is authenticated by the `ValidatedWebhook` extractor, which
-/// verifies the HMAC signature header before the handler ever runs.
-#[utoipa::path(
-    post,
-    path = "/api/v1/webhooks/incoming",
-    tag = "Operations",
-    request_body(
-        content = String,
-        description = "Raw webhook payload, authenticated via its HMAC signature header"
-    ),
-    responses(
-        (status = 200, description = "Payload accepted"),
-        (status = 401, description = "Missing or invalid signature")
-    )
-)]
-async fn incoming_webhook(
-    ValidatedWebhook(body): ValidatedWebhook,
-) -> impl IntoResponse {
-    tracing::info!("Received authenticated inbound webhook of length {}", body.len());
+async fn incoming_webhook(ValidatedWebhook(body): ValidatedWebhook) -> impl IntoResponse {
+    tracing::info!(
+        "Received authenticated inbound webhook of length {}",
+        body.len()
+    );
     StatusCode::OK
 }
 
@@ -1914,9 +1899,7 @@ struct ReadinessResponse {
 async fn healthz() -> impl IntoResponse {
     (
         StatusCode::OK,
-        axum::Json(HealthStatusResponse {
-            status: "ok".to_string(),
-        }),
+        axum::Json(serde_json::json!({"status": "ok"})),
     )
 }
 /// `/readyz` — Kubernetes readiness probe.
@@ -1989,9 +1972,9 @@ async fn main() {
     // filtering without recompiling the binary.
     let config = load_config().expect("Failed to load configuration");
     // ── Tracing init (#572: JSON format + x-request-id correlation) ────
-    let log_json = env::var("LOG_FORMAT").map(|v| v.to_lowercase() == "json").unwrap_or(false);
-    // `rust_log` comes from the loaded config (RUST_LOG env var, default
-    // "info"), so the log level is tunable without a rebuild.
+    let log_json = env::var("LOG_FORMAT")
+        .map(|v| v.to_lowercase() == "json")
+        .unwrap_or(false);
     let filter = build_env_filter(&config.rust_log);
     if log_json {
         tracing_subscriber::registry()
@@ -2334,25 +2317,21 @@ async fn main() {
             request_timeout: std::time::Duration::from_secs(30),
         };
 
-        // The reindex path drives `fetch_and_store_ledger` directly rather
-        // than running the collection loop, but the constructor still needs a
-        // metrics handle and a leader lease, so build throwaway ones here.
-        let reindex_metrics =
-            Arc::new(AppMetrics::new().expect("Failed to initialize metrics registry"));
-        let reindex_redis_client = redis::Client::open(config.redis_url.as_str())
+        let metrics = Arc::new(AppMetrics::new().expect("Failed to initialize Prometheus metrics"));
+        let redis_client = redis::Client::open(config.redis_url.clone())
             .expect("Failed to create Redis client for leader lock");
-        let reindex_leader_lock = Arc::new(leader_lock::RedisLeaderLock::new(
-            reindex_redis_client,
-            "soroscope:leader:reindex",
-            std::time::Duration::from_secs(30),
+        let leader_lock = Arc::new(crate::leader_lock::RedisLeaderLock::new(
+            redis_client,
+            "reindex_fee_collector",
+            std::time::Duration::from_secs(10),
         ));
 
         let collector = Arc::new(FeeCollector::new(
             Arc::clone(&registry),
             Arc::clone(&fee_store),
             collector_config,
-            reindex_metrics,
-            reindex_leader_lock,
+            metrics,
+            leader_lock,
         ));
         let total = end - start + 1;
         let mut processed: u64 = 0;
@@ -2380,7 +2359,9 @@ async fn main() {
                 }
             }
         }
+
         println!("Re-indexing complete. Processed: {processed}/{total}, Errors: {errors}");
+
         return;
     }
     tracing::info!("Starting SoroScope API Server...");
@@ -2437,6 +2418,7 @@ async fn main() {
         "Dedicated event worker pool initialized with {} threads",
         config.event_worker_threads
     );
+
     // ── Fee Market Setup ────────────────────────────────────────────────
     let database_url = &config.database_url;
     tracing::info!(database_url = %database_url, "Initializing database");
@@ -2589,7 +2571,9 @@ async fn main() {
     let sled_db = sled::open("soroscope_cache").expect("Failed to open sled database");
     let simulation_cache = SimulationCache::new(&sled_db);
     let contract_cache = Arc::new(ContractCache::new(&sled_db));
+
     let app_metrics = Arc::new(AppMetrics::new().expect("Failed to initialize Prometheus metrics"));
+
     let app_state = Arc::new(AppState {
         engine: SimulationEngine::with_registry_and_cache(
             Arc::clone(&registry),
@@ -2637,9 +2621,6 @@ async fn main() {
     let graphql_schema =
         graphql::build_schema(app_state.job_queue.clone(), app_state.engine.clone());
 
-    // CORS policy is driven by ALLOWED_ORIGINS. An empty value keeps the
-    // permissive allow-all default used for local development; a
-    // comma-separated list restricts access to exactly those origins.
     let cors = {
         let raw = config.allowed_origins.trim().to_string();
         if raw.is_empty() {
@@ -2774,11 +2755,11 @@ async fn shutdown_signal(shutdown_tx: tokio::sync::broadcast::Sender<()>) {
 
     tokio::select! {
         _ = ctrl_c => {
-            tracing::info!("Received SIGINT (Ctrl-C), shutting down");
-        }
+            tracing::info!("Received SIGINT (Ctrl-C), shutting down…");
+        },
         _ = terminate => {
-            tracing::info!("Received SIGTERM, shutting down");
-        }
+            tracing::info!("Received SIGTERM, shutting down…");
+        },
     }
 
     tracing::info!("Shutdown signal received; notifying background workers");

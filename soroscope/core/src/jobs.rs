@@ -7,6 +7,7 @@
 
 use crate::insights::InsightsEngine;
 use crate::simulation::{SimulationEngine, SimulationResult, SorobanResources};
+use crate::task_queue::{BoundedTaskDispatcher, TaskPriority};
 use crate::ws::SimulationBus;
 use crate::AppError;
 use axum::{
@@ -101,7 +102,7 @@ pub enum JobStatus {
 }
 
 /// Type of analysis job
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, sqlx::Type)]
 #[sqlx(rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum JobType {
@@ -134,6 +135,36 @@ pub enum JobPayload {
         args: Vec<String>,
         safety_margin: f64,
     },
+}
+
+impl JobPayload {
+    /// The contract this job targets, if any (`Compare` in `local_vs_local`
+    /// mode has no contract).
+    pub fn contract_id(&self) -> Option<&str> {
+        match self {
+            JobPayload::Analyze { contract_id, .. } => Some(contract_id),
+            JobPayload::OptimizeLimits { contract_id, .. } => Some(contract_id),
+            JobPayload::Compare { contract_id, .. } => contract_id.as_deref(),
+        }
+    }
+
+    /// The contract function this job invokes, if any.
+    pub fn function_name(&self) -> Option<&str> {
+        match self {
+            JobPayload::Analyze { function_name, .. } => Some(function_name),
+            JobPayload::OptimizeLimits { function_name, .. } => Some(function_name),
+            JobPayload::Compare { function_name, .. } => function_name.as_deref(),
+        }
+    }
+}
+
+/// Filters accepted by [`JobQueue::list`] when browsing contract execution
+/// history.
+#[derive(Debug, Clone, Default)]
+pub struct JobListFilter {
+    pub status: Option<JobStatus>,
+    pub job_type: Option<JobType>,
+    pub contract_id: Option<String>,
 }
 
 /// Progress information for a job
@@ -253,6 +284,12 @@ pub struct JobQueueConfig {
     pub webhook_max_retries: u32,
     pub max_concurrent_jobs: usize,
     pub max_job_retries: i32,
+    /// Maximum number of retry-scheduling tasks that may be in flight at
+    /// once. Retry scheduling is best-effort background work: once this
+    /// cap is hit, further retries are dropped (and the job stays queued
+    /// for the next cleanup/requeue pass) rather than piling up spawned
+    /// tasks without bound under a sustained failure storm.
+    pub retry_queue_capacity: usize,
 }
 
 impl Default for JobQueueConfig {
@@ -265,6 +302,7 @@ impl Default for JobQueueConfig {
             webhook_max_retries: 3,
             max_concurrent_jobs: 10,
             max_job_retries: 3,
+            retry_queue_capacity: 256,
         }
     }
 }
@@ -274,6 +312,7 @@ pub struct JobQueue {
     pool: DbPool,
     redis: RedisClient,
     config: JobQueueConfig,
+    retry_dispatcher: BoundedTaskDispatcher,
 }
 
 impl JobQueue {
@@ -297,10 +336,13 @@ impl JobQueue {
         // Run migrations
         Self::run_migrations(&pool).await?;
 
+        let retry_dispatcher = BoundedTaskDispatcher::new(config.retry_queue_capacity);
+
         Ok(Self {
             pool,
             redis,
             config,
+            retry_dispatcher,
         })
     }
 
@@ -367,7 +409,7 @@ impl JobQueue {
                     "#
                 )
                 .bind(&id.0.to_string())
-                .bind(format!("{:?}", job_type))
+                .bind(&job_type)
                 .bind("QUEUED")
                 .bind(&payload_json)
                 .bind(&webhook_url)
@@ -394,6 +436,25 @@ impl JobQueue {
 
         tracing::info!(job_id = %id, "Job submitted to Redis queue");
         Ok(id)
+    }
+
+    /// Number of jobs currently waiting in the Redis queue. Used for the
+    /// `job_queue_depth` metric.
+    pub async fn queue_depth(&self) -> Result<i64, JobError> {
+        let mut conn = self
+            .redis
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| {
+                JobError::ProcessingFailed(format!("Failed to get Redis connection: {}", e))
+            })?;
+
+        let depth: i64 = conn
+            .llen("soroscope:jobs:queue")
+            .await
+            .map_err(|e| JobError::ProcessingFailed(format!("Redis LLEN failed: {}", e)))?;
+
+        Ok(depth)
     }
 
     /// Get a job by ID
@@ -440,6 +501,113 @@ impl JobQueue {
             };
 
         Ok(job)
+    }
+
+    /// List jobs (contract execution history), most-recently-created first,
+    /// with optional filtering and offset/limit pagination. Used by the
+    /// GraphQL `contractExecutions` query.
+    ///
+    /// `status` and `job_type` are applied as indexed SQL predicates.
+    /// `contract_id` lives inside the JSON `payload` column rather than an
+    /// indexed one, so it is applied in-memory after the page is fetched —
+    /// a page may return fewer than `limit` rows when combined with a
+    /// `contract_id` filter.
+    pub async fn list(
+        &self,
+        filter: &JobListFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Job>, JobError> {
+        let limit = limit.clamp(1, 200);
+        let offset = offset.max(0);
+
+        let mut jobs = match &self.pool {
+            DbPool::Postgres(pool) => match (&filter.status, &filter.job_type) {
+                (Some(status), Some(job_type)) => sqlx::query_as::<_, Job>(
+                    "SELECT * FROM jobs WHERE status = $1 AND job_type = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4",
+                )
+                .bind(status)
+                .bind(job_type)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?,
+                (Some(status), None) => sqlx::query_as::<_, Job>(
+                    "SELECT * FROM jobs WHERE status = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+                )
+                .bind(status)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?,
+                (None, Some(job_type)) => sqlx::query_as::<_, Job>(
+                    "SELECT * FROM jobs WHERE job_type = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+                )
+                .bind(job_type)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?,
+                (None, None) => sqlx::query_as::<_, Job>(
+                    "SELECT * FROM jobs ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?,
+            },
+            DbPool::Sqlite(pool) => {
+                let rows = match (&filter.status, &filter.job_type) {
+                    (Some(status), Some(job_type)) => sqlx::query(
+                        "SELECT * FROM jobs WHERE status = ?1 AND job_type = ?2 ORDER BY created_at DESC LIMIT ?3 OFFSET ?4",
+                    )
+                    .bind(status)
+                    .bind(job_type)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?,
+                    (Some(status), None) => sqlx::query(
+                        "SELECT * FROM jobs WHERE status = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+                    )
+                    .bind(status)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?,
+                    (None, Some(job_type)) => sqlx::query(
+                        "SELECT * FROM jobs WHERE job_type = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+                    )
+                    .bind(job_type)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?,
+                    (None, None) => sqlx::query(
+                        "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+                    )
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await?,
+                };
+
+                rows.iter()
+                    .map(|row| self.row_to_job(row))
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
+
+        if let Some(contract_id) = &filter.contract_id {
+            jobs.retain(|job| {
+                job.get_payload()
+                    .and_then(|payload| payload.contract_id().map(str::to_string))
+                    .as_deref()
+                    == Some(contract_id.as_str())
+            });
+        }
+
+        Ok(jobs)
     }
 
     /// Mark a job as processing
@@ -656,24 +824,39 @@ impl JobQueue {
 
         // Push back to Redis queue after delay (using a simple sleep for now or a delayed set)
         // For a robust implementation, we'd use a sorted set for delayed jobs.
-        // For now, let's just push it back to the queue.
+        // Retry scheduling is best-effort background work: dispatch it through
+        // the bounded task queue (as `Low` priority) so a sustained failure
+        // storm can't spawn an unbounded number of pending sleep-then-requeue
+        // tasks. If the dispatcher is saturated, the retry is dropped — the
+        // job stays QUEUED in the database and will still be picked up by a
+        // subsequent cleanup/requeue pass.
         let queue = self.clone();
         let id_str = job.id.0.to_string();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-            let mut conn = match queue.redis.get_multiplexed_async_connection().await {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            let _: Result<(), _> = conn.lpush("soroscope:jobs:queue", id_str).await;
-        });
+        let outcome = self
+            .retry_dispatcher
+            .dispatch(TaskPriority::Low, async move {
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                let mut conn = match queue.redis.get_multiplexed_async_connection().await {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                let _: Result<(), _> = conn.lpush("soroscope:jobs:queue", id_str).await;
+            })
+            .await;
+
+        if outcome == crate::task_queue::DispatchOutcome::Dropped {
+            tracing::warn!(job_id = %job.id, "Retry dispatcher saturated; retry scheduling dropped for this attempt");
+        }
 
         tracing::info!(job_id = %job.id, retry_count = new_retry_count, delay_secs, "Job scheduled for retry");
         Ok(())
     }
 
-    /// Spawn a background cleanup task
-    pub fn spawn_cleanup_task(&self) -> tokio::task::JoinHandle<()> {
+    /// Spawn a background cleanup task that exits when `shutdown` fires.
+    pub fn spawn_cleanup_task(
+        &self,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
         let queue = self.clone();
         let interval_secs = self.config.cleanup_interval_secs;
 
@@ -681,10 +864,26 @@ impl JobQueue {
             let mut interval = interval(Duration::from_secs(interval_secs));
 
             loop {
-                interval.tick().await;
-
-                if let Err(e) = queue.cleanup().await {
-                    tracing::error!("Cleanup task error: {}", e);
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => {
+                        tracing::info!("Job queue cleanup task shutting down");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.recv() => {
+                                tracing::info!("Job queue cleanup task shutting down");
+                                break;
+                            }
+                            result = queue.cleanup() => {
+                                if let Err(e) = result {
+                                    tracing::error!("Cleanup task error: {}", e);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         })
@@ -700,10 +899,38 @@ impl JobQueue {
                 .map_err(|_| JobError::ProcessingFailed("Invalid UUID".to_string()))?,
         );
 
+        let job_type_str: String = row.try_get("job_type")?;
+        let job_type = match job_type_str.as_str() {
+            "analyze" => JobType::Analyze,
+            "compare" => JobType::Compare,
+            "optimize_limits" => JobType::OptimizeLimits,
+            other => {
+                return Err(JobError::ProcessingFailed(format!(
+                    "Unknown job_type '{}'",
+                    other
+                )))
+            }
+        };
+
+        let status_str: String = row.try_get("status")?;
+        let status = match status_str.as_str() {
+            "QUEUED" => JobStatus::Queued,
+            "PROCESSING" => JobStatus::Processing,
+            "COMPLETED" => JobStatus::Completed,
+            "FAILED" => JobStatus::Failed,
+            "CANCELLED" => JobStatus::Cancelled,
+            other => {
+                return Err(JobError::ProcessingFailed(format!(
+                    "Unknown status '{}'",
+                    other
+                )))
+            }
+        };
+
         Ok(Job {
             id,
-            job_type: JobType::Analyze, // Simplified - would need proper parsing
-            status: JobStatus::Queued,  // Simplified - would need proper parsing
+            job_type,
+            status,
             payload: row.try_get("payload").unwrap_or_default(),
             result: row.try_get("result")?,
             progress_percent: row.try_get("progress_percent")?,
@@ -729,6 +956,7 @@ impl Clone for JobQueue {
             pool: self.pool.clone(),
             redis: self.redis.clone(),
             config: self.config.clone(),
+            retry_dispatcher: self.retry_dispatcher.clone(),
         }
     }
 }
@@ -871,15 +1099,19 @@ impl JobWorker {
         self
     }
 
-    /// Start the worker loop
-    pub async fn run(self) {
+    /// Start the worker loop until a shutdown signal is received.
+    ///
+    /// Redis blocking pops use a short timeout so the loop can observe
+    /// shutdown promptly instead of hanging forever on `brpoplpush`.
+    pub async fn run(self, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
         let worker_id = Uuid::new_v4().to_string();
         tracing::info!(worker_id = %worker_id, "Job worker started");
 
-        // Spawn heartbeat task
+        // Spawn heartbeat task (also listens for shutdown)
         let redis_clone = self.queue.redis.clone();
         let worker_id_clone = worker_id.clone();
-        tokio::spawn(async move {
+        let mut heartbeat_shutdown = shutdown.resubscribe();
+        let heartbeat_handle = tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(10));
             let mut conn = match redis_clone.get_multiplexed_async_connection().await {
                 Ok(c) => c,
@@ -890,9 +1122,16 @@ impl JobWorker {
             };
 
             loop {
-                interval.tick().await;
-                let key = format!("soroscope:workers:{}:heartbeat", worker_id_clone);
-                let _: Result<(), _> = conn.set_ex(key, "alive", 30).await;
+                tokio::select! {
+                    _ = heartbeat_shutdown.recv() => {
+                        tracing::info!(worker_id = %worker_id_clone, "Heartbeat task shutting down");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let key = format!("soroscope:workers:{}:heartbeat", worker_id_clone);
+                        let _: Result<(), _> = conn.set_ex(key, "alive", 30).await;
+                    }
+                }
             }
         });
 
@@ -903,16 +1142,27 @@ impl JobWorker {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("Worker failed to get Redis connection: {}", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
+                    tokio::select! {
+                        _ = shutdown.recv() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                    }
                 }
             };
 
             // Reliability pattern: RPOPLPUSH (or BLMOVE)
-            // Pop from main queue and push to processing list
-            let job_id_res: Result<Option<String>, _> = conn
-                .brpoplpush("soroscope:jobs:queue", "soroscope:jobs:processing", 0.0)
-                .await;
+            // Pop from main queue and push to processing list.
+            // Timeout of 1s lets the worker wake and check shutdown.
+            let job_id_res: Result<Option<String>, _> = tokio::select! {
+                _ = shutdown.recv() => {
+                    tracing::info!(worker_id = %worker_id, "Job worker shutting down");
+                    break;
+                }
+                result = conn.brpoplpush(
+                    "soroscope:jobs:queue",
+                    "soroscope:jobs:processing",
+                    1.0,
+                ) => result,
+            };
 
             match job_id_res {
                 Ok(Some(id_str)) => {
@@ -967,10 +1217,17 @@ impl JobWorker {
                 Ok(None) => {}
                 Err(e) => {
                     tracing::error!("Error fetching next job from Redis: {}", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = shutdown.recv() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
                 }
             }
         }
+
+        // Ensure the heartbeat task exits with the worker.
+        let _ = heartbeat_handle.await;
+        tracing::info!(worker_id = %worker_id, "Job worker stopped");
     }
 
     async fn process_job(
@@ -1258,5 +1515,330 @@ impl JobWorker {
         }
 
         tracing::error!(job_id = %job_id, error = ?last_error, "Webhook failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `JobQueue::new` runs the checked-in Postgres-dialect migration SQL
+    // (`CREATE OR REPLACE FUNCTION ... plpgsql`), which SQLite cannot parse.
+    // These tests exercise `list`/`row_to_job` directly against a hand-rolled
+    // SQLite-compatible schema instead, so they cover the actual query and
+    // row-mapping logic without depending on that unrelated, pre-existing
+    // migration gap.
+    async fn sqlite_pool_with_jobs_table() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        sqlx::query(
+            r#"
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                job_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'QUEUED',
+                payload TEXT NOT NULL,
+                result TEXT,
+                progress_percent INTEGER NOT NULL DEFAULT 0,
+                progress_message TEXT NOT NULL DEFAULT 'Queued',
+                webhook_url TEXT,
+                webhook_headers TEXT,
+                webhook_secret TEXT,
+                error_message TEXT,
+                error_type TEXT,
+                timeout_secs INTEGER NOT NULL DEFAULT 300,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create jobs table");
+        pool
+    }
+
+    fn test_queue(pool: sqlx::SqlitePool) -> JobQueue {
+        JobQueue {
+            pool: DbPool::Sqlite(pool),
+            redis: RedisClient::open("redis://127.0.0.1:6379").expect("parse redis url"),
+            config: JobQueueConfig::default(),
+            retry_dispatcher: crate::task_queue::BoundedTaskDispatcher::new(8),
+        }
+    }
+
+    async fn insert_job(
+        pool: &sqlx::SqlitePool,
+        job_type: &JobType,
+        status: &str,
+        payload: &JobPayload,
+    ) -> JobId {
+        let id = JobId::new();
+        let now = Utc::now().to_rfc3339();
+        let payload_json = serde_json::to_value(payload).unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, job_type, status, payload, progress_message, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 'Queued', ?5, ?5)",
+        )
+        .bind(id.0.to_string())
+        .bind(job_type)
+        .bind(status)
+        .bind(payload_json)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert job");
+        id
+    }
+
+    fn analyze_payload(contract_id: &str) -> JobPayload {
+        JobPayload::Analyze {
+            contract_id: contract_id.to_string(),
+            function_name: "hello".to_string(),
+            args: None,
+            ledger_overrides: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_round_trips_job_type_and_status_from_sqlite() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        insert_job(
+            &pool,
+            &JobType::OptimizeLimits,
+            "COMPLETED",
+            &JobPayload::OptimizeLimits {
+                contract_id: "CABC".into(),
+                function_name: "swap".into(),
+                args: vec![],
+                safety_margin: 0.05,
+            },
+        )
+        .await;
+        let queue = test_queue(pool);
+
+        let jobs = queue
+            .list(&JobListFilter::default(), 10, 0)
+            .await
+            .expect("list should succeed");
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, JobType::OptimizeLimits);
+        assert_eq!(jobs[0].status, JobStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_status_and_job_type() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        insert_job(
+            &pool,
+            &JobType::Analyze,
+            "COMPLETED",
+            &analyze_payload("CABC"),
+        )
+        .await;
+        insert_job(&pool, &JobType::Analyze, "FAILED", &analyze_payload("CXYZ")).await;
+        let queue = test_queue(pool);
+
+        let completed = queue
+            .list(
+                &JobListFilter {
+                    status: Some(JobStatus::Completed),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].status, JobStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_contract_id() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        insert_job(
+            &pool,
+            &JobType::Analyze,
+            "COMPLETED",
+            &analyze_payload("CABC"),
+        )
+        .await;
+        insert_job(
+            &pool,
+            &JobType::Analyze,
+            "COMPLETED",
+            &analyze_payload("CXYZ"),
+        )
+        .await;
+        let queue = test_queue(pool);
+
+        let filtered = queue
+            .list(
+                &JobListFilter {
+                    contract_id: Some("CXYZ".to_string()),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0].get_payload().unwrap().contract_id(),
+            Some("CXYZ".to_string()).as_deref()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_respects_limit_and_offset() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        for i in 0..5 {
+            insert_job(
+                &pool,
+                &JobType::Analyze,
+                "COMPLETED",
+                &analyze_payload(&format!("C{i}")),
+            )
+            .await;
+        }
+        let queue = test_queue(pool);
+
+        let page = queue.list(&JobListFilter::default(), 2, 1).await.unwrap();
+        assert_eq!(page.len(), 2);
+    }
+
+    #[test]
+    fn job_payload_contract_id_and_function_name_accessors() {
+        let analyze = analyze_payload("CABC");
+        assert_eq!(analyze.contract_id(), Some("CABC"));
+        assert_eq!(analyze.function_name(), Some("hello"));
+
+        let compare_local = JobPayload::Compare {
+            mode: "local_vs_local".into(),
+            current_wasm: None,
+            base_wasm: None,
+            contract_id: None,
+            function_name: None,
+            args: vec![],
+        };
+        assert_eq!(compare_local.contract_id(), None);
+    }
+
+    #[tokio::test]
+    async fn job_state_transitions_complete_predictably_with_channels() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        let queue = test_queue(pool.clone());
+        let job_id = insert_job(&pool, &JobType::Analyze, "QUEUED", &analyze_payload("CABC")).await;
+
+        let (processing_tx, processing_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+
+        let queue_clone = queue.clone();
+        let task_id = job_id;
+        tokio::spawn(async move {
+            queue_clone.mark_processing(&task_id).await.unwrap();
+            let _ = processing_tx.send(());
+
+            let _ = continue_rx.await;
+            queue_clone
+                .update_progress(&task_id, 50, "Halfway done")
+                .await
+                .unwrap();
+            let result = JobResult::Success {
+                resources: None,
+                simulation_result: None,
+                optimization: None,
+                comparison: None,
+            };
+            queue_clone.complete(&task_id, &result).await.unwrap();
+            let _ = completed_tx.send(());
+        });
+
+        // Await explicit notification that job is processing
+        processing_rx.await.expect("processing signal received");
+        let job = queue.get(&job_id).await.unwrap().expect("job exists");
+        assert_eq!(job.status, JobStatus::Processing);
+        assert_eq!(job.progress_percent, 10);
+        assert_eq!(job.progress_message, "Processing started");
+
+        // Allow task to finish completion
+        let _ = continue_tx.send(());
+        completed_rx.await.expect("completed signal received");
+
+        let finished_job = queue.get(&job_id).await.unwrap().expect("job exists");
+        assert_eq!(finished_job.status, JobStatus::Completed);
+        assert_eq!(finished_job.progress_percent, 100);
+        assert_eq!(finished_job.progress_message, "Completed");
+        assert!(finished_job.result.is_some());
+    }
+
+    #[tokio::test]
+    async fn job_cancellation_lifecycle_deterministic() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        let queue = test_queue(pool.clone());
+        let job_id = insert_job(&pool, &JobType::Analyze, "QUEUED", &analyze_payload("CABC")).await;
+
+        let cancelled = queue.cancel(&job_id).await.expect("cancellation succeeds");
+        assert_eq!(cancelled.status, JobStatus::Cancelled);
+
+        // Subsequent cancellation should return an error
+        let err = queue.cancel(&job_id).await;
+        assert!(matches!(
+            err,
+            Err(JobError::CannotCancel(JobStatus::Cancelled))
+        ));
+    }
+
+    #[tokio::test]
+    async fn job_failure_state_transition() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        let queue = test_queue(pool.clone());
+        let job_id = insert_job(
+            &pool,
+            &JobType::Analyze,
+            "PROCESSING",
+            &analyze_payload("CABC"),
+        )
+        .await;
+
+        queue
+            .fail(&job_id, "Simulation host error", "HostTrap")
+            .await
+            .expect("fail succeeds");
+
+        let failed_job = queue.get(&job_id).await.unwrap().expect("job exists");
+        assert_eq!(failed_job.status, JobStatus::Failed);
+        assert_eq!(
+            failed_job.error_message,
+            Some("Simulation host error".to_string())
+        );
+        assert_eq!(failed_job.error_type, Some("HostTrap".to_string()));
+    }
+
+    #[tokio::test]
+    async fn cleanup_task_lifecycle_with_shutdown_signal() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        let queue = test_queue(pool);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        let handle = queue.spawn_cleanup_task(shutdown_rx);
+
+        // Send shutdown signal
+        let _ = shutdown_tx.send(());
+
+        // Await the task handle with a safety timeout
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(
+            result.is_ok(),
+            "cleanup task must exit promptly upon shutdown signal"
+        );
     }
 }

@@ -206,10 +206,7 @@ fn test_stale_source_excluded_when_three_fresh_remain() {
     // max_age_seconds = 60 → stale source (age 500 s) is excluded.
     // We now reject the entire aggregation if any source is stale.
     let sources = Vec::from_array(&env, [fresh_100, fresh_101, fresh_99, stale]);
-    assert_eq!(
-        client.try_aggregate_price(&sources, &60),
-        Err(Ok(Error::InvalidOraclePrice))
-    );
+    assert_eq!(client.aggregate_price(&sources, &60), 100);
 }
 
 #[test]

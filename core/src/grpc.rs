@@ -102,7 +102,7 @@ impl EventStreamService for EventStreamServiceImpl {
             "gRPC client connected to EventStreamService"
         );
 
-        let receiver: broadcast::Receiver<SimulationEvent> = self.bus.subscribe();
+        let receiver = self.bus.subscribe();
         let bus_stream = BroadcastStream::new(receiver);
 
         let contract_filter = contract_id_filter.clone();
@@ -112,14 +112,12 @@ impl EventStreamService for EventStreamServiceImpl {
             .filter_map(move |item| {
                 let cf = contract_filter.clone();
                 let etf = event_types_filter.clone();
-                async move {
-                    match item {
-                        Err(_lagged) => {
-                            tracing::warn!("gRPC stream lagged; some events were dropped");
-                            None
-                        }
-                        Ok(event) => translate_event(event, &cf, &etf),
+                match item {
+                    Err(_lagged) => {
+                        tracing::warn!("gRPC stream lagged; some events were dropped");
+                        None
                     }
+                    Ok(traced_msg) => translate_event(traced_msg.payload, &cf, &etf),
                 }
             })
             .map(Ok);

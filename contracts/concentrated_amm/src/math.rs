@@ -86,7 +86,8 @@ pub fn sqrt_u128(x: u128) -> u128 {
 /// Price = 1.0001 ^ tick. SqrtPrice = 1.0001 ^ (tick / 2).
 pub fn get_sqrt_ratio_at_tick(tick: i32) -> Result<u128, MathError> {
     let abs_tick = tick.abs() as u32;
-    let base: u128 = 18447669818844880896; 
+    // 1.00005 in Q64 = 18447669818844880896
+    let base: u128 = 18447669818844880896;
     let mut ratio: u128 = Q64;
     let mut current_base = base;
     let mut t = abs_tick;
@@ -118,10 +119,14 @@ pub fn get_amount_0_delta(
     } else {
         (sqrt_ratio_bx64, sqrt_ratio_ax64)
     };
-    
-    let diff = upper.checked_sub(lower).ok_or(MathError::Overflow)?;
-    let prod_div_upper = mul_div_u128(liquidity, diff, upper)?;
-    let amount0 = mul_div_u128(prod_div_upper, Q64, lower)?;
+
+    // num1 = liquidity << 64
+    // num2 = upper - lower
+    // den = upper * lower
+    // Actually, amount0 = (liquidity * (upper - lower)) / upper / lower * 2^64
+    let num1 = mul_div_u128(liquidity, Q64, upper)?;
+    let num2 = upper.checked_sub(lower).ok_or(MathError::Overflow)?;
+    let amount0 = mul_div_u128(num1, num2, lower)?;
     Ok(amount0)
 }
 
