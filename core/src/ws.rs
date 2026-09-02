@@ -50,8 +50,8 @@ use crate::trace_propagation::TracedMessage;
 
 // ── Channel capacity ─────────────────────────────────────────────────────────
 
-/// Default number of events buffered per broadcast channel slot before slow
-/// consumers are forced to drop events via `RecvError::Lagged`.
+/// Maximum number of events retained for each subscriber before the oldest
+/// unconsumed telemetry events are dropped.
 const BUS_CAPACITY: usize = 100;
 
 /// Minimum allowed channel capacity (prevents degenerate single-slot configs).
@@ -181,8 +181,8 @@ impl SimulationBus {
     ///
     /// `capacity` is clamped to `[BUS_CAPACITY_MIN, BUS_CAPACITY_MAX]`.
     /// Slow subscribers that fall more than `capacity` events behind receive
-    /// [`RecvError::Lagged`] on the next receive call — this is the intended
-    /// backpressure mechanism (drop the stale event, catch up on the next tick).
+    /// [`RecvError::Lagged`] on the next receive call. Tokio's broadcast channel
+    /// drops the oldest unconsumed events, keeping memory bounded per subscriber.
     pub fn with_capacity(capacity: usize) -> Arc<Self> {
         let clamped = capacity.clamp(BUS_CAPACITY_MIN, BUS_CAPACITY_MAX);
         let (sender, _) = broadcast::channel(clamped);
@@ -458,6 +458,47 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(parsed["event"], "consensus_check");
         assert_eq!(parsed["data"]["agreement"], true);
+    }
+
+    #[tokio::test]
+    async fn slow_subscribers_drop_oldest_events_at_capacity() {
+        let bus = SimulationBus::with_capacity(BUS_CAPACITY_MIN);
+        let mut rx = bus.subscribe();
+        let fake_id = JobId::new();
+
+        for percent in 0..=BUS_CAPACITY_MIN {
+            bus.publish(SimulationBus::progress(&fake_id, percent as i32, "progress"));
+        }
+
+        let received = rx.recv().await;
+        assert!(matches!(
+            received,
+            Err(broadcast::error::RecvError::Lagged(skipped)) if skipped == 1
+        ));
+
+        let newest = rx.recv().await.expect("newest event should remain");
+        assert_eq!(newest.payload.job_id(), fake_id.to_string());
+        if let SimulationEvent::Progress { data, .. } = newest.payload {
+            assert_eq!(data.percent, BUS_CAPACITY_MIN as i32);
+        } else {
+            panic!("expected progress event");
+        }
+    }
+
+    #[tokio::test]
+    async fn requested_capacity_is_clamped() {
+        let bus = SimulationBus::with_capacity(1);
+        let mut rx = bus.subscribe();
+        let fake_id = JobId::new();
+
+        for percent in 0..BUS_CAPACITY_MIN {
+            bus.publish(SimulationBus::progress(&fake_id, percent as i32, "progress"));
+        }
+
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
     }
 
     #[tokio::test]
