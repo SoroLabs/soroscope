@@ -55,10 +55,16 @@ rayon = "1.8"
 # everything we need: `system`, `process`, and the CPU usage diff.
 sysinfo = "0.32"
 # gRPC event streaming (Issue #583)
-tonic = { version = "0.12", features = ["transport"] }
+#
+# The `tls` feature pulls in rustls so the gRPC server can terminate TLS and
+# present a proper certificate chain (Issue #918).
+tonic = { version = "0.12", features = ["transport", "tls"] }
 prost = "0.13"
 tokio-stream = { version = "0.1", features = ["sync"] }
-async-graphql = "7"
+# Enables precise PEM parsing so the whole certificate chain (leaf + any
+# intermediate CAs) is loaded and presented by the Tonic server, instead of
+# truncating to a single certificate (Issue #918).
+rustls-pemfile = "2"
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -69,6 +75,15 @@ tower = { version = "0.4", features = ["util"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 tikv-jemalloc-ctl = { version = "0.5", optional = false }
 tikv-jemallocator = { version = "0.5", optional = false }
+# Generates throwaway CA/server/client certificates for the gRPC TLS
+# integration test (Issue #918).
+rcgen = "0.13"
+# Low-level TLS client used by the integration test to drive a real TLS
+# handshake against the Tonic gRPC server, proving the certificate chain
+# loading fix (Issue #918).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+tokio-rustls = "0.26"
 
 [[bench]]
 name = "merkle_bench"
