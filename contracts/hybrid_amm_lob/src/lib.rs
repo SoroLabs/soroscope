@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 #[cfg(test)]
 mod test;
@@ -837,7 +837,7 @@ impl HybridAmmLob {
         }
 
         e.events().publish(
-            ("swap", taker),
+            (Symbol::new(&e, "swap"), taker),
             SwapResult {
                 amount_in: total_in,
                 amount_out: out,

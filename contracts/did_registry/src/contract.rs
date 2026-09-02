@@ -81,7 +81,11 @@ impl DIDRegistry {
     }
 
     fn append_did_index(e: &Env, did: &String) {
-        let mut dids: Vec<String> = e.storage().persistent().get(&DID_INDEX).unwrap_or(Vec::new(&e));
+        let mut dids: Vec<String> = e
+            .storage()
+            .persistent()
+            .get(&DID_INDEX)
+            .unwrap_or(Vec::new(&e));
         let mut i = 0;
         while i < dids.len() {
             if dids.get(i).unwrap() == *did {
@@ -99,7 +103,11 @@ impl DIDRegistry {
             return true;
         }
 
-        let dids: Vec<String> = e.storage().persistent().get(&DID_INDEX).unwrap_or(Vec::new(&e));
+        let dids: Vec<String> = e
+            .storage()
+            .persistent()
+            .get(&DID_INDEX)
+            .unwrap_or(Vec::new(&e));
         let mut i = 0;
         while i < dids.len() {
             let did = dids.get(i).unwrap();
@@ -336,7 +344,8 @@ impl DIDRegistryTrait for DIDRegistry {
         Self::require_owner_auth(&e);
 
         let key = (ATTESTATIONS, attestation.claim_hash.clone());
-        let mut attestations: Vec<Attestation> = e.storage().persistent().get(&key).unwrap_or(Vec::new(&e));
+        let mut attestations: Vec<Attestation> =
+            e.storage().persistent().get(&key).unwrap_or(Vec::new(&e));
         attestations.push_back(attestation);
         e.storage().persistent().set(&key, &attestations);
     }
@@ -366,7 +375,8 @@ impl DIDRegistryTrait for DIDRegistry {
         }
 
         let key = (ATTESTATIONS, attestation.claim_hash.clone());
-        let attestations: Vec<Attestation> = e.storage().persistent().get(&key).unwrap_or(Vec::new(&e));
+        let attestations: Vec<Attestation> =
+            e.storage().persistent().get(&key).unwrap_or(Vec::new(&e));
         let mut found = false;
         let mut i = 0;
         while i < attestations.len() {

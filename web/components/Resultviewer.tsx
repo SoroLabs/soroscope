@@ -181,8 +181,11 @@ export function ResultViewer({ result }: ResultViewerProps) {
         )
       )}
 
-      {result.callGraphMermaid && (
-        <CallGraphVisualizer mermaidDefinition={result.callGraphMermaid} />
+      {(result.callGraph || result.callGraphMermaid) && (
+        <CallGraphVisualizer
+          callGraph={result.callGraph}
+          mermaidDefinition={result.callGraphMermaid}
+        />
       )}
     </div>
   );

@@ -12,7 +12,7 @@
 //!    If the borrower fails to repay, the balance check at step 9 fails and
 //!    the transfer at step 6 is rolled back — funds never leave the vault.
 //!
-//! 2. **Reentrancy guard**: A `FlashLoanActive` flag prevents nested flash
+//! 2. **Reentrancy guard**: A `ReentrancyLock` flag prevents nested flash
 //!    loans from the same vault during a callback.
 //!
 //! ## Flow
@@ -20,25 +20,25 @@
 //! ```text
 //! 1. if BorrowPaused → Err(BorrowPaused)
 //! 2. check_not_paused(PauseType::BORROW)
-//! 3. if FlashLoanActive → Err(Reentrancy)
-//! 4. set FlashLoanActive = true
+//! 3. if ReentrancyLock → Err(Reentrancy)
+//! 4. set ReentrancyLock = true
 //! 5. pre_balance = token.balance(self)
 //! 6. fee = amount * fee_bps / 10_000
 //! 7. token.transfer(self → receiver, amount)
 //! 8. ReceiverClient::execute_operation(token, amount, fee, initiator)
 //! 9. post_balance = token.balance(self)
 //! 10. assert post_balance >= pre_balance + fee
-//! 11. set FlashLoanActive = false
+//! 11. set ReentrancyLock = false
 //! 12. emit FlashLoanEvent
 //! ```
 
 use emergency_guard::{EmergencyGuard, PauseType};
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 #[cfg(test)]
 mod test;
 
-// ── Errors ───────────────────────────────────────────────────────────────────
+// Errors
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -70,7 +70,7 @@ pub enum Error {
     InvalidReceiver = 12,
 }
 
-// ── Event types ──────────────────────────────────────────────────────────────
+// Event types
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,7 +103,7 @@ pub struct FeeChangedEvent {
     pub new_fee_bps: i128,
 }
 
-// ── Storage keys ─────────────────────────────────────────────────────────────
+// Storage keys
 
 #[contracttype]
 #[derive(Clone)]
@@ -115,7 +115,7 @@ pub enum DataKey {
     /// Flash loan fee in basis points (0–100).
     FeeBps,
     /// Reentrancy guard: true while a flash loan callback is executing.
-    FlashLoanActive,
+    ReentrancyLock,
     /// Granular pause: blocks BORROW/flash_loan only, without affecting admin ops.
     BorrowPaused,
     /// Total amount the admin has deposited (tracked for withdrawal cap).
@@ -124,7 +124,7 @@ pub enum DataKey {
     BorrowRecord(Address),
 }
 
-// ── Flash loan receiver interface ────────────────────────────────────────────
+// Flash loan receiver interface
 
 /// Trait that borrower contracts must implement.
 ///
@@ -143,7 +143,7 @@ pub trait FlashLoanReceiver {
     fn execute_operation(e: Env, token: Address, amount: i128, fee: i128, initiator: Address);
 }
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// Constants
 
 /// Maximum fee in basis points (1%).
 pub const MAX_FEE_BPS: i128 = 100;
@@ -151,7 +151,7 @@ pub const MAX_FEE_BPS: i128 = 100;
 /// Default fee: 0 bps (free flash loans).
 pub const DEFAULT_FEE_BPS: i128 = 0;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// Helpers
 
 fn check_not_paused(e: &Env, operation: u32) -> Result<(), Error> {
     if EmergencyGuard::is_paused(e.clone(), operation) {
@@ -203,7 +203,7 @@ fn calculate_fee(e: &Env, amount: i128) -> i128 {
 fn is_flash_loan_active(e: &Env) -> bool {
     e.storage()
         .instance()
-        .get(&DataKey::FlashLoanActive)
+        .get(&DataKey::ReentrancyLock)
         .unwrap_or(false)
 }
 
@@ -218,7 +218,7 @@ fn check_no_flash_loan_active(e: &Env) -> Result<(), Error> {
 fn set_flash_loan_active(e: &Env, active: bool) {
     e.storage()
         .instance()
-        .set(&DataKey::FlashLoanActive, &active);
+        .set(&DataKey::ReentrancyLock, &active);
 }
 
 fn get_total_deposited(e: &Env) -> i128 {
@@ -245,14 +245,14 @@ fn set_borrow_paused(e: &Env, paused: bool) {
     e.storage().instance().set(&DataKey::BorrowPaused, &paused);
 }
 
-// ── Contract ─────────────────────────────────────────────────────────────────
+// Contract
 
 #[contract]
 pub struct FlashLoanVault;
 
 #[contractimpl]
 impl FlashLoanVault {
-    // ── Initialization ───────────────────────────────────────────────────────
+    // Initialization
 
     /// Initialize the vault with an admin and the token to lend.
     ///
@@ -269,14 +269,14 @@ impl FlashLoanVault {
             .set(&DataKey::FeeBps, &DEFAULT_FEE_BPS);
         e.storage()
             .instance()
-            .set(&DataKey::FlashLoanActive, &false);
+            .set(&DataKey::ReentrancyLock, &false);
         e.storage().instance().set(&DataKey::BorrowPaused, &false);
         e.storage().instance().set(&DataKey::TotalDeposited, &0i128);
 
         Ok(())
     }
 
-    // ── Admin operations ─────────────────────────────────────────────────────
+    // Admin operations
 
     /// Admin deposits tokens into the vault, making them available for flash loans.
     pub fn deposit(e: Env, from: Address, amount: i128) -> Result<(), Error> {
@@ -302,7 +302,7 @@ impl FlashLoanVault {
         set_total_deposited(&e, deposited + amount);
 
         e.events().publish(
-            (String::from_str(&e, "vault_deposit"), from.clone()),
+            (Symbol::new(&e, "vault_deposit"), from.clone()),
             VaultDepositEvent {
                 admin: from,
                 amount,
@@ -340,7 +340,7 @@ impl FlashLoanVault {
         set_total_deposited(&e, deposited - amount);
 
         e.events().publish(
-            (String::from_str(&e, "vault_withdraw"), to.clone()),
+            (Symbol::new(&e, "vault_withdraw"), to.clone()),
             VaultWithdrawEvent { admin: to, amount },
         );
 
@@ -361,7 +361,7 @@ impl FlashLoanVault {
         e.storage().instance().set(&DataKey::FeeBps, &fee_bps);
 
         e.events().publish(
-            (String::from_str(&e, "fee_changed"), admin.clone()),
+            (Symbol::new(&e, "fee_changed"), admin.clone()),
             FeeChangedEvent {
                 admin,
                 old_fee_bps: old_fee,
@@ -408,7 +408,7 @@ impl FlashLoanVault {
         EmergencyGuard::emergency_pause(e, approvers).map_err(|_| Error::Unauthorized)
     }
 
-    // ── Flash loan ───────────────────────────────────────────────────────────
+    // Flash loan
 
     /// Execute a flash loan.
     ///
@@ -508,7 +508,7 @@ impl FlashLoanVault {
 
         // 13. Emit event.
         e.events().publish(
-            (String::from_str(&e, "flash_loan"), receiver.clone()),
+            (Symbol::new(&e, "flash_loan"), receiver.clone()),
             FlashLoanEvent {
                 receiver,
                 token: token_addr,
@@ -541,6 +541,12 @@ impl FlashLoanVault {
         // 3. Reentrancy guard.
         if is_flash_loan_active(&e) {
             return Err(Error::Reentrancy);
+        }
+
+        // 3b. Auth & receiver validation.
+        borrower.require_auth();
+        if !borrower.is_contract() {
+            return Err(Error::InvalidReceiver);
         }
 
         let token_addr = load_token(&e)?;
@@ -578,7 +584,10 @@ impl FlashLoanVault {
             set_flash_loan_active(&e, false);
             e.storage().instance().set(
                 &DataKey::BorrowRecord(borrower.clone()),
-                &BorrowRecord { fee: 0, total_repayment: 0 },
+                &BorrowRecord {
+                    fee: 0,
+                    total_repayment: 0,
+                },
             );
             return Err(Error::InvalidReceiver);
         }
@@ -587,39 +596,28 @@ impl FlashLoanVault {
         let expected_fee = calculate_fee(&e, amount);
         let required_balance = pre_balance + expected_fee;
         let post_balance = token.balance(&e.current_contract_address());
-        if post_balance < pre_balance + fee {
+        if post_balance < required_balance {
             set_flash_loan_active(&e, false);
             e.storage().instance().set(
                 &DataKey::BorrowRecord(borrower.clone()),
-                &BorrowRecord { fee: 0, total_repayment: 0 },
+                &BorrowRecord {
+                    fee: 0,
+                    total_repayment: 0,
+                },
             );
-        if post_balance < required_balance {
-            e.storage()
-                .instance()
-                .remove(&DataKey::BorrowRecord(borrower));
             return Err(Error::LoanNotRepaid);
         }
 
-        // 10. Clear reentrancy guard and borrow record.
-        set_flash_loan_active(&e, false);
-        // Overwrite the temporary record with zeros to avoid stale data.
-        e.storage().instance().set(
-            &DataKey::BorrowRecord(borrower.clone()),
-            &BorrowRecord {
-                fee: 0,
-                total_repayment: 0,
-            },
-        );
+        // ── Views ────────────────────────────────────────────────────────────────
 
-        // 11. If fee collected, update total deposited.
-        if fee > 0 {
-            let deposited = get_total_deposited(&e);
-            set_total_deposited(&e, deposited + fee);
+        /// Returns the current fee in basis points.
+        pub fn get_fee(e: Env) -> i128 {
+            get_fee_bps(&e)
         }
 
         // 12. Emit same event as flash_loan for observability.
         e.events().publish(
-            (String::from_str(&e, "borrow"), borrower.clone()),
+            (Symbol::new(&e, "borrow"), borrower.clone()),
             FlashLoanEvent {
                 receiver: borrower,
                 token: token_addr,
@@ -628,35 +626,16 @@ impl FlashLoanVault {
             },
         );
 
-        Ok(fee)
-    }
+        /// Returns the token address this vault lends.
+        pub fn get_token(e: Env) -> Result<Address, Error> {
+            load_token(&e)
+        }
 
-    // ── Views ────────────────────────────────────────────────────────────────
+    // Views
 
-    /// Returns the current fee in basis points.
-    pub fn get_fee(e: Env) -> i128 {
-        get_fee_bps(&e)
-    }
-
-    /// Returns the amount of tokens available for flash loans.
-    pub fn get_available(e: Env) -> Result<i128, Error> {
-        let token_addr = load_token(&e)?;
-        let token = soroban_sdk::token::Client::new(&e, &token_addr);
-        Ok(token.balance(&e.current_contract_address()))
-    }
-
-    /// Returns the token address this vault lends.
-    pub fn get_token(e: Env) -> Result<Address, Error> {
-        load_token(&e)
-    }
-
-    /// Returns the vault admin.
-    pub fn get_admin(e: Env) -> Result<Address, Error> {
-        load_admin(&e)
-    }
-
-    /// Returns the total amount deposited by the admin.
-    pub fn get_total_deposited(e: Env) -> i128 {
-        get_total_deposited(&e)
+        /// Returns the total amount deposited by the admin.
+        pub fn get_total_deposited(e: Env) -> i128 {
+            get_total_deposited(&e)
+        }
     }
 }

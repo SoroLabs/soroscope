@@ -1,2 +1,5 @@
-[target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=-reference-types"]
+[registries.crates-io]
+protocol = "sparse"
+
+[net]
+git-fetch-with-cli = true

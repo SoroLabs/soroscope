@@ -1,6 +1,6 @@
 use crate::contract::{Token, TokenClient, BurnEvent};
 use emergency_guard::{GuardError, PauseType};
-use soroban_sdk::{testutils::Address as _, Address, Env, String, vec, Vec, IntoVal, TryIntoVal};
+use soroban_sdk::{testutils::Address as _, Address, Env, String, Symbol, vec, Vec, IntoVal, TryIntoVal};
 
 // ── Existing Tests ─────────────────────────────────────────────────────────────
 
@@ -471,7 +471,7 @@ fn test_burn_emits_event() {
     assert!(events.len() > initial_events_count);
 
     // Find the burn event
-    let burn_event_name = String::from_str(&env, "burn");
+    let burn_event_name = Symbol::new(&env, "burn");
     let burn_events: Vec<_> = events
         .iter()
         .filter(|(c_id, topics, _)| {
@@ -523,7 +523,7 @@ fn test_burn_from_emits_event() {
     assert!(events.len() > initial_events_count);
 
     // Find the burn event
-    let burn_event_name = String::from_str(&env, "burn");
+    let burn_event_name = Symbol::new(&env, "burn");
     let burn_events: Vec<_> = events
         .iter()
         .filter(|(c_id, topics, _)| {

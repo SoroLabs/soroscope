@@ -3,9 +3,6 @@ name = "soroscope-core"
 version = "0.1.0"
 edition = "2021"
 
-# The root workspace only lists the contract crates as members, so opt out
-# explicitly — without this, cargo refuses to build the package at all.
-[workspace]
 
 [lib]
 name = "soroscope_core"
@@ -14,9 +11,6 @@ crate-type = ["rlib"]
 
 [dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
-# Used directly for the local WASM simulation runner. `testutils` exposes
-# the test Host + budget controls we need for in-process contract invocation.
-# Version aligned with the soroban-sdk 22 workspace pin.
 soroban-env-host = { version = "22", features = ["testutils"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
@@ -38,23 +32,19 @@ opentelemetry = "0.27"
 opentelemetry_sdk = "0.27"
 tracing-opentelemetry = "0.28"
 prometheus = "0.14"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace", "request-id", "set-header"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "compression-full"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "request-id", "set-header", "compression-full"] }
 tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
-url = "2"
 utoipa = { version = "4", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "7", features = ["axum", "vendored"] }
 base64 = "0.22"
 hex = "0.4"
 stellar-strkey = "0.0.9"
 jsonwebtoken = "9"
-ed25519-dalek = "2"
+ed25519-dalek = "=2.1.1"
 rand = "0.8"
 moka = { version = "0.12", features = ["future", "sync"] }
 sled = "0.34"
-sqlx = { version = "0.7", features = ["runtime-tokio", "tls-native-tls", "postgres", "sqlite", "uuid", "chrono", "migrate"] }
+sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "uuid", "chrono", "migrate"] }
 redis = { version = "0.25", features = ["tokio-comp"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -68,13 +58,19 @@ rayon = "1.8"
 # everything we need: `system`, `process`, and the CPU usage diff.
 sysinfo = "0.32"
 # gRPC event streaming (Issue #583)
-tonic = { version = "0.12", features = ["transport"] }
+#
+# The `tls` feature pulls in rustls so the gRPC server can terminate TLS and
+# present a proper certificate chain (Issue #918).
+tonic = { version = "0.12", features = ["transport", "tls"] }
 prost = "0.13"
 tokio-stream = { version = "0.1", features = ["sync"] }
+# Enables precise PEM parsing so the whole certificate chain (leaf + any
+# intermediate CAs) is loaded and presented by the Tonic server, instead of
+# truncating to a single certificate (Issue #918).
+rustls-pemfile = "2"
 
 [build-dependencies]
 tonic-build = "0.12"
-async-graphql = "7"
 
 [dev-dependencies]
 proptest = "1.4.0"
@@ -82,9 +78,20 @@ tower = { version = "0.4", features = ["util"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 tikv-jemalloc-ctl = { version = "0.5", optional = false }
 tikv-jemallocator = { version = "0.5", optional = false }
+# Generates throwaway CA/server/client certificates for the gRPC TLS
+# integration test (Issue #918).
+rcgen = "0.13"
+# Low-level TLS client used by the integration test to drive a real TLS
+# handshake against the Tonic gRPC server, proving the certificate chain
+# loading fix (Issue #918).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+tokio-rustls = "0.26"
 
 [[bench]]
 name = "merkle_bench"
 harness = false
 
+[[bench]]
 name = "memory_bench"
+harness = false

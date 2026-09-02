@@ -889,6 +889,23 @@ impl JobQueue {
         })
     }
 
+    /// Close all database connections gracefully
+    pub async fn close(&self) {
+        tracing::info!("Closing JobQueue database connections");
+        match &self.pool {
+            DbPool::Postgres(pool) => {
+                pool.close().await;
+                tracing::info!("PostgreSQL connection pool closed");
+            }
+            DbPool::Sqlite(pool) => {
+                pool.close().await;
+                tracing::info!("SQLite connection pool closed");
+            }
+        }
+        // Redis connection will be dropped when the client is dropped
+        tracing::info!("JobQueue closed successfully");
+    }
+
     fn row_to_job(&self, row: &sqlx::sqlite::SqliteRow) -> Result<Job, JobError> {
         // Manual mapping for SQLite since FromRow might have issues
         use sqlx::Row;
@@ -1729,5 +1746,116 @@ mod tests {
             args: vec![],
         };
         assert_eq!(compare_local.contract_id(), None);
+    }
+
+    #[tokio::test]
+    async fn job_state_transitions_complete_predictably_with_channels() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        let queue = test_queue(pool.clone());
+        let job_id = insert_job(&pool, &JobType::Analyze, "QUEUED", &analyze_payload("CABC")).await;
+
+        let (processing_tx, processing_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+
+        let queue_clone = queue.clone();
+        let task_id = job_id;
+        tokio::spawn(async move {
+            queue_clone.mark_processing(&task_id).await.unwrap();
+            let _ = processing_tx.send(());
+
+            let _ = continue_rx.await;
+            queue_clone
+                .update_progress(&task_id, 50, "Halfway done")
+                .await
+                .unwrap();
+            let result = JobResult::Success {
+                resources: None,
+                simulation_result: None,
+                optimization: None,
+                comparison: None,
+            };
+            queue_clone.complete(&task_id, &result).await.unwrap();
+            let _ = completed_tx.send(());
+        });
+
+        // Await explicit notification that job is processing
+        processing_rx.await.expect("processing signal received");
+        let job = queue.get(&job_id).await.unwrap().expect("job exists");
+        assert_eq!(job.status, JobStatus::Processing);
+        assert_eq!(job.progress_percent, 10);
+        assert_eq!(job.progress_message, "Processing started");
+
+        // Allow task to finish completion
+        let _ = continue_tx.send(());
+        completed_rx.await.expect("completed signal received");
+
+        let finished_job = queue.get(&job_id).await.unwrap().expect("job exists");
+        assert_eq!(finished_job.status, JobStatus::Completed);
+        assert_eq!(finished_job.progress_percent, 100);
+        assert_eq!(finished_job.progress_message, "Completed");
+        assert!(finished_job.result.is_some());
+    }
+
+    #[tokio::test]
+    async fn job_cancellation_lifecycle_deterministic() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        let queue = test_queue(pool.clone());
+        let job_id = insert_job(&pool, &JobType::Analyze, "QUEUED", &analyze_payload("CABC")).await;
+
+        let cancelled = queue.cancel(&job_id).await.expect("cancellation succeeds");
+        assert_eq!(cancelled.status, JobStatus::Cancelled);
+
+        // Subsequent cancellation should return an error
+        let err = queue.cancel(&job_id).await;
+        assert!(matches!(
+            err,
+            Err(JobError::CannotCancel(JobStatus::Cancelled))
+        ));
+    }
+
+    #[tokio::test]
+    async fn job_failure_state_transition() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        let queue = test_queue(pool.clone());
+        let job_id = insert_job(
+            &pool,
+            &JobType::Analyze,
+            "PROCESSING",
+            &analyze_payload("CABC"),
+        )
+        .await;
+
+        queue
+            .fail(&job_id, "Simulation host error", "HostTrap")
+            .await
+            .expect("fail succeeds");
+
+        let failed_job = queue.get(&job_id).await.unwrap().expect("job exists");
+        assert_eq!(failed_job.status, JobStatus::Failed);
+        assert_eq!(
+            failed_job.error_message,
+            Some("Simulation host error".to_string())
+        );
+        assert_eq!(failed_job.error_type, Some("HostTrap".to_string()));
+    }
+
+    #[tokio::test]
+    async fn cleanup_task_lifecycle_with_shutdown_signal() {
+        let pool = sqlite_pool_with_jobs_table().await;
+        let queue = test_queue(pool);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        let handle = queue.spawn_cleanup_task(shutdown_rx);
+
+        // Send shutdown signal
+        let _ = shutdown_tx.send(());
+
+        // Await the task handle with a safety timeout
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(
+            result.is_ok(),
+            "cleanup task must exit promptly upon shutdown signal"
+        );
     }
 }

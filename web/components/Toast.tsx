@@ -49,7 +49,7 @@ export function Toast({ message, type = 'error', onClose, duration = 6000 }: Toa
         position: 'fixed',
         bottom: '24px',
         right: '24px',
-        zIndex: 1000,
+        zIndex: 60,
         minWidth: '320px',
         maxWidth: '480px',
         backgroundColor: theme.bg,

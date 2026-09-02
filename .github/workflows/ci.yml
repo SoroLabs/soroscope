@@ -17,6 +17,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       (
+i
         github.head_ref == 'integrate-typepause' ||
         github.head_ref == 'unauthorized-admin' ||
         github.head_ref == 'admin-rotation' ||
@@ -28,9 +29,9 @@ jobs:
     steps:
       - run: echo "Skipping repo-wide Rust CI jobs for this branch."
 
-  # ------------------------------------------------------------------
+  # --------------------------------------------------------------------------
   # Job 0: Cargo Check (fast compile check for all targets)
-  # ------------------------------------------------------------------
+  # --------------------------------------------------------------------------
   check:
     if: >-
       github.event_name != 'pull_request' ||
@@ -48,6 +49,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
       - name: Ensure WASM target is installed
         run: rustup target add wasm32-unknown-unknown
       - name: Build liquidity_pool WASM
@@ -61,13 +64,14 @@ jobs:
       - name: Cargo Check
         run: cargo check --locked --all-targets
 
-  # ------------------------------------------------------------------
+  # --------------------------------------------------------------------------
   # Job 1: Formatter Check (Rust)
-  # ------------------------------------------------------------------
+  # --------------------------------------------------------------------------
   fmt:
     if: >-
       github.event_name != 'pull_request' ||
       (
+i
         github.head_ref != 'integrate-typepause' &&
         github.head_ref != 'unauthorized-admin' &&
         !contains(github.head_ref, 'staking-calculator') &&
@@ -81,16 +85,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
       - name: Check Formatting
         run: cargo fmt --all -- --check
 
-  # ------------------------------------------------------------------
+  # --------------------------------------------------------------------------
   # Job 2: Clippy (Linting)
-  # ------------------------------------------------------------------
+  # --------------------------------------------------------------------------
   clippy:
     if: >-
       github.event_name != 'pull_request' ||
       (
+i
         github.head_ref != 'integrate-typepause' &&
         github.head_ref != 'unauthorized-admin' &&
         github.head_ref != 'admin-rotation' &&
@@ -102,10 +109,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
+      - name: Install rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
       - name: Ensure WASM target is installed
         run: rustup target add wasm32-unknown-unknown
       - name: Install System Dependencies
@@ -121,9 +130,9 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-  # ------------------------------------------------------------------
+  # --------------------------------------------------------------------------
   # Job 3: Tests (Unit & Integration)
-  # ------------------------------------------------------------------
+  # --------------------------------------------------------------------------
   test:
     if: >-
       github.event_name != 'pull_request' ||
@@ -141,6 +150,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
       - name: Ensure WASM target is installed
         run: rustup target add wasm32-unknown-unknown
       - name: Install System Dependencies
@@ -156,14 +167,15 @@ jobs:
       - name: Run Tests
         run: cargo test --locked
 
-  # ------------------------------------------------------------------
+  # --------------------------------------------------------------------------
   # Job 4: Frontend (Lint & Typecheck)
-  # ------------------------------------------------------------------
+  # --------------------------------------------------------------------------
   frontend:
     name: Frontend Check
     if: >-
       github.event_name != 'pull_request' ||
       (
+i
         github.head_ref != 'integrate-typepause' &&
         github.head_ref != 'unauthorized-admin'
       )
@@ -186,4 +198,40 @@ jobs:
       - name: Run Unit Tests
         run: npm test
 
-
+  # --------------------------------------------------------------------------
+  # Job 5: E.E. End-to-End Tests (Playwright)
+  # --------------------------------------------------------------------------
+  e2e:
+    name: E.E. Tests
+    if: >-
+      github.event_name != 'pull_request' ||
+      (
+i
+        github.head_ref != 'integrate-typepause' &&
+        github.head_ref != 'unauthorized-admin'
+      )
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./web
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+      - name: Install Dependencies
+        run: npm ci
+      - name: Install Playwright Browsers
+        run: nx Playwright install --with-deps chromium
+      - name: Run E.E. Tests
+        run: npm run e2e
+      - name: Upload Playwright Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: web/playwright-report
+          retention-days: 7

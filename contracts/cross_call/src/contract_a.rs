@@ -16,15 +16,24 @@ pub enum DataKey {
 }
 
 fn lock(env: &Env) -> Result<(), Error> {
-    if env.storage().instance().get(&DataKey::ReentrancyLock).unwrap_or(false) {
+    if env
+        .storage()
+        .instance()
+        .get(&DataKey::ReentrancyLock)
+        .unwrap_or(false)
+    {
         return Err(Error::Reentrancy);
     }
-    env.storage().instance().set(&DataKey::ReentrancyLock, &true);
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyLock, &true);
     Ok(())
 }
 
 fn unlock(env: &Env) {
-    env.storage().instance().set(&DataKey::ReentrancyLock, &false);
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyLock, &false);
 }
 
 #[contract]

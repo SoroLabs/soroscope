@@ -72,7 +72,9 @@ impl EnglishAuction {
         env.storage()
             .instance()
             .set(&DataKey::ReservePrice, &reserve_price);
-        env.storage().instance().set(&DataKey::EndLedger, &end_ledger);
+        env.storage()
+            .instance()
+            .set(&DataKey::EndLedger, &end_ledger);
         env.storage()
             .instance()
             .set(&DataKey::EndTimestamp, &end_timestamp);
@@ -159,7 +161,9 @@ impl EnglishAuction {
             );
         }
 
-        env.storage().instance().set(&DataKey::HighestBidder, &bidder);
+        env.storage()
+            .instance()
+            .set(&DataKey::HighestBidder, &bidder);
         env.storage().instance().set(&DataKey::HighestBid, &amount);
 
         let mut bids: Vec<Bid> = env.storage().instance().get(&DataKey::Bids).unwrap();
@@ -217,11 +221,8 @@ impl EnglishAuction {
                 .instance()
                 .get(&DataKey::HighestBidder)
                 .unwrap();
-            let nft_contract: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::NftContract)
-                .unwrap();
+            let nft_contract: Address =
+                env.storage().instance().get(&DataKey::NftContract).unwrap();
             let token_id: i128 = env.storage().instance().get(&DataKey::TokenId).unwrap();
             let payment_token: Address = env
                 .storage()
@@ -280,11 +281,8 @@ impl EnglishAuction {
                 );
             }
             let seller: Address = env.storage().instance().get(&DataKey::Seller).unwrap();
-            let nft_contract: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::NftContract)
-                .unwrap();
+            let nft_contract: Address =
+                env.storage().instance().get(&DataKey::NftContract).unwrap();
             let token_id: i128 = env.storage().instance().get(&DataKey::TokenId).unwrap();
             env.invoke_contract::<()>(
                 &nft_contract,
@@ -318,7 +316,10 @@ impl EnglishAuction {
     }
 
     pub fn get_end_timestamp(env: Env) -> u64 {
-        env.storage().instance().get(&DataKey::EndTimestamp).unwrap()
+        env.storage()
+            .instance()
+            .get(&DataKey::EndTimestamp)
+            .unwrap()
     }
 }
 

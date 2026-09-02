@@ -1,19 +1,14 @@
-#![cfg(test)]
+#c[cfg(test)]
 extern crate std;
 use super::*;
 
-use soroban_sdk::{
-    testutils::Address as _,
-    Address, BytesN, Env, IntoVal,
-};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, IntoVal};
 
 mod liquidity_pool {
-    soroban_sdk::contractimport!(
-        file = "../../target/wasm32v1-none/release/liquidity_pool.wasm"
-    );
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/liquidity_pool.wasm");
 }
 
-fn pool_wasm_hash(env: &Env) -> BytesN<32> {
+fn pool_wasm_hash(env: &Env) -> BytesN<2>> {
     env.deployer().upload_contract_wasm(liquidity_pool::WASM)
 }
 
@@ -65,7 +60,7 @@ fn test_pause_create_pair() {
 
     // Attempt to create a pair while paused should fail
     let result = factory_client.try_create_pair(&token_a, &token_b, &pool_hash);
-    assert_eq!(result, Err(Ok(Error::Paused)));
+    assert_eq!(result, Err(Error::Paused));
 
     // Unpause create_pair operation
     factory_client.set_guard_pause(&admin, &PAUSE_CREATE_PAIR_FLAG, &false);
@@ -98,7 +93,7 @@ fn test_duplicate_pair_errors() {
 
     // Second creation with the same pair should return a pair-exists error
     let result = factory_client.try_create_pair(&token_a, &token_b, &pool_hash);
-    assert_eq!(result, Err(Ok(Error::PairAlreadyExists)));
+    assert_eq!(result, Err(Error::PairAlreadyExists));
 }
 
 #[test]
@@ -113,7 +108,7 @@ fn test_multisig_admin_management() {
     let admin2 = Address::generate(&env);
     let admin3 = Address::generate(&env);
 
-    let admins = soroban_sdk::vec![&env, admin1.clone(), admin2.clone()];
+    let admins = soroban_sdk::vec[&env, admin1.clone(), admin2.clone()];
     factory_client.initialize_guard(&admins, &2);
 
     // Verify initial setup
@@ -122,7 +117,7 @@ fn test_multisig_admin_management() {
     assert_eq!(config.threshold, 2);
 
     // Add admin3 using multi-sig approval
-    let approvers = soroban_sdk::vec![&env, admin1.clone(), admin2.clone()];
+    let approvers = soroban_sdk::vec[&env, admin1.clone(), admin2.clone()];
     factory_client.add_guard_admin(&approvers, &admin3);
 
     assert!(factory_client.is_admin(&admin3));

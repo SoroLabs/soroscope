@@ -1,23 +1,29 @@
 #![cfg(test)]
 extern crate std;
 
-use soroban_sdk::{testutils::Address as _, Address, Env};
 use crate::{ConcentratedAmm, ConcentratedAmmClient};
+use soroban_sdk::{testutils::Address as _, Address, Env};
 
 // 1.0 in Q64 fixed-point
 const Q64: u128 = 1u128 << 64;
 
 /// Registers two stellar asset contracts and returns (token_a_addr, token_b_addr,
 /// token_a_admin_client, token_b_admin_client).
-fn setup_tokens(e: &Env) -> (
+fn setup_tokens(
+    e: &Env,
+) -> (
     Address,
     Address,
     soroban_sdk::token::StellarAssetClient,
     soroban_sdk::token::StellarAssetClient,
 ) {
     let admin = Address::generate(e);
-    let token_a_addr = e.register_stellar_asset_contract_v2(admin.clone()).address();
-    let token_b_addr = e.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_a_addr = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b_addr = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let admin_a = soroban_sdk::token::StellarAssetClient::new(e, &token_a_addr);
     let admin_b = soroban_sdk::token::StellarAssetClient::new(e, &token_b_addr);
     (token_a_addr, token_b_addr, admin_a, admin_b)
@@ -154,7 +160,13 @@ fn test_mint_tick_below_min_tick() {
     admin_a.mint(&user, &1_000_000);
 
     // tick_lower below MIN_TICK — must fail with InvalidTickRange.
-    client.mint(&user, &-524_290i32, &-524_280i32, &100_000u128, &100_000u128);
+    client.mint(
+        &user,
+        &-524_290i32,
+        &-524_280i32,
+        &100_000u128,
+        &100_000u128,
+    );
 }
 
 #[test]
@@ -256,7 +268,8 @@ fn test_burn_recovers_tokens() {
     admin_a.mint(&user, &1_000_000);
     admin_b.mint(&user, &1_000_000);
 
-    let (liq, amt_a_in, amt_b_in) = client.mint(&user, &-100i32, &100i32, &100_000u128, &100_000u128);
+    let (liq, amt_a_in, amt_b_in) =
+        client.mint(&user, &-100i32, &100i32, &100_000u128, &100_000u128);
 
     let client_a = soroban_sdk::token::Client::new(&e, &token_a);
     let client_b = soroban_sdk::token::Client::new(&e, &token_b);
@@ -399,7 +412,10 @@ fn test_swap_crosses_tick() {
     assert!(amt_in > 0);
     assert!(amt_out > 0);
     // Trader paid token A and received token B.
-    assert!(client_b.balance(&trader) > bal_b_before, "trader should have received token B");
+    assert!(
+        client_b.balance(&trader) > bal_b_before,
+        "trader should have received token B"
+    );
     let _ = client_a.balance(&trader); // just access to ensure no panic
 }
 
@@ -429,7 +445,10 @@ fn test_collect_fees_after_swap() {
 
     // LP collects fees; should get some positive amount of at least one token.
     let (fee0, fee1) = client.collect_fees(&lp, &-500i32, &500i32);
-    assert!(fee0 > 0 || fee1 > 0, "LP should have earned fees from swaps");
+    assert!(
+        fee0 > 0 || fee1 > 0,
+        "LP should have earned fees from swaps"
+    );
 }
 
 #[test]
@@ -487,5 +506,8 @@ fn test_partial_burn() {
 
     // Burn the remainder.
     let (a2, b2) = client.burn(&lp, &-100i32, &100i32, &(liq - half));
-    assert!(a2 > 0 || b2 > 0, "remaining burn should also recover tokens");
+    assert!(
+        a2 > 0 || b2 > 0,
+        "remaining burn should also recover tokens"
+    );
 }

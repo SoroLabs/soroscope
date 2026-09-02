@@ -138,7 +138,7 @@ export function CopyButton({
         <div
           role="status"
           aria-live="polite"
-          className={`absolute z-50 pointer-events-none flex items-center gap-1.5 whitespace-nowrap rounded-md bg-slate-900 px-2.5 py-1 text-xs font-semibold text-emerald-400 shadow-lg ring-1 ring-emerald-500/30 transition-opacity animate-in fade-in duration-150 ${tooltipPositionClasses}`}
+          className={`absolute z-[60] pointer-events-none flex items-center gap-1.5 whitespace-nowrap rounded-md bg-slate-900 px-2.5 py-1 text-xs font-semibold text-emerald-400 shadow-lg ring-1 ring-emerald-500/30 transition-opacity animate-in fade-in duration-150 ${tooltipPositionClasses}`}
         >
           <Check size={12} className="text-emerald-400" />
           <span>{copiedLabel}</span>

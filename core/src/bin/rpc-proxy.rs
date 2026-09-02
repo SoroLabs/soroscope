@@ -13,10 +13,9 @@ struct Args {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 struct Config {
     max_gas_limit: u64,
-    min_gas_price: u64,
+    _min_gas_price: u64,
     blocked_addresses: HashSet<String>,
 }
 
@@ -24,7 +23,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             max_gas_limit: 30_000_000,
-            min_gas_price: 100,
+            _min_gas_price: 100,
             blocked_addresses: HashSet::new(),
         }
     }

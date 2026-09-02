@@ -81,9 +81,7 @@ mod tests {
         let _guard = span.enter();
 
         let message = TracedMessage::capture("event");
-        assert!(
-            message.carrier.is_empty() || message.carrier.contains_key("traceparent")
-        );
+        assert!(message.carrier.is_empty() || message.carrier.contains_key("traceparent"));
         assert_eq!(message.payload, "event");
     }
 }

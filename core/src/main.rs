@@ -1912,6 +1912,18 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
+async fn healthz() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
+    let providers_healthy = !state.provider_registry.healthy_providers().await.is_empty();
+    let db_healthy = state.fee_store.get_sample_count().await.is_ok();
+    
+    if providers_healthy && db_healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
 /// `/healthz` — Kubernetes liveness probe.
 ///
 /// Returns 200 OK as long as the process is running. No external dependency
@@ -2752,8 +2764,10 @@ async fn main() {
 
     // ── Graceful shutdown (#573: SIGTERM / SIGINT) ────────────────────
     // ── Spawn gRPC server on its dedicated port ──────────────────────────
+    // TLS is enabled automatically when GRPC_TLS_CERT / GRPC_TLS_KEY are set
+    // (Issue #918).
     tokio::spawn(async move {
-        grpc::serve(grpc_addr, grpc_bus).await;
+        grpc::serve_with_tls_from_env(grpc_addr, grpc_bus).await;
     });
 
     axum::serve(listener, app)

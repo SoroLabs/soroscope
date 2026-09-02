@@ -191,13 +191,17 @@ mod tests {
         };
 
         let sym = |s: &str| -> ScVal {
-            let string_m: StringM = s.as_bytes().to_vec().try_into().unwrap();
+            let string_m: StringM<32> = s.as_bytes().to_vec().try_into().unwrap();
             ScVal::Symbol(ScSymbol(string_m))
         };
 
-        let topics: VecM<ScVal> = vec![sym(topic0), sym("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"), sym(fn_name)]
-            .try_into()
-            .unwrap();
+        let topics: VecM<ScVal> = vec![
+            sym(topic0),
+            sym("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"),
+            sym(fn_name),
+        ]
+        .try_into()
+        .unwrap();
 
         let event = DiagnosticEvent {
             in_successful_contract_call: true,

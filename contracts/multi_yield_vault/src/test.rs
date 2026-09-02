@@ -1,6 +1,6 @@
 use crate::{MultiYieldVault, MultiYieldVaultClient};
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
 // ── Mock AMM pool ─────────────────────────────────────────────────────────────
 
@@ -32,11 +32,21 @@ impl MockPool {
         let total_lp: i128 = e.storage().instance().get(&MockKey::TotalLp).unwrap_or(0);
 
         let deposit_amount = amount_a.max(amount_b);
-        let lp = if total_lp == 0 { deposit_amount } else { deposit_amount };
+        let lp = if total_lp == 0 {
+            deposit_amount
+        } else {
+            deposit_amount
+        };
 
-        e.storage().instance().set(&MockKey::ReserveA, &(ra + amount_a));
-        e.storage().instance().set(&MockKey::ReserveB, &(rb + amount_b));
-        e.storage().instance().set(&MockKey::TotalLp, &(total_lp + lp));
+        e.storage()
+            .instance()
+            .set(&MockKey::ReserveA, &(ra + amount_a));
+        e.storage()
+            .instance()
+            .set(&MockKey::ReserveB, &(rb + amount_b));
+        e.storage()
+            .instance()
+            .set(&MockKey::TotalLp, &(total_lp + lp));
 
         let key = MockKey::LpBalance(to.clone());
         let cur: i128 = e.storage().persistent().get(&key).unwrap_or(0);
@@ -52,9 +62,15 @@ impl MockPool {
         let out_a = share_amount * ra / total_lp;
         let out_b = share_amount * rb / total_lp;
 
-        e.storage().instance().set(&MockKey::ReserveA, &(ra - out_a));
-        e.storage().instance().set(&MockKey::ReserveB, &(rb - out_b));
-        e.storage().instance().set(&MockKey::TotalLp, &(total_lp - share_amount));
+        e.storage()
+            .instance()
+            .set(&MockKey::ReserveA, &(ra - out_a));
+        e.storage()
+            .instance()
+            .set(&MockKey::ReserveB, &(rb - out_b));
+        e.storage()
+            .instance()
+            .set(&MockKey::TotalLp, &(total_lp - share_amount));
 
         let key = MockKey::LpBalance(to.clone());
         let cur: i128 = e.storage().persistent().get(&key).unwrap_or(0);
@@ -151,7 +167,7 @@ fn test_apr_estimation() {
     e.mock_all_auths();
     let (client, admin, _, _) = setup(&e);
 
-    let pool_low = register_mock_pool(&e, &admin, 10_000, 10);  // 10 bps fee
+    let pool_low = register_mock_pool(&e, &admin, 10_000, 10); // 10 bps fee
     let pool_high = register_mock_pool(&e, &admin, 10_000, 50); // 50 bps fee
 
     client.register_pool(&pool_low, &true);

@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: soroscope-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: always
+
+  soroban-rpc:
+    image: stellar/soroban-rpc:latest
+    container_name: soroscope-soroban-rpc
+    ports:
+      - "8000:8000"
+    restart: always
+    command: ["--network", "standalone"]
+
+  core-server:
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+    container_name: soroscope-core
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      soroban-rpc:
+        condition: service_started
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SOROBAN_RPC_URL=http://soroban-rpc:8000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: always
+
+  web-dashboard:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    container_name: soroscope-web
+    ports:
+      - "3000:3000"
+    depends_on:
+      core-server:
+        condition: service_healthy
+    restart: always

@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
 
 use emergency_guard::{DefaultEmergencyGuard, EmergencyGuard, EmergencyGuardTrait, PauseType};
 pub use soroscope_error_codes::ContractError;
@@ -27,9 +27,9 @@ pub struct StakingConfig {
     pub owner: Address,
     pub staking_token: Address,
     pub reward_token: Address,
-    pub initial_rate: Fixed,           // r0 — emission rate at epoch 0
-    pub epoch_decay_percent: Fixed,    // percentage reduction per epoch (e.g. 0.1 = 10%)
-    pub epoch_length: u32,             // blocks per epoch
+    pub initial_rate: Fixed,        // r0 — emission rate at epoch 0
+    pub epoch_decay_percent: Fixed, // percentage reduction per epoch (e.g. 0.1 = 10%)
+    pub epoch_length: u32,          // blocks per epoch
     pub start_block: u32,
     pub is_paused: bool,
 }
@@ -159,6 +159,39 @@ fn multiply_amount(amount: i128, multiplier: Fixed) -> Result<i128, ContractErro
     mul_div(amount, multiplier.0, SCALE).ok_or(ContractError::Overflow)
 }
 
+// ── Reward Index Computation ────────────────────────────────
+
+/// Computes the compounded reward for a staker from a compounding multiplier.
+///
+/// All arithmetic uses checked helpers so an unexpected state (e.g. a zero or
+/// corrupted staked balance) can never panic the host with a math underflow.
+/// If the resulting reward index would be negative the operation fails with
+/// `InvalidAmount` instead of silently proceeding.
+fn compute_reward_index(
+    staked_amount: i128,
+    accrued_rewards: i128,
+    multiplier: &Fixed,
+) -> Result<i128, ContractError> {
+    if staked_amount <= 0 || accrued_rewards < 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    // Virtual Balance V = S + R
+    let v_old = staked_amount
+        .checked_add(accrued_rewards)
+        .ok_or(ContractError::Overflow)?;
+
+    // V_new = v_old * multiplier (guarded multiply via mul_div)
+    let v_new = multiply_amount(v_old, *multiplier)?;
+
+    // R_new = V_new - S — guarded subtraction; never underflow panics.
+    let r_new = v_new
+        .checked_sub(staked_amount)
+        .ok_or(ContractError::InvalidAmount)?;
+
+    Ok(r_new)
+}
+
 // ── Epoch Helpers ─────────────────────────────────────────────
 
 fn epoch_for_block(start_block: u32, epoch_length: u32, block: u32) -> u32 {
@@ -188,7 +221,9 @@ fn compute_epoch_rate(
         return Err(ContractError::InvalidInput);
     }
     let decay_factor = fixed_pow_int(base, epoch)?;
-    initial_rate.mul(decay_factor).map_err(|_| ContractError::Overflow)
+    initial_rate
+        .mul(decay_factor)
+        .map_err(|_| ContractError::Overflow)
 }
 
 fn ensure_epoch_snapshots(
@@ -202,9 +237,16 @@ fn ensure_epoch_snapshots(
     while epoch <= up_to_epoch {
         let key = DataKey::EpochSnapshot(epoch);
         if !e.storage().instance().has(&key) {
-            let rate = compute_epoch_rate(&config.initial_rate, &config.epoch_decay_percent, epoch)?;
+            let rate =
+                compute_epoch_rate(&config.initial_rate, &config.epoch_decay_percent, epoch)?;
             let start = epoch_start_block(config.start_block, config.epoch_length, epoch);
-            e.storage().instance().set(&key, &EpochSnapshot { rate, start_block: start });
+            e.storage().instance().set(
+                &key,
+                &EpochSnapshot {
+                    rate,
+                    start_block: start,
+                },
+            );
         }
         epoch += 1;
     }
@@ -258,7 +300,9 @@ fn calculate_multiplier(
         if overlap_end > overlap_start {
             let blocks = (overlap_end - overlap_start) as i128;
             let blocks_fixed = Fixed::from_int(blocks).map_err(|_| ContractError::Overflow)?;
-            let exponent = rate.mul(blocks_fixed).map_err(|_| ContractError::Overflow)?;
+            let exponent = rate
+                .mul(blocks_fixed)
+                .map_err(|_| ContractError::Overflow)?;
             let factor = exponent.exp().map_err(|_| ContractError::Overflow)?;
             mult = mult.mul(factor).map_err(|_| ContractError::Overflow)?;
         }
@@ -316,7 +360,10 @@ impl StakingRewards {
         let rate0 = compute_epoch_rate(&config.initial_rate, &config.epoch_decay_percent, 0)?;
         e.storage().instance().set(
             &DataKey::EpochSnapshot(0),
-            &EpochSnapshot { rate: rate0, start_block },
+            &EpochSnapshot {
+                rate: rate0,
+                start_block,
+            },
         );
 
         e.storage().instance().set(&DataKey::Config, &config);
@@ -360,11 +407,17 @@ impl StakingRewards {
             .ok_or(ContractError::Overflow)?;
 
         // Update total staked
-        let mut total_staked: i128 = e.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        let mut total_staked: i128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
         total_staked = total_staked
             .checked_add(amount)
             .ok_or(ContractError::Overflow)?;
-        e.storage().instance().set(&DataKey::TotalStaked, &total_staked);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalStaked, &total_staked);
 
         e.storage()
             .persistent()
@@ -375,7 +428,7 @@ impl StakingRewards {
         e.storage().instance().extend_ttl(10000, 10000);
 
         e.events().publish(
-            (String::from_str(&e, "stake"), user.clone()),
+            (Symbol::new(&e, "stake"), user.clone()),
             StakeEvent { user, amount },
         );
 
@@ -407,11 +460,17 @@ impl StakingRewards {
             .ok_or(ContractError::Overflow)?;
 
         // Update total staked
-        let mut total_staked: i128 = e.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        let mut total_staked: i128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
         total_staked = total_staked
             .checked_sub(amount)
             .ok_or(ContractError::Overflow)?;
-        e.storage().instance().set(&DataKey::TotalStaked, &total_staked);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalStaked, &total_staked);
 
         if state.staked_amount == 0 && state.accrued_rewards == 0 {
             e.storage()
@@ -435,7 +494,7 @@ impl StakingRewards {
         );
 
         e.events().publish(
-            (String::from_str(&e, "withdraw"), user.clone()),
+            (Symbol::new(&e, "withdraw"), user.clone()),
             WithdrawEvent { user, amount },
         );
 
@@ -486,7 +545,7 @@ impl StakingRewards {
         );
 
         e.events().publish(
-            (String::from_str(&e, "claim"), user.clone()),
+            (Symbol::new(&e, "claim"), user.clone()),
             ClaimEvent {
                 user,
                 amount: reward_amount,
@@ -512,7 +571,11 @@ impl StakingRewards {
         let staked_amount = state.staked_amount;
 
         // Update total staked
-        let mut total_staked: i128 = e.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        let mut total_staked: i128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
         total_staked = total_staked
             .checked_sub(staked_amount)
             .ok_or(ContractError::Overflow)?;
@@ -525,7 +588,11 @@ impl StakingRewards {
         }
 
         // Calculate emergency unbonding penalty fee if configured
-        let penalty_fee_bps: u32 = e.storage().instance().get(&DataKey::PenaltyFeeBps).unwrap_or(0);
+        let penalty_fee_bps: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::PenaltyFeeBps)
+            .unwrap_or(0);
         let penalty = (staked_amount as u128 * penalty_fee_bps as u128 / 10000) as i128;
         let payout = staked_amount - penalty;
 
@@ -543,7 +610,7 @@ impl StakingRewards {
         }
 
         e.events().publish(
-            (String::from_str(&e, "emergency_withdraw"), user.clone()),
+            (Symbol::new(&e, "emergency_withdraw"), user.clone()),
             EmergencyWithdrawEvent {
                 user,
                 amount: payout,
@@ -562,13 +629,18 @@ impl StakingRewards {
             return Err(ContractError::InvalidInput);
         }
 
-        e.storage().instance().set(&DataKey::PenaltyFeeBps, &fee_bps);
+        e.storage()
+            .instance()
+            .set(&DataKey::PenaltyFeeBps, &fee_bps);
         Ok(())
     }
 
     /// Gets emergency unbonding penalty fee in basis points.
     pub fn get_penalty_fee(e: Env) -> u32 {
-        e.storage().instance().get(&DataKey::PenaltyFeeBps).unwrap_or(0)
+        e.storage()
+            .instance()
+            .get(&DataKey::PenaltyFeeBps)
+            .unwrap_or(0)
     }
 
     /// Pause staking operations (admin only).
@@ -580,7 +652,7 @@ impl StakingRewards {
             .map_err(|_| ContractError::Paused)?;
 
         e.events().publish(
-            (String::from_str(&e, "pause_staking"),),
+            (Symbol::new(&e, "pause_staking"),),
             PausedEvent { paused: true },
         );
 
@@ -596,7 +668,7 @@ impl StakingRewards {
             .map_err(|_| ContractError::Paused)?;
 
         e.events().publish(
-            (String::from_str(&e, "resume_staking"),),
+            (Symbol::new(&e, "resume_staking"),),
             PausedEvent { paused: false },
         );
 
@@ -609,7 +681,7 @@ impl StakingRewards {
             .map_err(|_| ContractError::Paused)?;
 
         e.events().publish(
-            (String::from_str(&e, "emergency_pause_all"),),
+            (Symbol::new(&e, "emergency_pause_all"),),
             PausedEvent { paused: true },
         );
 
@@ -621,7 +693,7 @@ impl StakingRewards {
         DefaultEmergencyGuard::resume_all(&e, approvers).map_err(|_| ContractError::Paused)?;
 
         e.events().publish(
-            (String::from_str(&e, "resume_all"),),
+            (Symbol::new(&e, "resume_all"),),
             PausedEvent { paused: false },
         );
 
@@ -735,18 +807,14 @@ impl StakingRewards {
         if state.staked_amount > 0 && t_curr > state.last_update_block {
             // Time-based reward calculation: V_new = V_old * multiplier, where
             // multiplier = exp(integral of reward rate over time). Rewards are
-            // computed as R_new = V_new - staked_amount to avoid rounding errors.
+            // computed as R_new = V_new - staked_amount. Uses checked math so a
+            // zero-stake edge case can never trigger a subtraction-underflow panic.
             let multiplier_res = calculate_multiplier(&e, &config, state.last_update_block, t_curr);
             if let Ok(multiplier) = multiplier_res {
-                let v_old_res = state.staked_amount.checked_add(state.accrued_rewards);
-                if let Some(v_old) = v_old_res {
-                    let v_new_res = multiply_amount(v_old, multiplier);
-                    if let Ok(v_new) = v_new_res {
-                        let r_new_res = v_new.checked_sub(state.staked_amount);
-                        if let Some(r_new) = r_new_res {
-                            return r_new;
-                        }
-                    }
+                if let Ok(r_new) =
+                    compute_reward_index(state.staked_amount, state.accrued_rewards, &multiplier)
+                {
+                    return r_new;
                 }
             }
         }
@@ -785,24 +853,12 @@ impl StakingRewards {
         if state.staked_amount > 0 && t_curr > state.last_update_block {
             // Time-based reward calculation: V_new = V_old * multiplier, where
             // multiplier = exp(integral of reward rate over time). Rewards are
-            // computed as R_new = V_new - staked_amount to avoid rounding errors.
-            let multiplier = calculate_multiplier(e, config, state.last_update_block, t_curr)?;
-
-            // Virtual Balance V = S + R
-            let v_old = state
-                .staked_amount
-                .checked_add(state.accrued_rewards)
-                .ok_or(ContractError::Overflow)?;
-
-            // V_new = v_old * multiplier
-            let v_new = multiply_amount(v_old, multiplier)?;
-
-            // R_new = V_new - S
-            let r_new = v_new
-                .checked_sub(state.staked_amount)
-                .ok_or(ContractError::Overflow)?;
-
-            state.accrued_rewards = r_new;
+            // computed as R_new = V_new - staked_amount. The reward index is
+            // computed with checked math only — a zero or underflowing balance
+            // can never cause a subtraction-underflow panic.
+            let multiplier = calculate_multiplier(&e, &config, state.last_update_block, t_curr)?;
+            state.accrued_rewards =
+                compute_reward_index(state.staked_amount, state.accrued_rewards, &multiplier)?;
         }
 
         state.last_update_block = t_curr.max(config.start_block);

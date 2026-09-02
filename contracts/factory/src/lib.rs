@@ -4,8 +4,8 @@ use emergency_guard::{
     DefaultEmergencyGuard, EmergencyGuard, EmergencyGuardTrait, GuardDataKey, GuardError, PauseType,
 };
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env,
-    IntoVal, Vec,
+    contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, IntoVal,
+    Vec,
 };
 
 #[cfg(test)]
@@ -131,7 +131,11 @@ impl DefaultEmergencyGuard {
         Ok(())
     }
 
-    pub fn add_admin(env: &Env, approvers: Vec<Address>, new_admin: Address) -> Result<(), GuardError> {
+    pub fn add_admin(
+        env: &Env,
+        approvers: Vec<Address>,
+        new_admin: Address,
+    ) -> Result<(), GuardError> {
         EmergencyGuard::validate_multi_sig(env.clone(), approvers.clone())?;
 
         let mut admins = Self::get_admins(env);
@@ -143,7 +147,11 @@ impl DefaultEmergencyGuard {
         Ok(())
     }
 
-    pub fn remove_admin(env: &Env, approvers: Vec<Address>, admin: Address) -> Result<(), GuardError> {
+    pub fn remove_admin(
+        env: &Env,
+        approvers: Vec<Address>,
+        admin: Address,
+    ) -> Result<(), GuardError> {
         EmergencyGuard::validate_multi_sig(env.clone(), approvers.clone())?;
 
         let admins = Self::get_admins(env);
@@ -167,7 +175,9 @@ impl DefaultEmergencyGuard {
             return Err(GuardError::AdminNotFound);
         }
 
-        env.storage().instance().set(&GuardDataKey::Admins, &new_admins);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Admins, &new_admins);
         Ok(())
     }
 
@@ -202,7 +212,9 @@ impl DefaultEmergencyGuard {
             return Err(GuardError::InvalidThreshold);
         }
 
-        env.storage().instance().set(&GuardDataKey::Admins, &new_admins);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Admins, &new_admins);
         Ok(())
     }
 
@@ -248,6 +260,9 @@ pub enum Error {
 pub enum DataKey {
     Admin,
     Pair(Address, Address),
+    Instance(Address),
+    Creator(Address),
+    AllInstances,
 }
 
 #[contracttype]
@@ -255,6 +270,13 @@ pub enum DataKey {
 pub struct MultisigConfig {
     pub admins: Vec<Address>,
     pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstanceRecord {
+    pub creator: Address,
+    pub created_at: u64,
 }
 
 fn map_guard_err(err: GuardError) -> Error {
@@ -466,6 +488,12 @@ impl LiquidityPoolFactory {
             .instance()
             .set(&DataKey::Pair(token_0, token_1), &deployed_address);
 
+        Self::register_instance(
+            env.clone(),
+            deployed_address.clone(),
+            env.current_contract_address(),
+        )?;
+
         Ok(deployed_address)
     }
 
@@ -476,7 +504,9 @@ impl LiquidityPoolFactory {
             (token_b, token_a)
         };
 
-        env.storage().instance().get(&DataKey::Pair(token_0, token_1))
+        env.storage()
+            .instance()
+            .get(&DataKey::Pair(token_0, token_1))
     }
 
     pub fn get_multisig_config(env: Env) -> MultisigConfig {

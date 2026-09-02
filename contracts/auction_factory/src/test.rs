@@ -10,7 +10,25 @@
 
 use super::*;
 use emergency_guard::GuardError;
-use soroban_sdk::{testutils::Address as _, vec, Address, Env};
+use soroban_sdk::{testutils::Address as _, token, vec, Address, BytesN, Env};
+
+mod english_auction {
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/english_auction.wasm");
+}
+
+mod dutch_auction {
+    soroban_sdk::contractimport!(
+        file = "../../target/wasm32v1-none/release/soroban_dutch_auction_contract.wasm"
+    );
+}
+
+fn english_wasm_hash(env: &Env) -> BytesN<32> {
+    env.deployer().upload_contract_wasm(english_auction::WASM)
+}
+
+fn dutch_wasm_hash(env: &Env) -> BytesN<32> {
+    env.deployer().upload_contract_wasm(dutch_auction::WASM)
+}
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -87,6 +105,91 @@ fn test_initialize_cannot_be_called_twice() {
     let dummy = vec![&env, Address::generate(&env)];
     let result = client.try_initialize(&dummy, &1);
     assert_eq!(result, Err(Ok(GuardError::AlreadyInitialized)));
+}
+
+#[test]
+fn test_factory_deploys_auctions_collects_fees_and_indexes_them() {
+    let (env, client, admins) = setup(1, 1);
+    let seller = Address::generate(&env);
+    let fee_recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let fee_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let nft_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    token::StellarAssetClient::new(&env, &fee_token).mint(&seller, &100);
+    token::StellarAssetClient::new(&env, &nft_token).mint(&seller, &1);
+    client.configure_deployment_fee(&admins, &fee_token, &fee_recipient, &50);
+
+    let english = client.create_english_auction(
+        &seller,
+        &nft_token,
+        &1,
+        &fee_token,
+        &100,
+        &200,
+        &10,
+        &english_wasm_hash(&env),
+    );
+    let dutch = client.create_dutch_auction(
+        &seller,
+        &nft_token,
+        &1,
+        &fee_token,
+        &200,
+        &100,
+        &10,
+        &dutch_wasm_hash(&env),
+    );
+
+    assert_eq!(
+        english_auction::Client::new(&env, &english).get_seller(),
+        seller
+    );
+    assert_eq!(dutch_auction::Client::new(&env, &dutch).is_sold(), false);
+    assert_eq!(token::Client::new(&env, &fee_token).balance(&seller), 0);
+    assert_eq!(
+        token::Client::new(&env, &fee_token).balance(&fee_recipient),
+        100
+    );
+    assert_eq!(client.get_auction_count(), 2);
+    assert_eq!(client.get_auction_by_index(&0), Some(english.clone()));
+    assert_eq!(client.get_auction_by_index(&1), Some(dutch.clone()));
+    assert_eq!(
+        client.get_auction_type(&english),
+        Some(AuctionType::English)
+    );
+    assert_eq!(client.get_auction_type(&dutch), Some(AuctionType::Dutch));
+    assert_eq!(client.get_auctions(&0, &10), vec![&env, english, dutch]);
+}
+
+#[test]
+fn test_factory_rejects_deployment_without_fee_configuration() {
+    let (env, client, _admins) = setup(1, 1);
+    let seller = Address::generate(&env);
+    let contract = Address::generate(&env);
+    let zero_hash = BytesN::from_array(&env, &[0; 32]);
+
+    let result = client.try_create_dutch_auction(
+        &seller, &contract, &1, &contract, &200, &100, &10, &zero_hash,
+    );
+
+    assert_eq!(result, Err(Ok(FactoryError::FeeNotConfigured)));
+}
+
+#[test]
+fn test_factory_rejects_non_positive_deployment_fee() {
+    let (env, client, admins) = setup(1, 1);
+    let token = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    assert_eq!(
+        client.try_configure_deployment_fee(&admins, &token, &recipient, &0),
+        Err(Ok(FactoryError::InvalidFee))
+    );
 }
 
 // ── rotate_admin: happy path ─────────────────────────────────────────────────

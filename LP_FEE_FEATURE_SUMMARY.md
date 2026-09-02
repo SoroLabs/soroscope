@@ -53,6 +53,11 @@ Implement a configurable liquidity deposit/withdrawal fee (default 5 bps / 0.05%
   2. `feature(amm-deposit-fee): Add implementation status and next steps` - Status document
 - **Status**: Ready for code integration and PR
 
+#### 4. **Mobile Viewport Overflow Fix**
+- Added `max-w-full overflow-x-auto` to resource data table containers
+- Wrapped responsive flex grids with proper breakpoint utility classes
+- Tested layout at 375px mobile breakpoint: zero horizontal body scrollbar
+
 ### ⚠️ In Progress / Remaining
 
 #### Code Integration

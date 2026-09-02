@@ -10,7 +10,7 @@ pub struct EventWorkerPool {
 
 impl EventWorkerPool {
     /// Initializes a new dedicated Tokio runtime for event processing.
-    /// 
+    ///
     /// # Arguments
     /// * `worker_threads` - The number of OS threads to allocate to this pool.
     pub fn new(worker_threads: usize) -> std::io::Result<Self> {
@@ -48,12 +48,14 @@ impl EventWorkerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn test_worker_pool_initialization() {
         let pool_result = EventWorkerPool::new(2);
-        assert!(pool_result.is_ok(), "Worker pool should initialize successfully");
+        assert!(
+            pool_result.is_ok(),
+            "Worker pool should initialize successfully"
+        );
     }
 
     #[test]
@@ -61,13 +63,14 @@ mod tests {
         let pool = EventWorkerPool::new(2).expect("Failed to create worker pool");
 
         let result = pool.runtime.block_on(async {
-            let handle = pool.spawn(async {
-                100 + 42
-            });
+            let handle = pool.spawn(async { 100 + 42 });
             handle.await.unwrap()
         });
 
-        assert_eq!(result, 142, "Async task should execute and return correctly");
+        assert_eq!(
+            result, 142,
+            "Async task should execute and return correctly"
+        );
     }
 
     #[test]
@@ -86,6 +89,9 @@ mod tests {
             handle.await.unwrap()
         });
 
-        assert_eq!(result, 500500, "Blocking CPU task should compute correctly off-thread");
+        assert_eq!(
+            result, 500500,
+            "Blocking CPU task should compute correctly off-thread"
+        );
     }
 }

@@ -57,4 +57,7 @@ pub enum DataKey {
     Config,
     HasVoted(u32, Address), // proposal_id, voter -> has_voted
     SecurityCouncil, // Security Council address for veto power
+    Voters,
+    VotingPowerSnapshot(u32, Address),
+    TotalVotingPowerSnapshot(u32),
 }

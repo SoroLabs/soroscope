@@ -8,12 +8,12 @@
 use crate::contract_registry::{verify_bytecode, ContractBytecodeSource, ContractRegister};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use thiserror::Error;
-use reqwest::{Client, StatusCode};
 use tokio::{
     sync::{mpsc, RwLock},
     task::JoinHandle,
@@ -463,12 +463,7 @@ mod tests {
 
     #[test]
     fn rejects_weak_subscription_configuration() {
-        let result = ContractSubscription::new(
-            "",
-            Vec::new(),
-            "https://example.com",
-            "short",
-        );
+        let result = ContractSubscription::new("", Vec::new(), "https://example.com", "short");
         assert!(matches!(result, Err(WebhookError::InvalidSubscription(_))));
     }
 

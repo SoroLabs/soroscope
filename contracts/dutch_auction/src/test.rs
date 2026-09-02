@@ -60,3 +60,56 @@ fn test_dutch_auction() {
     assert_eq!(payment_client.balance(&seller), 150);
     assert_eq!(auction_client.is_sold(), true);
 }
+
+#[test]
+fn test_dutch_auction_30_day_duration_saturates_at_floor() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+
+    let nft_contract_id = env.register(token_contract::Token, ());
+    let nft_client = TokenClient::new(&env, &nft_contract_id);
+    nft_client.initialize(&seller, &0, &"NFT".into_val(&env), &"NFT".into_val(&env));
+    nft_client.mint(&seller, &1);
+
+    let payment_contract_id = env.register(token_contract::Token, ());
+    let payment_client = TokenClient::new(&env, &payment_contract_id);
+    payment_client.initialize(&seller, &7, &"USD".into_val(&env), &"USD".into_val(&env));
+    payment_client.mint(&buyer, &1000);
+
+    let auction_contract_id = env.register(DutchAuction, ());
+    let auction_client = DutchAuctionClient::new(&env, &auction_contract_id);
+
+    nft_client.approve(&seller, &auction_contract_id, &1, &1000);
+    nft_client.transfer(&seller, &auction_contract_id, &1);
+
+    let duration_ledgers: u32 = 30 * 24 * 60 * 60;
+    let start_price = i128::MAX / 2;
+    let end_price = 0_i128;
+    auction_client.initialize(
+        &seller,
+        &nft_contract_id,
+        &1,
+        &payment_contract_id,
+        &start_price,
+        &end_price,
+        &duration_ledgers,
+    );
+
+    env.ledger().set(LedgerInfo {
+        timestamp: 1_000_000,
+        protocol_version: 1,
+        sequence_number: duration_ledgers + 10,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 10,
+        min_persistent_entry_ttl: 10,
+        max_entry_ttl: 3110400,
+    });
+
+    assert_eq!(auction_client.get_current_price(), end_price);
+    assert_eq!(auction_client.is_sold(), false);
+    assert_eq!(payment_client.balance(&buyer), 1000);
+}

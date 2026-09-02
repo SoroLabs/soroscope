@@ -970,6 +970,54 @@ struct ResourceCost {
     cpu_insns: String,
     mem_bytes: String,
 }
+
+#[allow(dead_code)]
+/// Extracts Soroban host budget limits from CLI log output.
+///
+/// Soroban CLI v21 changed the budget line from the legacy
+/// `budget: instructions: <cpu>, memory: <mem>` format to
+/// `budget: cpu: <cpu>, mem: <mem>`. Some RPC cost logs use
+/// `cost: cpu_insns: <cpu>, mem_bytes: <mem>` as well. This parser
+/// accepts all three formats and returns `(cpu_instructions, ram_bytes)`.
+fn extract_soroban_budget_limits(log: &str) -> Option<(u64, u64)> {
+    let budget_line = log.lines().find(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("budget") || lower.contains("cpu_insns") || lower.contains("mem_bytes")
+    })?;
+
+    let cpu_patterns = [
+        r"\binstructions\b[^\d]*(\d+)",
+        r"\bcpu\b[^\d]*(\d+)",
+        r"\bcpu_insns\b[^\d]*(\d+)",
+    ];
+    let mem_patterns = [
+        r"\bmemory\b[^\d]*(\d+)",
+        r"\bmem\b[^\d]*(\d+)",
+        r"\bmem_bytes\b[^\d]*(\d+)",
+    ];
+
+    let cpu = cpu_patterns.iter().find_map(|pattern| {
+        regex::Regex::new(pattern)
+            .ok()?
+            .captures(budget_line)?
+            .get(1)?
+            .as_str()
+            .parse()
+            .ok()
+    })?;
+    let mem = mem_patterns.iter().find_map(|pattern| {
+        regex::Regex::new(pattern)
+            .ok()?
+            .captures(budget_line)?
+            .get(1)?
+            .as_str()
+            .parse()
+            .ok()
+    })?;
+
+    Some((cpu, mem))
+}
+
 // ── Multi-account authorization ───────────────────────────────────────────────
 
 /// Represents one signer in a multi-account authorization scenario.
@@ -1896,9 +1944,9 @@ impl SimulationEngine {
             seq_num: SequenceNumber(0),
             cond: Preconditions::None,
             memo: Memo::None,
-            operations: vec![operation]
-                .try_into()
-                .map_err(|_| SimulationError::XdrError("Failed to create operations".to_string()))?,
+            operations: vec![operation].try_into().map_err(|_| {
+                SimulationError::XdrError("Failed to create operations".to_string())
+            })?,
             ext: TransactionExt::V1(soroban_data),
         };
 
@@ -3082,11 +3130,9 @@ impl SimulationEngine {
             .map_err(|e| SimulationError::XdrError(format!("Encode invocation: {e}")))?;
         let nonce_input = [&public_key[..], &invocation_xdr[..]].concat();
         let nonce_hash = Sha256::digest(&nonce_input);
-        let nonce = i64::from_be_bytes(
-            nonce_hash[..8]
-                .try_into()
-                .map_err(|_| SimulationError::XdrError("Failed to derive nonce from hash".to_string()))?,
-        );
+        let nonce = i64::from_be_bytes(nonce_hash[..8].try_into().map_err(|_| {
+            SimulationError::XdrError("Failed to derive nonce from hash".to_string())
+        })?);
 
         // 3. Compute the network id
         let network_id: [u8; 32] = Sha256::digest(network_passphrase.as_bytes()).into();
@@ -3825,6 +3871,38 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_soroban_budget_limits_v21_format() {
+        let log = "INFO soroban_cli: budget: cpu: 100000, mem: 2048";
+        assert_eq!(extract_soroban_budget_limits(log), Some((100000, 2048)));
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_legacy_format() {
+        let log = "budget: instructions: 500000, memory: 4096";
+        assert_eq!(extract_soroban_budget_limits(log), Some((500000, 4096)));
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_rpc_cost_format() {
+        let log = "cost: cpu_insns: 123, mem_bytes: 456";
+        assert_eq!(extract_soroban_budget_limits(log), Some((123, 456)));
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_reversed_legacy_order() {
+        let log = "budget: memory: 100, instructions: 200";
+        assert_eq!(extract_soroban_budget_limits(log), Some((200, 100)));
+    }
+
+    #[test]
+    fn test_extract_soroban_budget_limits_missing_values_returns_none() {
+        assert_eq!(
+            extract_soroban_budget_limits("budget: cpu: 123"),
+            None
+        );
+    }
+
+    #[test]
     fn test_estimate_scval_size_primitives() {
         use soroban_sdk::xdr::ScVal;
         let engine = SimulationEngine::new("https://test.com".to_string());
@@ -4524,4 +4602,90 @@ mod tests {
         let count = result.unwrap().get_payload() >> 8;
         assert!(count > 0, "counter should be > 0, got {count}");
     }
+
+    #[test]
+    fn test_extract_soroban_budget_from_logs_v21_and_legacy() {
+        // v21+ format
+        let v21_logs = "INFO soroban_cli::run: Budget: cpu: 1234567, mem: 987654";
+        let parsed_v21 = extract_soroban_budget_from_logs(v21_logs);
+        assert_eq!(parsed_v21.cpu_instructions, 1234567);
+        assert_eq!(parsed_v21.memory_bytes, 987654);
+
+        // Legacy format
+        let legacy_logs = "Budget report:\nCpuCost: 500000\nMemCost: 250000";
+        let parsed_legacy = extract_soroban_budget_from_logs(legacy_logs);
+        assert_eq!(parsed_legacy.cpu_instructions, 500000);
+        assert_eq!(parsed_legacy.memory_bytes, 250000);
+    }
 }
+
+/// Parsed host budget consumption (CPU instructions, memory bytes) extracted from Soroban CLI log output.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExtractedSorobanBudget {
+    pub cpu_instructions: u64,
+    pub memory_bytes: u64,
+}
+
+/// Extract Soroban host budget limits from log output strings.
+/// Supports Soroban CLI v21+ format changes with fallbacks for legacy log output formats.
+pub fn extract_soroban_budget_from_logs(logs: &str) -> ExtractedSorobanBudget {
+    let mut result = ExtractedSorobanBudget::default();
+
+    for line in logs.lines() {
+        let line_lower = line.to_lowercase();
+
+        if line_lower.contains("cpu") || line_lower.contains("mem") || line_lower.contains("budget") {
+            if let Some(idx) = line_lower.find("cpu:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 4..]) {
+                    result.cpu_instructions = val;
+                }
+            } else if let Some(idx) = line_lower.find("cpu_instructions:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 17..]) {
+                    result.cpu_instructions = val;
+                }
+            } else if let Some(idx) = line_lower.find("cpu cost:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 9..]) {
+                    result.cpu_instructions = val;
+                }
+            } else if let Some(idx) = line_lower.find("cpucost:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 8..]) {
+                    result.cpu_instructions = val;
+                }
+            } else if let Some(idx) = line_lower.find("cpuinvocations:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 15..]) {
+                    result.cpu_instructions = val;
+                }
+            }
+
+            if let Some(idx) = line_lower.find("mem:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 4..]) {
+                    result.memory_bytes = val;
+                }
+            } else if let Some(idx) = line_lower.find("memory_bytes:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 13..]) {
+                    result.memory_bytes = val;
+                }
+            } else if let Some(idx) = line_lower.find("mem cost:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 9..]) {
+                    result.memory_bytes = val;
+                }
+            } else if let Some(idx) = line_lower.find("memcost:") {
+                if let Some(val) = parse_trailing_number(&line[idx + 8..]) {
+                    result.memory_bytes = val;
+                }
+            }
+        }
+    }
+
+    result
+}
+
+fn parse_trailing_number(s: &str) -> Option<u64> {
+    let digits: String = s
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+

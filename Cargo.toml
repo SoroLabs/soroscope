@@ -1,25 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "contracts/cpu_heavy",
-    "contracts/crucible-example-gasless",
-    "contracts/error_codes",
-    "contracts/liquidity_pool",
-    "contracts/flash_loan_vault",
-    "contracts/math",
-    "contracts/proxy",
-    "contracts/staking_rewards",
-    "contracts/oracle_aggregator",
     "contracts/*",
-    "contracts/governance",
-    "contracts/batch_transfer",
-    "contracts/cross_call",
-    "contracts/concentrated_amm",
-    "contracts/did_registry",
-    "core",
 ]
-
-    "contracts/*",
 
 [workspace.dependencies]
 soroban-sdk = "22.0.0"
+ed25519-dalek = "=2.2.0"

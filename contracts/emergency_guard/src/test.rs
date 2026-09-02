@@ -141,6 +141,9 @@ fn test_initialize_stores_guardian() {
     let guardians: Vec<Address> = client.get_guardians().iter().collect();
     assert_eq!(guardians.len(), 1);
     assert!(guardians.contains(&guardian));
+}
+
+#[test]
 fn test_initialize_with_distinct_guardians_and_admins() {
     let env = Env::default();
     env.mock_all_auths();
@@ -657,4 +660,14 @@ fn test_full_admin_rotation_add_then_remove_old() {
     assert_eq!(stored.len(), 3);
     assert!(!stored.contains(&admins[2]));
     assert!(stored.contains(&new_admin));
+}
+
+#[test]
+fn test_unpause_requires_admin() {
+    let (env, _client, _admins) = setup(1, 2);
+    let outsider = Address::generate(&env);
+
+    // Call DefaultEmergencyGuard::unpause
+    let result = DefaultEmergencyGuard::unpause(&env, outsider.clone(), PauseType::SWAP);
+    assert_eq!(result, Err(GuardError::Unauthorized));
 }

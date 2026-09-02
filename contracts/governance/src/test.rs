@@ -296,3 +296,29 @@ fn test_set_and_get_security_council() {
     let retrieved = client.get_security_council();
     assert_eq!(retrieved, Some(security_council));
 }
+
+#[test]
+fn transferred_voting_units_cannot_be_used_to_double_vote() {
+    let (env, contract_id, _admin, voter_a, voter_b) = setup(true);
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    client.register_voter(&voter_a, &25, &make_identity(&env, 10));
+    client.register_voter(&voter_b, &10, &make_identity(&env, 11));
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = 30;
+    });
+
+    let proposal = client.create_proposal(
+        &String::from_str(&env, "Prevent double voting"),
+        &String::from_str(&env, "Voting units are snapshotted at proposal creation"),
+        &90,
+    );
+
+    client.cast_vote(&proposal.id, &voter_a, &true, &9);
+
+    // Transferring units after the proposal must not increase B's voting power for it.
+    client.transfer_voting_units(&voter_a, &voter_b, &10);
+
+    let err = client.try_cast_vote(&proposal.id, &voter_b, &true, &11);
+    assert_eq!(err, Err(Ok(Error::InsufficientVotingUnits)));
+}

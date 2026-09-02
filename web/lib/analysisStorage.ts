@@ -8,8 +8,62 @@
 
 import type { InvocationResult } from './sorobantypes';
 import { getEncryptedLocalStorage } from './encryptedStorage';
+import {
+  sanitizePlainText,
+  sanitizeMermaidDefinition,
+  stripControlChars,
+} from './security';
 
 const LATEST_ANALYSIS_KEY = 'soroscope-latest-analysis';
+
+const MAX_FUNCTION_NAME_LENGTH = 64;
+const MAX_RESULT_FIELD_LENGTH = 1_000_000;
+
+/**
+ * Sanitize an untrusted object (e.g. restored from localStorage, which any
+ * attacker can edit) into a render-safe InvocationResult. Immutable string
+ * fields are length-capped and control-char-stripped; the mermaid definition —
+ * the only field rendered through raw innerHTML downstream — is bounded so a
+ * tampered graph cannot be used for a stored-XSS payload.
+ */
+export function sanitizeRestoredResult(parsed: unknown): InvocationResult | null {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const result = parsed as Record<string, unknown>;
+
+  if (typeof result.id !== 'string' || result.id.length === 0) return null;
+
+  const functionName = sanitizePlainText(result.functionName, MAX_FUNCTION_NAME_LENGTH);
+  if (!functionName) return null;
+
+  return {
+    ...result,
+    id: stripControlChars(result.id).slice(0, 128),
+    functionName,
+    error: typeof result.error === 'string' ? sanitizePlainText(result.error, MAX_RESULT_FIELD_LENGTH) : result.error,
+    errorType: typeof result.errorType === 'string' ? sanitizePlainText(result.errorType, 256) : result.errorType,
+    callGraphMermaid:
+      typeof result.callGraphMermaid === 'string'
+        ? sanitizeMermaidDefinition(result.callGraphMermaid)
+        : result.callGraphMermaid,
+    inputs:
+      result.inputs && typeof result.inputs === 'object'
+        ? sanitizeRestoredInputs(result.inputs)
+        : result.inputs,
+  } as InvocationResult;
+}
+
+function sanitizeRestoredInputs(inputs: Record<string, unknown>): Record<string, unknown> {
+  const sanitized: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(inputs)) {
+    const key = stripControlChars(name).slice(0, 128);
+    if (typeof value === 'string') {
+      sanitized[key] = sanitizePlainText(value, MAX_RESULT_FIELD_LENGTH);
+    } else {
+      sanitized[key] = value;
+    }
+  }
+  return sanitized;
+}
 
 /**
  * Check if we're running in a browser environment.
@@ -56,14 +110,16 @@ export async function loadLatestAnalysis(): Promise<InvocationResult | null> {
     }
 
     const parsed = JSON.parse(stored) as InvocationResult;
-    
-    // Basic validation to ensure the stored data has the expected shape
-    if (!parsed || typeof parsed !== 'object' || !parsed.id || !parsed.functionName) {
+
+    // Validate and sanitize the stored data — localStorage is user-editable, so
+    // restored content is treated as untrusted before it is re-rendered.
+    const sanitized = sanitizeRestoredResult(parsed);
+    if (!sanitized) {
       console.warn('Invalid analysis result in storage, ignoring');
       return null;
     }
 
-    return parsed;
+    return sanitized;
   } catch (error) {
     // Handle malformed JSON or other parsing errors gracefully
     console.warn('Failed to load latest analysis from local storage:', error);

@@ -10,6 +10,11 @@ pub struct Fixed(pub i128);
 pub const SCALE: i128 = 1_000_000_000_000_000_000; // 18 decimals
 pub const LN2: i128 = 693_147_180_559_945_309; // ln(2) * SCALE
 
+/// WAD — 10^18, the standard 18-decimal fixed-point unit (same as `SCALE`).
+pub const WAD: i128 = SCALE;
+/// RAY — 10^27, the high-precision 27-decimal fixed-point unit.
+pub const RAY: i128 = 1_000_000_000_000_000_000_000_000_000;
+
 #[allow(clippy::should_implement_trait)]
 impl Fixed {
     pub const ZERO: Fixed = Fixed(0);
@@ -151,6 +156,37 @@ impl Fixed {
     }
 }
 
+/// Multiply two WAD fixed-point numbers: `(a * b) / WAD`.
+/// The intermediate product is computed with full 256-bit precision, so
+/// results are exact up to the final truncation. Overflow returns
+/// `MathError::Overflow` instead of panicking.
+pub fn wad_mul(a: i128, b: i128) -> Result<i128, MathError> {
+    mul_div(a, b, WAD).ok_or(MathError::Overflow)
+}
+
+/// Divide two WAD fixed-point numbers: `(a * WAD) / b`.
+/// A zero divisor returns `MathError::DivisionByZero`.
+pub fn wad_div(a: i128, b: i128) -> Result<i128, MathError> {
+    if b == 0 {
+        return Err(MathError::DivisionByZero);
+    }
+    mul_div(a, WAD, b).ok_or(MathError::Overflow)
+}
+
+/// Multiply two RAY fixed-point numbers: `(a * b) / RAY`.
+pub fn ray_mul(a: i128, b: i128) -> Result<i128, MathError> {
+    mul_div(a, b, RAY).ok_or(MathError::Overflow)
+}
+
+/// Divide two RAY fixed-point numbers: `(a * RAY) / b`.
+/// A zero divisor returns `MathError::DivisionByZero`.
+pub fn ray_div(a: i128, b: i128) -> Result<i128, MathError> {
+    if b == 0 {
+        return Err(MathError::DivisionByZero);
+    }
+    mul_div(a, RAY, b).ok_or(MathError::Overflow)
+}
+
 fn mul_div(a: i128, b: i128, d: i128) -> Option<i128> {
     if d == 0 {
         return None;
@@ -216,6 +252,18 @@ impl Math {
     pub fn pow(_e: Env, x: i128, y: i128) -> Result<i128, MathError> {
         Fixed(x).pow(Fixed(y)).map(|f| f.0)
     }
+    pub fn wad_mul(_e: Env, a: i128, b: i128) -> Result<i128, MathError> {
+        crate::wad_mul(a, b)
+    }
+    pub fn wad_div(_e: Env, a: i128, b: i128) -> Result<i128, MathError> {
+        crate::wad_div(a, b)
+    }
+    pub fn ray_mul(_e: Env, a: i128, b: i128) -> Result<i128, MathError> {
+        crate::ray_mul(a, b)
+    }
+    pub fn ray_div(_e: Env, a: i128, b: i128) -> Result<i128, MathError> {
+        crate::ray_div(a, b)
+    }
 }
 
 #[cfg(test)]
@@ -260,5 +308,125 @@ mod test {
         // Advanced ops (no raw equivalent easily)
         let fixed_exp = Fixed(SCALE).exp().unwrap();
         assert!(fixed_exp.0 > 2 * SCALE);
+    }
+
+    #[test]
+    fn test_wad_ray_constants() {
+        assert_eq!(WAD, SCALE);
+        assert_eq!(WAD, 1_000_000_000_000_000_000);
+        assert_eq!(RAY, 1_000_000_000_000_000_000_000_000_000);
+        let wad_pow = 10_i128.pow(18);
+        let ray_pow = 10_i128.pow(27);
+        assert_eq!(WAD, wad_pow);
+        assert_eq!(RAY, ray_pow);
+        assert!(ray_pow > wad_pow);
+    }
+
+    #[test]
+    fn test_wad_mul() {
+        assert_eq!(wad_mul(0, 0).unwrap(), 0);
+        assert_eq!(wad_mul(0, 5 * WAD).unwrap(), 0);
+        assert_eq!(wad_mul(5 * WAD, 0).unwrap(), 0);
+        assert_eq!(wad_mul(WAD, WAD).unwrap(), WAD);
+        assert_eq!(wad_mul(2 * WAD, 3 * WAD).unwrap(), 6 * WAD);
+        assert_eq!(wad_mul(WAD / 2, WAD / 2).unwrap(), WAD / 4);
+        assert_eq!(wad_mul(-2 * WAD, 3 * WAD).unwrap(), -6 * WAD);
+        assert_eq!(wad_mul(2 * WAD, -3 * WAD).unwrap(), -6 * WAD);
+        assert_eq!(wad_mul(-2 * WAD, -3 * WAD).unwrap(), 6 * WAD);
+    }
+
+    #[test]
+    fn test_wad_div() {
+        assert_eq!(wad_div(WAD, 2 * WAD).unwrap(), WAD / 2);
+        assert_eq!(wad_div(-WAD, 2 * WAD).unwrap(), -(WAD / 2));
+        assert_eq!(wad_div(10 * WAD, 2 * WAD).unwrap(), 5 * WAD);
+        assert_eq!(wad_div(42 * WAD, 6 * WAD).unwrap(), 7 * WAD);
+        assert_eq!(wad_div(0, 7 * WAD).unwrap(), 0);
+        assert_eq!(wad_div(WAD / 4, WAD / 2).unwrap(), WAD / 2);
+        assert_eq!(wad_div(-42 * WAD, -6 * WAD).unwrap(), 7 * WAD);
+    }
+
+    #[test]
+    fn test_ray_mul_div() {
+        assert_eq!(ray_mul(RAY, RAY).unwrap(), RAY);
+        assert_eq!(ray_mul(2 * RAY, 3 * RAY).unwrap(), 6 * RAY);
+        assert_eq!(ray_mul(-2 * RAY, 3 * RAY).unwrap(), -6 * RAY);
+        assert_eq!(ray_mul(100 * RAY, 100 * RAY).unwrap(), 10_000 * RAY);
+        assert_eq!(ray_div(RAY, 2 * RAY).unwrap(), RAY / 2);
+        assert_eq!(
+            ray_div(10 * RAY, 4 * RAY).unwrap(),
+            2_500_000_000_000_000_000_000_000_000
+        );
+        assert_eq!(ray_div(0, 7 * RAY).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_zero_precision_loss_on_division() {
+        // Exact divisions round-trip bit-for-bit: (a / b) * b == a.
+        for x in [0i128, 1, 42, 10_000, i128::MAX / WAD] {
+            for y in [1, 2, 4, 8, 100] {
+                let q = wad_div(x * WAD, y * WAD).unwrap();
+                assert_eq!(wad_mul(q, y * WAD).unwrap(), x * WAD);
+            }
+        }
+        for x in [0i128, 1, 123_456] {
+            for y in [1, 2, 4, 8, 100] {
+                let q = ray_div(x * RAY, y * RAY).unwrap();
+                assert_eq!(ray_mul(q, y * RAY).unwrap(), x * RAY);
+            }
+        }
+
+        // RAY keeps ~9 extra decimal digits: scaling a RAY quotient down to
+        // WAD restores the WAD quotient exactly.
+        let wad_third = wad_div(WAD, 3 * WAD).unwrap();
+        let ray_third = ray_div(RAY, 3 * RAY).unwrap();
+        assert_eq!(wad_third, ray_third / 1_000_000_000);
+    }
+
+    #[test]
+    fn test_div_by_zero() {
+        assert_eq!(wad_div(1, 0), Err(MathError::DivisionByZero));
+        assert_eq!(wad_div(0, 0), Err(MathError::DivisionByZero));
+        assert_eq!(ray_div(1, 0), Err(MathError::DivisionByZero));
+        assert_eq!(ray_div(0, 0), Err(MathError::DivisionByZero));
+    }
+
+    #[test]
+    fn test_overflow_boundaries() {
+        // Intermediate products that exceed the i128 range return errors
+        // instead of panicking, even when computed through the 256-bit path.
+        assert_eq!(wad_mul(i128::MAX, WAD).unwrap(), i128::MAX);
+        assert_eq!(wad_mul(i128::MAX, 2 * WAD), Err(MathError::Overflow));
+        assert_eq!(wad_mul(i128::MIN, WAD), Err(MathError::Overflow));
+        assert_eq!(ray_mul(i128::MAX, 2 * RAY), Err(MathError::Overflow));
+        assert_eq!(wad_div(i128::MAX, 1), Err(MathError::Overflow));
+        assert_eq!(ray_div(i128::MAX, 1), Err(MathError::Overflow));
+        assert_eq!(wad_div(i128::MAX, 2 * WAD).unwrap(), i128::MAX / 2);
+        assert_eq!(ray_div(i128::MAX, 2 * RAY).unwrap(), i128::MAX / 2);
+    }
+
+    #[test]
+    fn test_high_precision_large_numerators() {
+        // Divisor-scaled division keeps full 256-bit numerator precision,
+        // whereas a naive `a * WAD` in i128 would overflow.
+        assert_eq!(wad_div(WAD, 7 * WAD).unwrap(), 142_857_142_857_142_857);
+        assert_eq!(wad_div(i128::MAX, 100 * WAD).unwrap(), i128::MAX / 100);
+        assert_eq!(
+            ray_div(RAY, 7 * RAY).unwrap(),
+            142_857_142_857_142_857_142_857_142
+        );
+    }
+
+    #[test]
+    fn test_contract_methods() {
+        let env = Env::default();
+        assert_eq!(Math::wad_mul(env.clone(), 2 * WAD, 3 * WAD), Ok(6 * WAD));
+        assert_eq!(Math::wad_div(env.clone(), WAD, 4 * WAD), Ok(WAD / 4));
+        assert_eq!(Math::ray_mul(env.clone(), 2 * RAY, 3 * RAY), Ok(6 * RAY));
+        assert_eq!(Math::ray_div(env.clone(), RAY, 4 * RAY), Ok(RAY / 4));
+        assert_eq!(
+            Math::wad_div(env.clone(), 1, 0),
+            Err(MathError::DivisionByZero)
+        );
     }
 }

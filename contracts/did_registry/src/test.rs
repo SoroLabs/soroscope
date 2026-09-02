@@ -15,7 +15,10 @@ fn test_register_and_update_did() {
 
     let did = String::from_str(&env, "did:example:123");
     let mut document = DIDDocument {
-        context: Vec::from_array(&env, [String::from_str(&env, "https://www.w3.org/ns/did/v1")]),
+        context: Vec::from_array(
+            &env,
+            [String::from_str(&env, "https://www.w3.org/ns/did/v1")],
+        ),
         id: did.clone(),
         verification_method: Vec::new(&env),
         authentication: Vec::new(&env),
@@ -32,7 +35,9 @@ fn test_register_and_update_did() {
     assert_eq!(retrieved.id, did);
 
     // Update document
-    document.context.push_back(String::from_str(&env, "https://example.com/context"));
+    document
+        .context
+        .push_back(String::from_str(&env, "https://example.com/context"));
     client.update_did_document(&did, &document);
 
     let updated = client.get_did_document(&did);
@@ -52,7 +57,10 @@ fn test_add_verification_method() {
 
     let did = String::from_str(&env, "did:example:123");
     let document = DIDDocument {
-        context: Vec::from_array(&env, [String::from_str(&env, "https://www.w3.org/ns/did/v1")]),
+        context: Vec::from_array(
+            &env,
+            [String::from_str(&env, "https://www.w3.org/ns/did/v1")],
+        ),
         id: did.clone(),
         verification_method: Vec::new(&env),
         authentication: Vec::new(&env),
@@ -76,7 +84,10 @@ fn test_add_verification_method() {
 
     let updated_doc = client.get_did_document(&did);
     assert_eq!(updated_doc.verification_method.len(), 1);
-    assert_eq!(updated_doc.verification_method.get(0).unwrap().id, method.id);
+    assert_eq!(
+        updated_doc.verification_method.get(0).unwrap().id,
+        method.id
+    );
 }
 
 #[test]
@@ -118,7 +129,10 @@ fn test_did_with_expiration() {
 
     let did = String::from_str(&env, "did:example:456");
     let document = DIDDocument {
-        context: Vec::from_array(&env, [String::from_str(&env, "https://www.w3.org/ns/did/v1")]),
+        context: Vec::from_array(
+            &env,
+            [String::from_str(&env, "https://www.w3.org/ns/did/v1")],
+        ),
         id: did.clone(),
         verification_method: Vec::new(&env),
         authentication: Vec::new(&env),
@@ -152,7 +166,10 @@ fn test_did_expiration_passed() {
 
     let did = String::from_str(&env, "did:example:789");
     let document = DIDDocument {
-        context: Vec::from_array(&env, [String::from_str(&env, "https://www.w3.org/ns/did/v1")]),
+        context: Vec::from_array(
+            &env,
+            [String::from_str(&env, "https://www.w3.org/ns/did/v1")],
+        ),
         id: did.clone(),
         verification_method: Vec::new(&env),
         authentication: Vec::new(&env),
@@ -190,7 +207,10 @@ fn test_revoke_did() {
 
     let did = String::from_str(&env, "did:example:999");
     let document = DIDDocument {
-        context: Vec::from_array(&env, [String::from_str(&env, "https://www.w3.org/ns/did/v1")]),
+        context: Vec::from_array(
+            &env,
+            [String::from_str(&env, "https://www.w3.org/ns/did/v1")],
+        ),
         id: did.clone(),
         verification_method: Vec::new(&env),
         authentication: Vec::new(&env),
@@ -230,7 +250,10 @@ fn test_set_expiration() {
 
     let did = String::from_str(&env, "did:example:111");
     let document = DIDDocument {
-        context: Vec::from_array(&env, [String::from_str(&env, "https://www.w3.org/ns/did/v1")]),
+        context: Vec::from_array(
+            &env,
+            [String::from_str(&env, "https://www.w3.org/ns/did/v1")],
+        ),
         id: did.clone(),
         verification_method: Vec::new(&env),
         authentication: Vec::new(&env),
@@ -268,7 +291,10 @@ fn test_did_without_expiration_remains_valid() {
 
     let did = String::from_str(&env, "did:example:222");
     let document = DIDDocument {
-        context: Vec::from_array(&env, [String::from_str(&env, "https://www.w3.org/ns/did/v1")]),
+        context: Vec::from_array(
+            &env,
+            [String::from_str(&env, "https://www.w3.org/ns/did/v1")],
+        ),
         id: did.clone(),
         verification_method: Vec::new(&env),
         authentication: Vec::new(&env),
@@ -303,7 +329,10 @@ fn test_rotate_and_remove_verification_method() {
 
     let did = String::from_str(&env, "did:soroban:test1234");
     let document = DIDDocument {
-        context: Vec::from_array(&env, [String::from_str(&env, "https://www.w3.org/ns/did/v1")]),
+        context: Vec::from_array(
+            &env,
+            [String::from_str(&env, "https://www.w3.org/ns/did/v1")],
+        ),
         id: did.clone(),
         verification_method: Vec::new(&env),
         authentication: Vec::new(&env),
@@ -332,7 +361,11 @@ fn test_rotate_and_remove_verification_method() {
 
     let doc_after_rotation = client.get_did_document(&did);
     assert_eq!(
-        doc_after_rotation.verification_method.get(0).unwrap().public_key_multibase,
+        doc_after_rotation
+            .verification_method
+            .get(0)
+            .unwrap()
+            .public_key_multibase,
         new_key
     );
 

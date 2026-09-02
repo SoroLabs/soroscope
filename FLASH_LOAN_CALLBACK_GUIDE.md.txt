@@ -20,6 +20,8 @@ function executeOperation(
 
 ### Parameter Specifications
 
+<div class="max-w-full overflow-x-auto">
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `asset` | address | The address of the loaned token (ERC20 contract) |
@@ -27,6 +29,8 @@ function executeOperation(
 | `premium` | uint256 | The fee amount required to repay (in the same token) |
 | `initiator` | address | The address that initiated the flash loan |
 | `params` | bytes | Encoded arbitrary parameters for custom logic |
+
+</div>
 
 ## Implementation Steps
 
@@ -202,6 +206,8 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, ReentrancyGuard, Ownable {
 
 ## Common Pitfalls
 
+<div class="max-w-full overflow-x-auto">
+
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
 | Not validating caller | Contract drains funds | Check `msg.sender` against authorized provider |
@@ -209,6 +215,8 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, ReentrancyGuard, Ownable {
 | Insufficient repayment | Loan defaults | Calculate premium before starting operations |
 | No reentrancy guard | Exploitation risk | Use `ReentrancyGuard` or checks-effects-interactions |
 | Unchecked transfers | Silent failures | Use safe transfer wrappers or require checks |
+
+</div>
 
 ## Testing Checklist
 

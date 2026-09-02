@@ -2,7 +2,7 @@ use super::*;
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Events, Ledger},
-    vec, Address, Env, String as SorobanString, TryIntoVal,
+    vec, Address, Env, String, Symbol, TryIntoVal,
 };
 
 // Import Vec from alloc for no_std environment
@@ -375,16 +375,16 @@ fn test_events() {
     let deposit_shares = client.deposit(&user1, &1000, &1000);
 
     let events = e.events().all();
-    let deposit_event_name = String::from_str(&e, "deposit");
+    let deposit_event_name = Symbol::new(&e, "deposit");
     let deposit_events: Vec<_> = events
         .iter()
         .filter(|(_, topics, _)| {
             if topics.len() != 2 {
                 return false;
             }
-            // Compare by converting Val to String
-            let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&e);
-            topic_str.is_ok() && topic_str.unwrap() == deposit_event_name
+            // Compare by converting Val to Symbol
+            let topic_sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&e);
+            topic_sym.is_ok() && topic_sym.unwrap() == deposit_event_name
         })
         .collect();
 
@@ -418,16 +418,16 @@ fn test_events() {
     let amount_paid = client.swap(&user2, &false, &out_amount, &in_max);
 
     let events = e.events().all();
-    let swap_event_name = String::from_str(&e, "swap");
+    let swap_event_name = Symbol::new(&e, "swap");
     let swap_events: Vec<_> = events
         .iter()
         .filter(|(_, topics, _)| {
             if topics.len() != 2 {
                 return false;
             }
-            // Compare by converting Val to String
-            let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&e);
-            topic_str.is_ok() && topic_str.unwrap() == swap_event_name
+            // Compare by converting Val to Symbol
+            let topic_sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&e);
+            topic_sym.is_ok() && topic_sym.unwrap() == swap_event_name
         })
         .collect();
 
@@ -462,16 +462,16 @@ fn test_events() {
     let (withdrawn_a, withdrawn_b) = client.withdraw(&user1, &withdraw_shares);
 
     let events = e.events().all();
-    let withdraw_event_name = String::from_str(&e, "withdraw");
+    let withdraw_event_name = Symbol::new(&e, "withdraw");
     let withdraw_events: Vec<_> = events
         .iter()
         .filter(|(_, topics, _)| {
             if topics.len() != 2 {
                 return false;
             }
-            // Compare by converting Val to String
-            let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&e);
-            topic_str.is_ok() && topic_str.unwrap() == withdraw_event_name
+            // Compare by converting Val to Symbol
+            let topic_sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&e);
+            topic_sym.is_ok() && topic_sym.unwrap() == withdraw_event_name
         })
         .collect();
 
@@ -2309,6 +2309,21 @@ fn test_swap_exact_in_input_too_small_to_fill() {
     // 1 unit against a 1M/1M pool rounds down to zero output. Settling that would
     // take the input and hand back nothing.
     assert_eq!(client.get_amount_out(&false, &1), 0);
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &1, &0),
+        Err(Ok(Error::InsufficientLiquidity))
+    );
+}
+
+#[test]
+fn test_swap_exact_in_prevents_1_stroop_micro_swap_exploit() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1_000_000, 1_000_000);
+
+    assert_eq!(client.get_amount_out(&false, &1), 0);
+    let input_for_one = client.get_amount_in(&false, &1);
+    assert!(input_for_one > 1, "1 stroop must require a positive pool-favoring input: {input_for_one}");
     assert_eq!(
         client.try_swap_exact_in(&trader, &false, &1, &0),
         Err(Ok(Error::InsufficientLiquidity))

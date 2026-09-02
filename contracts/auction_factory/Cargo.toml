@@ -1,5 +1,5 @@
 [package]
-name = "soroban-auction-factory-contract"
+name = "auction_factory"
 version = "0.1.0"
 edition = "2021"
 publish = false

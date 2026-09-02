@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String,
+    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol,
 };
 
 #[contracttype]
@@ -45,7 +45,7 @@ impl TypedDataAuth {
 
         // Log the successful authorization (optional)
         env.events().publish(
-            ("transfer_authorized",),
+            (Symbol::new(&env, "transfer_authorized"),),
             (signer, transfer.from, transfer.to, transfer.amount),
         );
     }

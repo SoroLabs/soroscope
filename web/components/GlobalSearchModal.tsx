@@ -68,21 +68,31 @@ export function GlobalSearchModal() {
 
   // Global shortcut listener — intentionally on window so it fires regardless
   // of which element currently has focus.
+  // Fixed: Properly handle listener cleanup to prevent duplicates and ensure
+  // the modal can be opened/closed reliably with Esc key.
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      // Handle search shortcut (Cmd+K or Ctrl+K)
       if (isSearchShortcut(event)) {
         event.preventDefault();
         setOpen((prev) => !prev);
         return;
       }
-      if (isDismissShortcut(event)) {
-        setOpen((prev) => (prev ? false : prev));
+      
+      // Handle dismiss shortcut (Escape) — only if modal is open
+      if (isDismissShortcut(event) && open) {
+        event.preventDefault();
+        setOpen(false);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
+    
+    // Cleanup: Remove listener when component unmounts or dependencies change
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [open]);
 
   // Focus the input and lock background scroll while the overlay is up.
   useEffect(() => {
