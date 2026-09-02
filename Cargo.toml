@@ -18,5 +18,6 @@ members = [
     "contracts/did_registry",
     "core",
 ]
+
 [workspace.dependencies]
 soroban-sdk = "22.0.0"
