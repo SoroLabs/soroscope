@@ -10,11 +10,13 @@ A comprehensive, production-ready data structure library for cross-chain payload
 
 ### 1. **Module Architecture** (`src/lib.rs`)
 The library exports 5 core modules with a cleanly organized API surface:
-- `chain_info` - Chain and bridge management
-- `payload` - Cross-chain payload structures
-- `verification` - Verification state and consensus
-- `signatures` - Cryptographic signature handling
-- `errors` - Comprehensive error definitions
+<ul class="flex flex-col sm:flex-row sm:flex-wrap sm:gap-4">
+  <li>`chain_info` - Chain and bridge management</li>
+  <li>`payload` - Cross-chain payload structures</li>
+  <li>`verification` - Verification state and consensus</li>
+  <li>`signatures` - Cryptographic signature handling</li>
+  <li>`errors` - Comprehensive error definitions</li>
+</ul>
 
 ---
 
@@ -149,6 +151,8 @@ The library exports 5 core modules with a cleanly organized API surface:
 
 **28 Distinct Error Types**:
 
+<div class="max-w-full overflow-x-auto">
+
 | Category | Error Types |
 |----------|-------------|
 | **Validation** (3) | InvalidPayloadHash, MalformedPayload, EncodingError |
@@ -159,6 +163,8 @@ The library exports 5 core modules with a cleanly organized API surface:
 | **Operational** (6) | PayloadExpired, InsufficientGas, MaintenanceMode, BacklogExceeded, FeeValidationFailed, LiquidityError |
 | **System** (3) | StorageError, Unauthorized, Unknown |
 | **Context** (1) | IncompleteVerificationContext |
+
+</div>
 
 Each error maps to unique code (1-255) via `as_u32()` method.
 
@@ -335,6 +341,8 @@ let verification_status = VerificationStatus::Verified;
 
 ## Summary Statistics
 
+<div class="max-w-full overflow-x-auto">
+
 | Metric | Count |
 |--------|-------|
 | **Data Structures** | 18 primary structs/enums |
@@ -343,6 +351,8 @@ let verification_status = VerificationStatus::Verified;
 | **Test Cases** | 14+ comprehensive tests |
 | **Lines of Code** | ~1,200+ (data structures) |
 | **Documentation** | 700+ lines of detailed README |
+
+</div>
 
 ---
 

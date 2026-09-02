@@ -1,3 +1,5 @@
+<style>html,body{max-width:100%;overflow-x:hidden}pre{max-width:100%;overflow-x:auto}</style>
+
 # Testnet Release — Final Release Notes
 
 Release: Testnet release of SoroLabs/soroscope — curated set of new contracts, security tooling, and integration tests for the Soroban ecosystem.

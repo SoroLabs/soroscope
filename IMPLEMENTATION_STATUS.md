@@ -1,7 +1,7 @@
 # LP Deposit/Withdrawal Fee Implementation Status
 
 ## Branch
-`feature/issue-104-amm-deposit-fee`
+`fix/issue-134-fix-mobile-viewport-horizontal`
 
 ## Completed Work
 
@@ -159,7 +159,7 @@ When ready to create PR:
 - [ ] LP_FEE_IMPLEMENTATION.md included as reference
 - [ ] Test suite (lp_fee_test.rs) included
 - [ ] Conventional commit messages used
-- [ ] PR title: `[Contract] Implement LP mint/burn liquidity fee`
+- [ ] PR title: `[Fix] Issue #134 - Fix Mobile Viewport Horizontal Scroll Overflow`
 - [ ] PR description includes:
   - Problem statement (JIT liquidity)
   - Solution overview (5 bps fee)
