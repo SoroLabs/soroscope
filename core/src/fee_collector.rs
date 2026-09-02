@@ -109,6 +109,8 @@ impl FeeCollector {
                 _ = interval.tick() => {}
             }
 
+            // Only the instance holding the leader lease performs collection,
+            // so extra replicas don't duplicate writes to the fee store.
             if !self.leader_lock.try_acquire_or_renew().await {
                 tracing::debug!("not leader this cycle, skipping fee collection");
                 continue;
@@ -123,12 +125,18 @@ impl FeeCollector {
 
             match result {
                 Ok(true) => {
-                    self.metrics.events_processed_total.inc();
+                    self.metrics
+                        .events_processed_total
+                        .with_label_values(&["fee_collector"])
+                        .inc();
                 }
                 Ok(false) => {}
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to collect fee data");
-                    self.metrics.indexing_errors_total.inc();
+                    self.metrics
+                        .indexing_errors_total
+                        .with_label_values(&["fee_collector"])
+                        .inc();
                 }
             }
         }

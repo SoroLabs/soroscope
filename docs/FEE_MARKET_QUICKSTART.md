@@ -33,7 +33,7 @@ The server will start on `http://localhost:8080`
 
 **Option 1: Swagger UI (Recommended for testing)**
 ```
-http://localhost:8080/swagger-ui
+http://localhost:8080/docs
 ```
 
 **Option 2: Command Line**
@@ -196,7 +196,7 @@ ls -lh soroscope.db
 ## 🎓 Next Steps
 
 1. **Read full documentation**: `core/FEE_MARKET_README.md`
-2. **View API docs**: `http://localhost:8080/swagger-ui`
+2. **View API docs**: `http://localhost:8080/docs`
 3. **Check implementation**: `FEE_MARKET_IMPLEMENTATION_SUMMARY.md`
 4. **Run tests**: `cargo test -p soroscope-core fee_`
 
