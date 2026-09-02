@@ -6,7 +6,7 @@ edition = "2021"
 publish = false
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 emergency_guard = { path = "../emergency_guard", default-features = false }

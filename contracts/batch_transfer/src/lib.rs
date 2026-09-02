@@ -51,7 +51,15 @@ pub trait BatchToken {
     fn transfer(e: Env, from: Address, to: Address, amount: i128);
 }
 
-fn validate_lengths(recipients: &Vec<Address>, amounts: &Vec<i128>) -> Result<u32, Error> {
+fn process_batch(
+    env: &Env,
+    token: &Address,
+    sender: &Address,
+    recipients: &Vec<Address>,
+    amounts: &Vec<i128>,
+    mode: &ExecutionMode,
+    do_transfer: bool,
+) -> Result<Vec<TransferResult>, Error> {
     let len = recipients.len();
     if len == 0 {
         return Err(Error::EmptyBatch);
@@ -62,17 +70,7 @@ fn validate_lengths(recipients: &Vec<Address>, amounts: &Vec<i128>) -> Result<u3
     if len != amounts.len() {
         return Err(Error::LengthMismatch);
     }
-    Ok(len)
-}
-fn simulate_batch(
-    env: &Env,
-    token: &Address,
-    sender: &Address,
-    recipients: &Vec<Address>,
-    amounts: &Vec<i128>,
-    mode: &ExecutionMode,
-) -> Result<Vec<TransferResult>, Error> {
-    let len = validate_lengths(recipients, amounts)?;
+
     let token_client = BatchTokenClient::new(env, token);
     let mut remaining_balance = token_client.balance(sender);
     let mut results = Vec::new(env);
@@ -83,15 +81,14 @@ fn simulate_batch(
     ));
     let zero_address_c = Address::from_string(&String::from_str(
         env,
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABU",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
     ));
 
-    for i in 0..len {
-        let recipient = recipients.get(i).unwrap();
-        let amount = amounts.get(i).unwrap();
+    let is_all_or_nothing = matches!(mode, ExecutionMode::AllOrNothing);
 
+    for (recipient, amount) in recipients.iter().zip(amounts.iter()) {
         if amount <= 0 || recipient == zero_address_g || recipient == zero_address_c {
-            if matches!(mode, ExecutionMode::AllOrNothing) {
+            if is_all_or_nothing {
                 return Err(Error::InvalidAmount);
             }
             results.push_back(TransferResult {
@@ -104,7 +101,7 @@ fn simulate_batch(
         }
 
         if remaining_balance < amount {
-            if matches!(mode, ExecutionMode::AllOrNothing) {
+            if is_all_or_nothing {
                 return Err(Error::InsufficientBalance);
             }
             results.push_back(TransferResult {
@@ -117,6 +114,11 @@ fn simulate_batch(
         }
 
         remaining_balance -= amount;
+
+        if do_transfer {
+            token_client.transfer(sender, &recipient, &amount);
+        }
+
         results.push_back(TransferResult {
             recipient,
             amount,
@@ -142,17 +144,7 @@ impl BatchTransfer {
         mode: ExecutionMode,
     ) -> Result<Vec<TransferResult>, Error> {
         sender.require_auth();
-
-        let plan = simulate_batch(&env, &token, &sender, &recipients, &amounts, &mode)?;
-        let token_client = BatchTokenClient::new(&env, &token);
-
-        for item in plan.iter() {
-            if item.success {
-                token_client.transfer(&sender, &item.recipient, &item.amount);
-            }
-        }
-
-        Ok(plan)
+        process_batch(&env, &token, &sender, &recipients, &amounts, &mode, true)
     }
 
     pub fn quote(
@@ -163,6 +155,6 @@ impl BatchTransfer {
         amounts: Vec<i128>,
         mode: ExecutionMode,
     ) -> Result<Vec<TransferResult>, Error> {
-        simulate_batch(&env, &token, &sender, &recipients, &amounts, &mode)
+        process_batch(&env, &token, &sender, &recipients, &amounts, &mode, false)
     }
 }

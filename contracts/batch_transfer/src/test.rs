@@ -15,13 +15,13 @@ fn setup() -> (Env, Address, Address, Address, Address) {
     let admin = Address::generate(&env);
     let sender = Address::generate(&env);
     let recipient_a = Address::generate(&env);
-    let recipient_b = Address::generate(&env);
 
     token.initialize(
         &admin,
         &7,
         &String::from_str(&env, "Batch Token"),
         &String::from_str(&env, "BATCH"),
+        &1_000_000_000_i128,
     );
     token.mint(&sender, &1_000);
 
@@ -118,7 +118,6 @@ fn partial_mode_skips_failures_and_continues() {
 }
 
 #[test]
-#[test]
 fn accepts_batch_at_max_recipient_limit() {
     let (env, batch_id, token_id, sender, _recipient_a) = setup();
     let batch = BatchTransferClient::new(&env, &batch_id);
@@ -172,6 +171,8 @@ fn rejects_batch_over_max_recipient_limit() {
     // Nothing should have moved.
     assert_eq!(token.balance(&sender), 1_000);
 }
+
+#[test]
 fn quote_matches_partial_execution_plan() {
     let (env, batch_id, token_id, sender, recipient_a) = setup();
     let batch = BatchTransferClient::new(&env, &batch_id);
@@ -193,4 +194,31 @@ fn quote_matches_partial_execution_plan() {
         quote.get(1).unwrap().failure,
         TransferFailure::InsufficientBalance
     );
+}
+
+#[test]
+fn gas_cost_comparison_batch_vs_individual() {
+    let (env, batch_id, token_id, sender, _) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = TokenClient::new(&env, &token_id);
+
+    let mut recipients = Vec::new(&env);
+    let mut amounts = Vec::new(&env);
+    for _ in 0..5 {
+        recipients.push_back(Address::generate(&env));
+        amounts.push_back(10i128);
+    }
+
+    let results = batch.execute(
+        &token_id,
+        &sender,
+        &recipients,
+        &amounts,
+        &ExecutionMode::AllOrNothing,
+    );
+    assert_eq!(results.len(), 5);
+
+    for (r, a) in recipients.iter().zip(amounts.iter()) {
+        assert_eq!(token.balance(&r), a);
+    }
 }

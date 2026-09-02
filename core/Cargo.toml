@@ -2,7 +2,6 @@
 name = "soroscope-core"
 version = "0.1.0"
 edition = "2021"
-
 [lib]
 name = "soroscope_core"
 path = "src/lib.rs"
@@ -10,9 +9,6 @@ crate-type = ["rlib"]
 
 [dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
-# Used directly for the local WASM simulation runner. `testutils` exposes
-# the test Host + budget controls we need for in-process contract invocation.
-# Version aligned with the soroban-sdk 22 workspace pin.
 soroban-env-host = { version = "22", features = ["testutils"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
