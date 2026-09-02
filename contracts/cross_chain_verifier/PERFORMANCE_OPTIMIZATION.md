@@ -321,7 +321,7 @@ Added performance benchmark tests:
 ```rust
 // Emit metrics events
 env.events().publish(
-    ("verification_metrics",),
+    (Symbol::new(&env, "verification_metrics"),),
     (
         signer_count,
         verification_time_ms,

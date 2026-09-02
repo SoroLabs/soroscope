@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
 
 use emergency_guard::{DefaultEmergencyGuard, EmergencyGuard, EmergencyGuardTrait, PauseType};
 pub use soroscope_error_codes::ContractError;
@@ -428,7 +428,7 @@ impl StakingRewards {
         e.storage().instance().extend_ttl(10000, 10000);
 
         e.events().publish(
-            (String::from_str(&e, "stake"), user.clone()),
+            (Symbol::new(&e, "stake"), user.clone()),
             StakeEvent { user, amount },
         );
 
@@ -494,7 +494,7 @@ impl StakingRewards {
         );
 
         e.events().publish(
-            (String::from_str(&e, "withdraw"), user.clone()),
+            (Symbol::new(&e, "withdraw"), user.clone()),
             WithdrawEvent { user, amount },
         );
 
@@ -545,7 +545,7 @@ impl StakingRewards {
         );
 
         e.events().publish(
-            (String::from_str(&e, "claim"), user.clone()),
+            (Symbol::new(&e, "claim"), user.clone()),
             ClaimEvent {
                 user,
                 amount: reward_amount,
@@ -610,7 +610,7 @@ impl StakingRewards {
         }
 
         e.events().publish(
-            (String::from_str(&e, "emergency_withdraw"), user.clone()),
+            (Symbol::new(&e, "emergency_withdraw"), user.clone()),
             EmergencyWithdrawEvent {
                 user,
                 amount: payout,
@@ -652,7 +652,7 @@ impl StakingRewards {
             .map_err(|_| ContractError::Paused)?;
 
         e.events().publish(
-            (String::from_str(&e, "pause_staking"),),
+            (Symbol::new(&e, "pause_staking"),),
             PausedEvent { paused: true },
         );
 
@@ -668,7 +668,7 @@ impl StakingRewards {
             .map_err(|_| ContractError::Paused)?;
 
         e.events().publish(
-            (String::from_str(&e, "resume_staking"),),
+            (Symbol::new(&e, "resume_staking"),),
             PausedEvent { paused: false },
         );
 
@@ -681,7 +681,7 @@ impl StakingRewards {
             .map_err(|_| ContractError::Paused)?;
 
         e.events().publish(
-            (String::from_str(&e, "emergency_pause_all"),),
+            (Symbol::new(&e, "emergency_pause_all"),),
             PausedEvent { paused: true },
         );
 
@@ -693,7 +693,7 @@ impl StakingRewards {
         DefaultEmergencyGuard::resume_all(&e, approvers).map_err(|_| ContractError::Paused)?;
 
         e.events().publish(
-            (String::from_str(&e, "resume_all"),),
+            (Symbol::new(&e, "resume_all"),),
             PausedEvent { paused: false },
         );
 

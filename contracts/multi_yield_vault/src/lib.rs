@@ -22,7 +22,7 @@
 //! contract checks that the amount received from a pool withdrawal is within
 //! `slippage_bps` of the expected amount before proceeding.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 #[cfg(test)]
 mod test;
@@ -545,8 +545,7 @@ impl MultiYieldVault {
 
         save_pools(&e, &pools);
 
-        e.events()
-            .publish(("rebalance",), (last_idx as u32, total_to_move));
+        e.events().publish((Symbol::new(&e, "rebalance"),), (last_idx as u32, total_to_move));
         Ok(())
     }
 

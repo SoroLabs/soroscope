@@ -1,5 +1,5 @@
-use crate::storage_types::DataKey, Proposal, ProposalAction, ProposalState;
-use soroban_sdk::Address, Env, String, Vec;
+use crate::storage_types::{DataKey, Proposal, ProposalAction, ProposalState};
+use soroban_sdk::{Address, Env, String, Symbol, Vec};
 
 pub fn read_proposal(e: &Env, id: u32) -> Proposal {
     let key = DataKey::Proposal(id);
@@ -107,7 +107,9 @@ pub fn execute_proposal(e: &Env, proposal_id: u32) {
     assert!(current_time >= proposal.queued_time + config.timelock_delay);
 
     for action in proposal.actions.iter() {
-        e.events().publish(("proposal_executed", proposal_id), action.clone());
+        // Here we would execute the contract call
+        // For now, just log it
+        e.events().publish((Symbol::new(&e, "proposal_executed"), proposal_id), action.clone());
     }
 
     proposal.state = ProposalState::Executed;

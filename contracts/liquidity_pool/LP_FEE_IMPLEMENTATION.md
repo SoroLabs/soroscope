@@ -133,7 +133,7 @@ pub fn deposit(e: Env, to: Address, amount_a: i128, amount_b: i128) -> Result<i1
 
     // Emit LP fee event
     e.events().publish(
-        (String::from_str(&e, "lp_fee"), String::from_str(&e, "deposit")),
+        (Symbol::new(&e, "lp_fee"), Symbol::new(&e, "deposit")),
         LpDepositFeeEvent {
             depositor: to.clone(),
             gross_shares,
@@ -144,7 +144,7 @@ pub fn deposit(e: Env, to: Address, amount_a: i128, amount_b: i128) -> Result<i1
 
     // Emit deposit event
     e.events().publish(
-        (String::from_str(&e, "deposit"), to.clone()),
+        (Symbol::new(&e, "deposit"), to.clone()),
         DepositEvent {
             user: to,
             amount_a,
@@ -215,7 +215,7 @@ pub fn withdraw(e: Env, to: Address, share_amount: i128) -> Result<(i128, i128),
 
     // Emit LP fee event
     e.events().publish(
-        (String::from_str(&e, "lp_fee"), String::from_str(&e, "withdraw")),
+        (Symbol::new(&e, "lp_fee"), Symbol::new(&e, "withdraw")),
         LpWithdrawFeeEvent {
             withdrawer: to.clone(),
             gross_amount_a,
@@ -229,7 +229,7 @@ pub fn withdraw(e: Env, to: Address, share_amount: i128) -> Result<(i128, i128),
 
     // Emit withdraw event
     e.events().publish(
-        (String::from_str(&e, "withdraw"), to.clone()),
+        (Symbol::new(&e, "withdraw"), to.clone()),
         WithdrawEvent {
             user: to,
             shares_burned: share_amount,

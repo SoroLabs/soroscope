@@ -6,7 +6,7 @@ use crate::balance::{
 };
 use crate::metadata::{read_decimal, read_name, read_symbol, write_metadata};
 use emergency_guard::{EmergencyGuard, GuardError, PauseType};
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, String, Symbol, Vec};
 
 fn require_not_paused(e: &Env, operation: u32) {
     if EmergencyGuard::is_paused(e.clone(), operation) {
@@ -176,10 +176,17 @@ impl TokenTrait for Token {
             EmergencyGuard::is_paused(e, operation)
         }
 
-        fn allowance(e: Env, from: Address, spender: Address) -> i128 {
-            e.storage().instance().extend_ttl(100, 100);
-            read_allowance(&e, from, spender).amount
-        }
+        e.events().publish(
+            (Symbol::new(&e, "burn"), from.clone()),
+            BurnEvent {
+                burner: from.clone(),
+                target_account: from,
+                amount,
+            },
+        );
+        spend_balance(&e, from, amount);
+        write_total_supply(&e, read_total_supply(&e) - amount);
+    }
 
         fn approve(e: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
             from.require_auth();
@@ -188,10 +195,18 @@ impl TokenTrait for Token {
             write_allowance(&e, from, spender, amount, expiration_ledger);
         }
 
-        fn balance(e: Env, id: Address) -> i128 {
-            e.storage().instance().extend_ttl(100, 100);
-            read_balance(&e, id)
-        }
+        e.events().publish(
+            (Symbol::new(&e, "burn"), from.clone()),
+            BurnEvent {
+                burner: spender,
+                target_account: from,
+                amount,
+            },
+        );
+        spend_allowance(&e, from.clone(), spender, amount);
+        spend_balance(&e, from, amount);
+        write_total_supply(&e, read_total_supply(&e) - amount);
+    }
 
         fn transfer(e: Env, from: Address, to: Address, amount: i128) {
             require_not_paused(&e, PauseType::TRANSFER);
