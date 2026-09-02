@@ -6,6 +6,7 @@ mod benchmarks;
 mod cache;
 mod call_trace_parser;
 mod comparison;
+mod config;
 mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
@@ -56,7 +57,6 @@ use axum::{
     routing::{get, post},
     Extension, Router,
 };
-use config::{Config, ConfigError};
 use prometheus::{Encoder, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use simulation_service::{AnalysisResult, SimulationMetric, SimulationService};
@@ -65,6 +65,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 // CLI Argument Handling
+use crate::config::{load_config, AppConfig};
 use crate::fee_analytics::{FeeAnalyticsEngine, MarketConditions, ModelBreakdown};
 use crate::fee_collector::{FeeCollector, FeeCollectorConfig};
 use crate::fee_store::FeeStore;
@@ -81,221 +82,6 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct AppConfig {
-    /// Port for the HTTP server
-    server_port: u16,
-    /// Rust log level (e.g., "info", "debug")
-    rust_log: String,
-    /// Primary RPC URL — used as a single-provider fallback when
-    /// `RPC_PROVIDERS` is not set.
-    soroban_rpc_url: String,
-    /// Optional RSA Private Key PEM for RS256 JWTs. If missing, a dev key is generated.
-    jwt_private_key: Option<String>,
-    /// Stellar network passphrase
-    network_passphrase: String,
-    /// Redis URL reserved for the distributed cache migration (issue #65).
-    /// Unused in the MVP in-memory implementation — present so the config
-    /// surface is stable when Redis is wired in.
-    redis_url: String,
-    /// JSON-encoded array of RPC provider objects. Example:
-    /// ```json
-    /// [
-    ///   {"name":"stellar-testnet","url":"[https://soroban-testnet.stellar.org](https://soroban-testnet.stellar.org)"},
-    ///   {"name":"blockdaemon","url":"[https://soroban.blockdaemon.com](https://soroban.blockdaemon.com)","auth_header":"X-API-Key","auth_value":"KEY"}
-    /// ]
-    /// ```
-    /// When empty or absent the engine falls back to `soroban_rpc_url`.
-    #[serde(default)]
-    rpc_providers: String,
-    /// Stable node identifier used for gossip snapshots.
-    #[serde(default)]
-    registry_instance_id: String,
-    /// Public base URL announced to peers, e.g. `https://api-a.example.com`.
-    #[serde(default)]
-    registry_public_url: String,
-    /// Seed peers as a JSON array or comma-separated list of base URLs.
-    #[serde(default)]
-    registry_seed_peers: String,
-    /// Health-check interval in seconds (default 30).
-    #[serde(default = "default_health_check_interval")]
-    health_check_interval_secs: u64,
-    /// Gossip sync interval in seconds (default 30).
-    #[serde(default = "default_gossip_interval_secs")]
-    gossip_interval_secs: u64,
-    /// Simulation timeout in seconds (default 30).
-    #[serde(default = "default_simulation_timeout_secs")]
-    simulation_timeout_secs: u64,
-    /// Simulation execution mode: `failover` or `consensus`.
-    #[serde(default = "default_simulation_mode")]
-    simulation_mode: String,
-    /// Database URL for job queue (PostgreSQL or SQLite)
-    #[serde(default = "default_database_url")]
-    database_url: String,
-    /// Pre-shared secret for inbound webhook HMAC validation.
-    #[serde(default = "default_inbound_webhook_secret")]
-    inbound_webhook_secret: String,
-    /// Job timeout in seconds (default 300).
-    #[serde(default = "default_job_timeout_secs")]
-    job_timeout_secs: u64,
-    /// Max concurrent jobs (default 10).
-    #[serde(default = "default_max_concurrent_jobs")]
-    max_concurrent_jobs: usize,
-    /// Number of threads for the dedicated event worker pool.
-    #[serde(default = "default_event_worker_threads")]
-    event_worker_threads: usize,
-    /// Fee data collection interval in seconds (default 5).
-    #[serde(default = "default_fee_collection_interval")]
-    fee_collection_interval_secs: u64,
-    /// Fee data retention period in days (default 30).
-    #[serde(default = "default_fee_retention_days")]
-    fee_retention_days: u32,
-    /// Enable fee market analysis (default true).
-    #[serde(default = "default_fee_analysis_enabled")]
-    fee_analysis_enabled: bool,
-    /// Emergency pause for message verification (default false).
-    /// When true, all verification endpoints return an error.
-    #[serde(default = "default_emergency_verification_paused")]
-    emergency_verification_paused: bool,
-    /// Filesystem path that backs the disk-persistent L2 cache. When
-    /// empty the L2 tier is disabled and the service runs L1-only (same
-    /// behaviour as before #104).
-    #[serde(default = "default_disk_cache_path")]
-    disk_cache_path: String,
-    /// Number of ledgers a cached entry may lag the current ledger before
-    /// L2 treats it as stale. Default 100 ≈ 8 minutes at 5 s/ledger.
-    #[serde(default = "default_max_ledger_age")]
-    max_ledger_age: u32,
-    /// Comma-separated list of origins the CORS layer allows on the public
-    /// API routes (issue #670). Empty means any origin — development fallback.
-    #[serde(default)]
-    cors_allowed_origins: String,
-    /// Broadcast channel capacity for the WebSocket event bus (issue #565).
-    /// Controls the per-subscriber in-flight event buffer; slow consumers
-    /// that fall behind receive `RecvError::Lagged` (backpressure via drop).
-    /// Clamped to [16, 65536]. Default 256.
-    #[serde(default = "default_event_bus_capacity")]
-    event_bus_capacity: usize,
-    /// Emit structured JSON log lines instead of the default human-readable
-    /// format (issue #572). Set `LOG_FORMAT=json` to enable.
-    log_format_json: bool,
-    /// Comma-separated list of allowed CORS origins.
-    /// Example: `http://localhost:3000,https://app.example.com`
-    /// When empty, defaults to `*` (allow all origins).
-    #[serde(default = "default_allowed_origins")]
-    allowed_origins: String,
-}
-
-fn default_health_check_interval() -> u64 {
-    30
-}
-
-fn default_simulation_timeout_secs() -> u64 {
-    30
-}
-
-fn default_simulation_mode() -> String {
-    "failover".to_string()
-}
-
-fn default_gossip_interval_secs() -> u64 {
-    30
-}
-
-fn default_database_url() -> String {
-    "sqlite://soroscope.db".to_string()
-}
-
-fn default_inbound_webhook_secret() -> String {
-    String::new()
-}
-
-fn default_job_timeout_secs() -> u64 {
-    300
-}
-
-fn default_max_concurrent_jobs() -> usize {
-    10
-}
-
-fn default_event_worker_threads() -> usize {
-    4
-}
-
-fn default_fee_collection_interval() -> u64 {
-    5
-}
-
-fn default_fee_retention_days() -> u32 {
-    30
-}
-
-fn default_fee_analysis_enabled() -> bool {
-    true
-}
-
-fn default_emergency_verification_paused() -> bool {
-    false
-}
-fn default_disk_cache_path() -> String {
-    // Empty == L2 disabled. Operators who want persistence set this in
-    // env / config.toml explicitly; we don't create a hidden directory
-    // in the CWD by default.
-    String::new()
-}
-
-fn default_max_ledger_age() -> u32 {
-    100
-}
-
-fn default_event_bus_capacity() -> usize {
-    256
-fn default_allowed_origins() -> String {
-    // Empty string means: fall back to allow-all (*).
-    // Operators set ALLOWED_ORIGINS=http://localhost:3000,https://app.example.com
-    // in their environment to restrict access.
-    String::new()
-}
-
-fn load_config() -> Result<AppConfig, ConfigError> {
-    dotenvy::dotenv().ok();
-
-    let settings = Config::builder()
-        .add_source(config::Environment::default())
-        .set_default("server_port", 8080)?
-        .set_default("rust_log", "info")?
-        .set_default("soroban_rpc_url", "https://soroban-testnet.stellar.org")?
-        .set_default("network_passphrase", "Test SDF Network ; September 2015")?
-        .set_default("redis_url", "redis://127.0.0.1:6379")?
-        .set_default("rpc_providers", "")?
-        .set_default("registry_instance_id", "")?
-        .set_default("registry_public_url", "")?
-        .set_default("registry_seed_peers", "")?
-        .set_default("health_check_interval_secs", 30)?
-        .set_default("gossip_interval_secs", 30)?
-        .set_default("simulation_timeout_secs", 30)?
-        .set_default("simulation_mode", "failover")?
-        .set_default("database_url", "sqlite://soroscope.db")?
-        .set_default("inbound_webhook_secret", "")?
-        .set_default("job_timeout_secs", 300)?
-        .set_default("max_concurrent_jobs", 10)?
-        .set_default("event_worker_threads", 4)?
-        .set_default("fee_collection_interval_secs", 5)?
-        .set_default("fee_retention_days", 30)?
-        .set_default("fee_analysis_enabled", true)?
-        .set_default("emergency_verification_paused", false)?
-        .set_default("disk_cache_path", "")?
-        .set_default("max_ledger_age", 100)?
-        .set_default("cors_allowed_origins", "")?
-        .set_default("event_bus_capacity", 256)?
-        .set_default("log_format_json", false)?
-        .set_default("allowed_origins", "")?
-        .build()?;
-
-    settings.try_deserialize()
-}
 
 /// Build the tracing `EnvFilter` from the configured log directive
 /// (`RUST_LOG`, defaulting to `"info"` — see [`AppConfig::rust_log`]).
@@ -2464,7 +2250,7 @@ async fn main() {
         .await
         .expect("Failed to initialize job queue");
     // ── WebSocket event bus (#565: configurable bounded channel) ───────
-    let simulation_bus = SimulationBus::with_capacity(config.event_bus_capacity);
+    let simulation_bus = SimulationBus::with_capacity(config.clamped_event_bus_capacity());
 
     // Spawn background cleanup task
     job_queue.spawn_cleanup_task();
