@@ -284,7 +284,7 @@ fn format_sc_val(value: &soroban_sdk::xdr::ScVal) -> String {
         ScVal::I256(value) => format!("{value:?}"),
         ScVal::Symbol(value) => format!(":{}", format_symbol(value)),
         ScVal::String(value) => String::from_utf8_lossy(value.0.as_ref()).into_owned(),
-        ScVal::Bytes(value) => format!("0x{}", hex::encode(value.as_ref())),
+        ScVal::Bytes(value) => format!("0x{}", hex::encode(AsRef::<[u8]>::as_ref(value))),
         _ => format!("{value:?}"),
     }
 }
