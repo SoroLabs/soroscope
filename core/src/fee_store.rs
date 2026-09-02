@@ -235,6 +235,13 @@ impl FeeStore {
         Ok(count)
     }
 
+    /// Close the database connection pool
+    pub async fn close(&self) {
+        tracing::info!("Closing FeeStore database connections");
+        self.pool.close().await;
+        tracing::info!("FeeStore database connections closed");
+    }
+
     /// Batch insert multiple ledger samples
     pub async fn batch_insert_samples(
         &self,

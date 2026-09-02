@@ -889,6 +889,23 @@ impl JobQueue {
         })
     }
 
+    /// Close all database connections gracefully
+    pub async fn close(&self) {
+        tracing::info!("Closing JobQueue database connections");
+        match &self.pool {
+            DbPool::Postgres(pool) => {
+                pool.close().await;
+                tracing::info!("PostgreSQL connection pool closed");
+            }
+            DbPool::Sqlite(pool) => {
+                pool.close().await;
+                tracing::info!("SQLite connection pool closed");
+            }
+        }
+        // Redis connection will be dropped when the client is dropped
+        tracing::info!("JobQueue closed successfully");
+    }
+
     fn row_to_job(&self, row: &sqlx::sqlite::SqliteRow) -> Result<Job, JobError> {
         // Manual mapping for SQLite since FromRow might have issues
         use sqlx::Row;
