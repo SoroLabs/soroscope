@@ -3,6 +3,14 @@ name = "soroscope-core"
 version = "0.1.0"
 edition = "2021"
 
+# The root workspace only lists the contract crates as members, so opt out
+# explicitly — without this, cargo refuses to build the package at all.
+
+[lib]
+name = "soroscope_core"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
 [dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 # Used directly for the local WASM simulation runner. `testutils` exposes
@@ -31,6 +39,7 @@ tracing-opentelemetry = "0.28"
 prometheus = "0.14"
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "request-id", "set-header", "compression-full"] }
+
 utoipa = { version = "4", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "7", features = ["axum", "vendored"] }
 base64 = "0.22"

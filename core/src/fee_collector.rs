@@ -106,37 +106,29 @@ impl FeeCollector {
                     tracing::info!("Fee collector shutting down");
                     break;
                 }
-                _ = interval.tick() => {
-                    // Only the elected leader collects, so a multi-replica
-                    // deployment does not write duplicate fee samples.
-                    if !self.leader_lock.try_acquire_or_renew().await {
-                        tracing::debug!("not leader this cycle, skipping fee collection");
-                        continue;
-                    }
+                _ = interval.tick() => {}
+            }
 
-                    let started_at = Instant::now();
-                    let result = self.collect_latest_fees().await;
-                    self.metrics
-                        .indexing_latency_seconds
-                        .with_label_values(&["fee_collector"])
-                        .observe(started_at.elapsed().as_secs_f64());
+            if !self.leader_lock.try_acquire_or_renew().await {
+                tracing::debug!("not leader this cycle, skipping fee collection");
+                continue;
+            }
 
-                    match result {
-                        Ok(true) => {
-                            self.metrics
-                                .events_processed_total
-                                .with_label_values(&["fee_collector"])
-                                .inc();
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            tracing::error!(error = %e, "Failed to collect fee data");
-                            self.metrics
-                                .indexing_errors_total
-                                .with_label_values(&["fee_collector"])
-                                .inc();
-                        }
-                    }
+            let started_at = Instant::now();
+            let result = self.collect_latest_fees().await;
+            self.metrics
+                .indexing_latency_seconds
+                .with_label_values(&["fee_collector"])
+                .observe(started_at.elapsed().as_secs_f64());
+
+            match result {
+                Ok(true) => {
+                    self.metrics.events_processed_total.inc();
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to collect fee data");
+                    self.metrics.indexing_errors_total.inc();
                 }
             }
         }

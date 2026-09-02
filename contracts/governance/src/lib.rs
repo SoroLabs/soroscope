@@ -447,11 +447,7 @@ impl GovernanceContract {
         Ok(votes.checked_mul(votes).ok_or(Error::InvalidCredits)?)
     }
 
-    pub fn get_vote_receipt(
-        env: Env,
-        proposal_id: u32,
-        voter: Address,
-    ) -> Option<VoteReceipt> {
+    pub fn get_vote_receipt(env: Env, proposal_id: u32, voter: Address) -> Option<VoteReceipt> {
         let proposal = get_proposal(&env, proposal_id).ok()?;
         proposal.voter_receipts.get(voter)
     }

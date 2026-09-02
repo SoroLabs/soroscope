@@ -52,6 +52,7 @@ impl Proxy {
     /// Returns pending upgrade details if one exists
     pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
         env.storage().persistent().get(&DataKey::PendingUpgrade)
+    }
     pub fn upgrade_to(env: Env, implementation: Address) {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
@@ -152,10 +153,6 @@ impl Proxy {
 
         env.events()
             .publish((symbol_short!("upgraded"),), proposal.new_implementation);
-
-            .instance()
-            .set(&DataKey::Implementation, &implementation);
-        Self::delegate_call(env, method, args)
     }
 
     pub fn delegate_call(env: Env, method: Symbol, args: Vec<Val>) -> Val {
@@ -173,10 +170,7 @@ impl Proxy {
     }
 
     pub fn get_value(env: Env) -> i32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::Counter)
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::Counter).unwrap_or(0)
     }
 
     pub fn set_value(env: Env, value: i32) {

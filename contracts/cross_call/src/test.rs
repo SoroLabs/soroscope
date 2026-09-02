@@ -1,11 +1,11 @@
 use super::{ContractA, ContractAClient, ContractB};
-use soroban_sdk::{Address, Env};
 use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{Address, Env};
 
 #[test]
 fn test_cross_contract_call() {
     let env = Env::default();
-    
+
     let contract_b_id = Address::generate(&env);
     env.register_at(&contract_b_id, ContractB, ());
 

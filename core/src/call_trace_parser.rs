@@ -197,15 +197,13 @@ mod tests {
             ScVal::Symbol(ScSymbol(string_m))
         };
 
-        // topics[1] is the contract address. It is a 56-character strkey, which
-        // does not fit in an ScSymbol (max 32 chars), so it must be encoded as
-        // an ScVal::Address rather than a symbol.
-        let contract_addr = ScVal::Address(soroban_sdk::xdr::ScAddress::Contract(
-            soroban_sdk::xdr::Hash([0u8; 32]),
-        ));
-        let topics: VecM<ScVal> = vec![sym(topic0), contract_addr, sym(fn_name)]
-            .try_into()
-            .unwrap();
+        let topics: VecM<ScVal> = vec![
+            sym(topic0),
+            sym("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"),
+            sym(fn_name),
+        ]
+        .try_into()
+        .unwrap();
 
         let event = DiagnosticEvent {
             in_successful_contract_call: true,

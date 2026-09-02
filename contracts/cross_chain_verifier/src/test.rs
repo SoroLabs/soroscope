@@ -13,15 +13,20 @@ fn make_payload(env: &Env, nonce: u64) -> Payload {
         nonce,
         data,
     }
+}
 
 fn compute_leaf(env: &Env, payload: &Payload) -> BytesN<32> {
     CrossChainVerifier::compute_payload_hash(env, payload)
-use crate::{CrossChainVerifier, CrossChainVerifierClient};
+}
 use crate::{
     CrossChainMessage, CrossChainVerifier, CrossChainVerifierClient, SignatureAlgorithm,
     SignedMessage,
 };
-use crate::{CrossChainVerifier, CrossChainVerifierClient, CrossChainMessage, SignedMessage, SignatureAlgorithm};
+use crate::{
+    CrossChainMessage, CrossChainVerifier, CrossChainVerifierClient, SignatureAlgorithm,
+    SignedMessage,
+};
+use crate::{CrossChainVerifier, CrossChainVerifierClient};
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, Vec};
 
@@ -122,8 +127,21 @@ fn test_verify_message_and_consume_nonce() {
     let sibling1 = BytesN::from_array(&env, &[3; 32]);
     let sibling2 = BytesN::from_array(&env, &[4; 32]);
 
-    let hash_1 = merkle_hash_pair(&env, &sibling1.to_array(), &leaf.to_array());
-    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
+    let mut combined_1 = [0u8; 64];
+    combined_1[0..32].copy_from_slice(&sibling1.to_array());
+    combined_1[32..64].copy_from_slice(&leaf.to_array());
+    let hash_1 = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &combined_1))
+        .to_array();
+
+    let mut combined_2 = [0u8; 64];
+    combined_2[0..32].copy_from_slice(&hash_1);
+    combined_2[32..64].copy_from_slice(&sibling2.to_array());
+    let final_root = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &combined_2))
+        .to_array();
 
     let expected_root_bytes = BytesN::from_array(&env, &final_root);
     let block_height = 100;
@@ -157,8 +175,21 @@ fn test_replay_nonce_panics() {
     let sibling1 = BytesN::from_array(&env, &[3; 32]);
     let sibling2 = BytesN::from_array(&env, &[4; 32]);
 
-    let hash_1 = merkle_hash_pair(&env, &sibling1.to_array(), &leaf.to_array());
-    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
+    let mut combined_1 = [0u8; 64];
+    combined_1[0..32].copy_from_slice(&sibling1.to_array());
+    combined_1[32..64].copy_from_slice(&leaf.to_array());
+    let hash_1 = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &combined_1))
+        .to_array();
+
+    let mut combined_2 = [0u8; 64];
+    combined_2[0..32].copy_from_slice(&hash_1);
+    combined_2[32..64].copy_from_slice(&sibling2.to_array());
+    let final_root = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &combined_2))
+        .to_array();
 
     let expected_root_bytes = BytesN::from_array(&env, &final_root);
     let block_height = 100;
@@ -242,7 +273,7 @@ fn test_verify_message_different_nonce_allowed() {
     let contract_id = env.register_contract(None, CrossChainVerifier);
     // Create a test Ed25519 public key (32 bytes)
     let public_key = Bytes::from_slice(&env, &[1; 32]);
-    
+
     client.add_authorized_signer(&public_key, &SignatureAlgorithm::Ed25519);
 
     // Verify signer count increased
@@ -263,7 +294,7 @@ fn test_add_authorized_signer_secp256k1() {
 
     // Create a test Secp256k1 public key (33 bytes compressed)
     let public_key = Bytes::from_slice(&env, &[2; 33]);
-    
+
     client.add_authorized_signer(&public_key, &SignatureAlgorithm::Secp256k1);
 
     // Verify signer count increased
@@ -284,7 +315,7 @@ fn test_add_duplicate_signer() {
     client.initialize(&admin);
 
     let public_key = Bytes::from_slice(&env, &[1; 32]);
-    
+
     client.add_authorized_signer(&public_key, &SignatureAlgorithm::Ed25519);
     client.add_authorized_signer(&public_key, &SignatureAlgorithm::Ed25519); // Should panic
 }
@@ -401,7 +432,7 @@ fn test_compute_payload_hash_differs_by_destination() {
     let h2 = CrossChainVerifier::compute_payload_hash(&env, &p2);
     assert_ne!(h1, h2);
     let public_key = Bytes::from_slice(&env, &[1; 32]);
-    
+
     client.add_authorized_signer(&public_key, &SignatureAlgorithm::Ed25519);
     assert_eq!(client.get_signer_count(), 1);
 
@@ -453,8 +484,14 @@ fn test_verify_signed_message_success_ed25519() {
     let message_hash: BytesN<32> = {
         let mut data = Bytes::new(&env);
         data.append(&Bytes::from_slice(&env, b"CROSS_CHAIN_MESSAGE_V1"));
-        data.append(&Bytes::from_slice(&env, &message.source_chain.to_be_bytes()));
-        data.append(&Bytes::from_slice(&env, &message.destination_chain.to_be_bytes()));
+        data.append(&Bytes::from_slice(
+            &env,
+            &message.source_chain.to_be_bytes(),
+        ));
+        data.append(&Bytes::from_slice(
+            &env,
+            &message.destination_chain.to_be_bytes(),
+        ));
         data.append(&Bytes::from_slice(&env, &message.nonce.to_be_bytes()));
         data.append(&Bytes::from_slice(&env, &message.timestamp.to_be_bytes()));
         let payload_hash = env.crypto().sha256(&message.payload).to_array();
@@ -474,8 +511,21 @@ fn test_verify_signed_message_success_ed25519() {
     let sibling1 = BytesN::from_array(&env, &[3; 32]);
     let sibling2 = BytesN::from_array(&env, &[4; 32]);
 
-    let hash_1 = merkle_hash_pair(&env, &sibling1.to_array(), &message_hash.to_array());
-    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
+    let mut combined_1 = [0u8; 64];
+    combined_1[0..32].copy_from_slice(&sibling1.to_array());
+    combined_1[32..64].copy_from_slice(&message_hash.to_array());
+    let hash_1 = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &combined_1))
+        .to_array();
+
+    let mut combined_2 = [0u8; 64];
+    combined_2[0..32].copy_from_slice(&hash_1);
+    combined_2[32..64].copy_from_slice(&sibling2.to_array());
+    let final_root = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &combined_2))
+        .to_array();
 
     let expected_root = BytesN::from_array(&env, &final_root);
     let block_height = 100;
@@ -493,7 +543,8 @@ fn test_verify_signed_message_success_ed25519() {
     assert!(result);
 
     // Second verification of the same signed message should fail due to replay protection.
-    let replay_result = client.verify_signed_message(&signed_message, &block_height, &proof, &proof_flags);
+    let replay_result =
+        client.verify_signed_message(&signed_message, &block_height, &proof, &proof_flags);
     assert!(!replay_result);
 }
 
@@ -525,8 +576,14 @@ fn test_verify_signed_message_accepts_valid_signature() {
     let message_hash: BytesN<32> = {
         let mut data = Bytes::new(&env);
         data.append(&Bytes::from_slice(&env, b"CROSS_CHAIN_MESSAGE_V1"));
-        data.append(&Bytes::from_slice(&env, &message.source_chain.to_be_bytes()));
-        data.append(&Bytes::from_slice(&env, &message.destination_chain.to_be_bytes()));
+        data.append(&Bytes::from_slice(
+            &env,
+            &message.source_chain.to_be_bytes(),
+        ));
+        data.append(&Bytes::from_slice(
+            &env,
+            &message.destination_chain.to_be_bytes(),
+        ));
         data.append(&Bytes::from_slice(&env, &message.nonce.to_be_bytes()));
         data.append(&Bytes::from_slice(&env, &message.timestamp.to_be_bytes()));
         let payload_hash = env.crypto().sha256(&message.payload).to_array();
@@ -547,8 +604,21 @@ fn test_verify_signed_message_accepts_valid_signature() {
     let sibling1 = BytesN::from_array(&env, &[11; 32]);
     let sibling2 = BytesN::from_array(&env, &[13; 32]);
 
-    let hash_1 = merkle_hash_pair(&env, &sibling1.to_array(), &leaf.to_array());
-    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
+    let mut combined_1 = [0u8; 64];
+    combined_1[0..32].copy_from_slice(&sibling1.to_array());
+    combined_1[32..64].copy_from_slice(&leaf.to_array());
+    let hash_1 = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &combined_1))
+        .to_array();
+
+    let mut combined_2 = [0u8; 64];
+    combined_2[0..32].copy_from_slice(&hash_1);
+    combined_2[32..64].copy_from_slice(&sibling2.to_array());
+    let final_root = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &combined_2))
+        .to_array();
 
     let expected_root = BytesN::from_array(&env, &final_root);
     let block_height = 200;
@@ -588,7 +658,7 @@ fn test_verify_signed_message_with_invalid_signer() {
     // Create a signed message with an unauthorized signer
     let unauthorized_public_key = Bytes::from_slice(&env, &[99; 32]);
     let signature = BytesN::from_array(&env, &[0; 64]);
-    
+
     let signed_message = SignedMessage {
         message,
         signature,
@@ -619,7 +689,7 @@ fn test_multiple_authorized_signers() {
     // Add multiple signers with different algorithms
     let ed25519_key = Bytes::from_slice(&env, &[1; 32]);
     let secp256k1_key = Bytes::from_slice(&env, &[2; 33]);
-    
+
     client.add_authorized_signer(&ed25519_key, &SignatureAlgorithm::Ed25519);
     client.add_authorized_signer(&secp256k1_key, &SignatureAlgorithm::Secp256k1);
 
@@ -712,11 +782,22 @@ fn test_signer_removal_performance() {
 fn setup_valid_proof(
     env: &Env,
     client: &CrossChainVerifierClient,
-) -> (u32, BytesN<32>, soroban_sdk::Vec<BytesN<32>>, soroban_sdk::Vec<bool>) {
+) -> (
+    u32,
+    BytesN<32>,
+    soroban_sdk::Vec<BytesN<32>>,
+    soroban_sdk::Vec<bool>,
+) {
     let leaf = BytesN::from_array(env, &[2u8; 32]);
     let sibling = BytesN::from_array(env, &[3u8; 32]);
 
-    let root_arr = merkle_hash_pair(env, &sibling.to_array(), &leaf.to_array());
+    let mut combined = [0u8; 64];
+    combined[0..32].copy_from_slice(&sibling.to_array());
+    combined[32..64].copy_from_slice(&leaf.to_array());
+    let root_arr = env
+        .crypto()
+        .sha256(&Bytes::from_slice(env, &combined))
+        .to_array();
     let root = BytesN::from_array(env, &root_arr);
 
     let block_height: u32 = 42;

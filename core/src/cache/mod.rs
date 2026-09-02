@@ -6,15 +6,15 @@
 //! `with_disk_cache` to attach an L2 store — when it is set, reads walk
 //! L1 → L2 → miss (and promote L2 hits into L1), and writes populate both
 //! layers so state survives restarts.
-//!
-//! `ContractCache` follows the same L1/L2 shape for active ledger entries:
-//! a thread-safe in-memory LRU cache (`ledger_memory`, configurable TTL)
-//! sits in front of the Sled-backed `ledger_tree`, so repeated reads for
-//! hot ledger entries avoid hitting disk.
-#![allow(unused_imports)]
 
 pub mod disk;
+//
+// `ContractCache` follows the same L1/L2 shape for active ledger entries:
+// a thread-safe in-memory LRU cache (`ledger_memory`, configurable TTL)
+// sits in front of the Sled-backed `ledger_tree`, so repeated reads for
+// hot ledger entries avoid hitting disk.
 
+use crate::simulation::SimulationResult;
 use crate::simulation::{SimulationResult, SorobanResources};
 use moka::future::Cache;
 use moka::sync::Cache as SyncCache;
@@ -43,7 +43,7 @@ fn ledger_cache_ttl() -> Duration {
         .unwrap_or(Duration::from_secs(LEDGER_CACHE_TTL_SECS_DEFAULT))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Debug, Serialize, Deserialize)]
 struct CacheEntry<T> {
     data: T,
     ledger_sequence: u64,

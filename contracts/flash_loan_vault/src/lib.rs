@@ -578,7 +578,10 @@ impl FlashLoanVault {
             set_flash_loan_active(&e, false);
             e.storage().instance().set(
                 &DataKey::BorrowRecord(borrower.clone()),
-                &BorrowRecord { fee: 0, total_repayment: 0 },
+                &BorrowRecord {
+                    fee: 0,
+                    total_repayment: 0,
+                },
             );
             return Err(Error::InvalidReceiver);
         }
@@ -591,75 +594,76 @@ impl FlashLoanVault {
             set_flash_loan_active(&e, false);
             e.storage().instance().set(
                 &DataKey::BorrowRecord(borrower.clone()),
-                &BorrowRecord { fee: 0, total_repayment: 0 },
+                &BorrowRecord {
+                    fee: 0,
+                    total_repayment: 0,
+                },
             );
+            if post_balance < required_balance {
+                e.storage()
+                    .instance()
+                    .remove(&DataKey::BorrowRecord(borrower));
+                return Err(Error::LoanNotRepaid);
+            }
+
+            // 10. Clear reentrancy guard and borrow record.
+            set_flash_loan_active(&e, false);
+            // Overwrite the temporary record with zeros to avoid stale data.
+            e.storage().instance().set(
+                &DataKey::BorrowRecord(borrower.clone()),
+                &BorrowRecord {
+                    fee: 0,
+                    total_repayment: 0,
+                },
+            );
+
+            // 11. If fee collected, update total deposited.
+            if fee > 0 {
+                let deposited = get_total_deposited(&e);
+                set_total_deposited(&e, deposited + fee);
+            }
+
+            // 12. Emit same event as flash_loan for observability.
+            e.events().publish(
+                (String::from_str(&e, "borrow"), borrower.clone()),
+                FlashLoanEvent {
+                    receiver: borrower,
+                    token: token_addr,
+                    amount,
+                    fee,
+                },
+            );
+
+            Ok(fee)
         }
-        
-        
-        if post_balance < required_balance {
-            e.storage()
-                .instance()
-                .remove(&DataKey::BorrowRecord(borrower));
-            return Err(Error::LoanNotRepaid);
+
+        // ── Views ────────────────────────────────────────────────────────────────
+
+        /// Returns the current fee in basis points.
+        pub fn get_fee(e: Env) -> i128 {
+            get_fee_bps(&e)
         }
 
-        // 10. Clear reentrancy guard and borrow record.
-        set_flash_loan_active(&e, false);
-        // Overwrite the temporary record with zeros to avoid stale data.
-        e.storage().instance().set(
-            &DataKey::BorrowRecord(borrower.clone()),
-            &BorrowRecord {
-                fee: 0,
-                total_repayment: 0,
-            },
-        );
-
-        // 11. If fee collected, update total deposited.
-        if fee > 0 {
-            let deposited = get_total_deposited(&e);
-            set_total_deposited(&e, deposited + fee);
+        /// Returns the amount of tokens available for flash loans.
+        pub fn get_available(e: Env) -> Result<i128, Error> {
+            let token_addr = load_token(&e)?;
+            let token = soroban_sdk::token::Client::new(&e, &token_addr);
+            Ok(token.balance(&e.current_contract_address()))
         }
 
-        // 12. Emit same event as flash_loan for observability.
-        e.events().publish(
-            (String::from_str(&e, "borrow"), borrower.clone()),
-            FlashLoanEvent {
-                receiver: borrower,
-                token: token_addr,
-                amount,
-                fee,
-            },
-        );
+        /// Returns the token address this vault lends.
+        pub fn get_token(e: Env) -> Result<Address, Error> {
+            load_token(&e)
+        }
 
-        Ok(fee)
-    }
+        /// Returns the vault admin.
+        pub fn get_admin(e: Env) -> Result<Address, Error> {
+            load_admin(&e)
+        }
 
-    // ── Views ────────────────────────────────────────────────────────────────
-
-    /// Returns the current fee in basis points.
-    pub fn get_fee(e: Env) -> i128 {
-        get_fee_bps(&e)
-    }
-
-    /// Returns the amount of tokens available for flash loans.
-    pub fn get_available(e: Env) -> Result<i128, Error> {
-        let token_addr = load_token(&e)?;
-        let token = soroban_sdk::token::Client::new(&e, &token_addr);
-        Ok(token.balance(&e.current_contract_address()))
-    }
-
-    /// Returns the token address this vault lends.
-    pub fn get_token(e: Env) -> Result<Address, Error> {
-        load_token(&e)
-    }
-
-    /// Returns the vault admin.
-    pub fn get_admin(e: Env) -> Result<Address, Error> {
-        load_admin(&e)
-    }
-
-    /// Returns the total amount deposited by the admin.
-    pub fn get_total_deposited(e: Env) -> i128 {
-        get_total_deposited(&e)
+        /// Returns the total amount deposited by the admin.
+        pub fn get_total_deposited(e: Env) -> i128 {
+            get_total_deposited(&e)
+        }
     }
 }

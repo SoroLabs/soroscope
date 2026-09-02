@@ -77,8 +77,14 @@ fn simulate_batch(
     let mut remaining_balance = token_client.balance(sender);
     let mut results = Vec::new(env);
 
-    let zero_address_g = Address::from_string(&String::from_str(env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"));
-    let zero_address_c = Address::from_string(&String::from_str(env, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABU"));
+    let zero_address_g = Address::from_string(&String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    let zero_address_c = Address::from_string(&String::from_str(
+        env,
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABU",
+    ));
 
     for i in 0..len {
         let recipient = recipients.get(i).unwrap();

@@ -193,7 +193,11 @@ fn collateral_value(price: i128, collateral_amount: i128) -> Result<i128, Error>
     Ok(checked_mul(collateral_amount, price)? / PRICE_SCALE)
 }
 
-fn collateral_ratio_bps(price: i128, collateral_amount: i128, debt_amount: i128) -> Result<i128, Error> {
+fn collateral_ratio_bps(
+    price: i128,
+    collateral_amount: i128,
+    debt_amount: i128,
+) -> Result<i128, Error> {
     if debt_amount <= 0 {
         return Ok(i128::MAX);
     }
@@ -201,7 +205,10 @@ fn collateral_ratio_bps(price: i128, collateral_amount: i128, debt_amount: i128)
 }
 
 fn total_debt(env: &Env) -> i128 {
-    env.storage().instance().get(&DataKey::TotalDebt).unwrap_or(0)
+    env.storage()
+        .instance()
+        .get(&DataKey::TotalDebt)
+        .unwrap_or(0)
 }
 
 fn total_collateral(env: &Env) -> i128 {
@@ -227,8 +234,8 @@ fn borrow_rate_bps(model: &InterestRateModel, utilization: i128) -> Result<i128,
     } else {
         let base = checked_add(model.base_rate_bps, model.slope1_bps)?;
         let excess_util = utilization - model.optimal_utilization_bps;
-        let tail = checked_mul(excess_util, model.slope2_bps)?
-            / (BPS - model.optimal_utilization_bps);
+        let tail =
+            checked_mul(excess_util, model.slope2_bps)? / (BPS - model.optimal_utilization_bps);
         checked_add(base, tail)
     }
 }
@@ -257,7 +264,9 @@ fn accrue_position(env: &Env, user: Address) -> Result<Position, Error> {
     if interest > 0 {
         position.debt_amount = checked_add(position.debt_amount, interest)?;
         let new_total_debt = checked_add(total_debt(env), interest)?;
-        env.storage().instance().set(&DataKey::TotalDebt, &new_total_debt);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalDebt, &new_total_debt);
         let new_supply = checked_add(
             env.storage()
                 .instance()
@@ -279,22 +288,23 @@ fn dynamic_collateral_floor(env: &Env) -> Result<i128, Error> {
     let params = read_risk_params(env)?;
     let volatility = oracle_volatility_bps(env)?;
     let config = &params.volatility_config;
-    
+
     // If volatility is below low threshold, use base floor
     if volatility <= config.low_volatility_threshold_bps {
         return Ok(config.base_collateral_floor_bps);
     }
-    
+
     // If volatility is above high threshold, use max floor
     if volatility >= config.high_volatility_threshold_bps {
         return Ok(config.max_collateral_floor_bps);
     }
-    
+
     // Linear interpolation between base and max floor
-    let volatility_range = config.high_volatility_threshold_bps - config.low_volatility_threshold_bps;
+    let volatility_range =
+        config.high_volatility_threshold_bps - config.low_volatility_threshold_bps;
     let volatility_above_low = volatility - config.low_volatility_threshold_bps;
     let floor_range = config.max_collateral_floor_bps - config.base_collateral_floor_bps;
-    
+
     let additional_floor = checked_mul(floor_range, volatility_above_low)? / volatility_range;
     checked_add(config.base_collateral_floor_bps, additional_floor)
 }
@@ -304,14 +314,14 @@ fn ensure_safe(env: &Env, position: &Position) -> Result<(), Error> {
     let params = read_risk_params(env)?;
     let dynamic_floor = dynamic_collateral_floor(env)?;
     let ratio = collateral_ratio_bps(price, position.collateral_amount, position.debt_amount)?;
-    
+
     // Use the higher of static min ratio or dynamic floor
     let required_ratio = if params.min_collateral_ratio_bps > dynamic_floor {
         params.min_collateral_ratio_bps
     } else {
         dynamic_floor
     };
-    
+
     if ratio < required_ratio {
         return Err(Error::Undercollateralized);
     }
@@ -382,9 +392,13 @@ impl CdpContract {
                 optimal_utilization_bps,
             },
         );
-        env.storage().instance().set(&DataKey::TotalCollateral, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalCollateral, &0i128);
         env.storage().instance().set(&DataKey::TotalDebt, &0i128);
-        env.storage().instance().set(&DataKey::TotalStableSupply, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalStableSupply, &0i128);
         env.storage()
             .instance()
             .set(&DataKey::ProtocolCollateralReserves, &0i128);
@@ -425,7 +439,10 @@ impl CdpContract {
     }
 
     pub fn total_bad_debt(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::TotalBadDebt).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalBadDebt)
+            .unwrap_or(0)
     }
 
     pub fn current_borrow_rate_bps(env: Env) -> Result<i128, Error> {
@@ -470,9 +487,10 @@ impl CdpContract {
 
         position.collateral_amount = checked_add(position.collateral_amount, amount)?;
         write_position(&env, user, &position);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalCollateral, &checked_add(total_collateral(&env), amount)?);
+        env.storage().instance().set(
+            &DataKey::TotalCollateral,
+            &checked_add(total_collateral(&env), amount)?,
+        );
         Ok(position)
     }
 
@@ -496,9 +514,10 @@ impl CdpContract {
         ensure_safe(&env, &position)?;
 
         write_position(&env, user.clone(), &position);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalCollateral, &checked_sub(total_collateral(&env), amount)?);
+        env.storage().instance().set(
+            &DataKey::TotalCollateral,
+            &checked_sub(total_collateral(&env), amount)?,
+        );
         soroban_sdk::token::Client::new(&env, &collateral_token).transfer(
             &env.current_contract_address(),
             &user,
@@ -555,9 +574,10 @@ impl CdpContract {
         position.debt_amount = checked_sub(position.debt_amount, repay_amount)?;
         write_stable_balance(&env, user.clone(), checked_sub(balance, repay_amount)?);
         write_position(&env, user, &position);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalDebt, &checked_sub(total_debt(&env), repay_amount)?);
+        env.storage().instance().set(
+            &DataKey::TotalDebt,
+            &checked_sub(total_debt(&env), repay_amount)?,
+        );
         env.storage().instance().set(
             &DataKey::TotalStableSupply,
             &checked_sub(Self::total_stable_supply(env.clone()), repay_amount)?,
@@ -580,7 +600,11 @@ impl CdpContract {
             return Err(Error::InsufficientStableBalance);
         }
         write_stable_balance(&env, from, checked_sub(from_balance, amount)?);
-        write_stable_balance(&env, to.clone(), checked_add(read_stable_balance(&env, to), amount)?);
+        write_stable_balance(
+            &env,
+            to.clone(),
+            checked_add(read_stable_balance(&env, to), amount)?,
+        );
         Ok(())
     }
 
@@ -602,8 +626,8 @@ impl CdpContract {
         }
 
         let collateral_value_total = collateral_value(price, position.collateral_amount)?;
-        let max_coverable_repay = checked_mul(collateral_value_total, BPS)?
-            / (BPS + params.liquidation_incentive_bps);
+        let max_coverable_repay =
+            checked_mul(collateral_value_total, BPS)? / (BPS + params.liquidation_incentive_bps);
         let repay_amount = requested_repay_amount
             .min(position.debt_amount)
             .min(max_coverable_repay);
@@ -654,9 +678,10 @@ impl CdpContract {
             checked_sub(liquidator_balance, quote.repay_amount)?,
         );
         write_position(&env, borrower, &position);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalDebt, &checked_sub(total_debt(&env), quote.repay_amount)?);
+        env.storage().instance().set(
+            &DataKey::TotalDebt,
+            &checked_sub(total_debt(&env), quote.repay_amount)?,
+        );
         env.storage().instance().set(
             &DataKey::TotalStableSupply,
             &checked_sub(Self::total_stable_supply(env.clone()), quote.repay_amount)?,
@@ -685,8 +710,8 @@ impl CdpContract {
         }
 
         let collateral_value_total = collateral_value(price, position.collateral_amount)?;
-        let repay_coverable = checked_mul(collateral_value_total, BPS)?
-            / (BPS + params.liquidation_incentive_bps);
+        let repay_coverable =
+            checked_mul(collateral_value_total, BPS)? / (BPS + params.liquidation_incentive_bps);
         let bad_debt = if position.debt_amount > repay_coverable {
             position.debt_amount - repay_coverable
         } else {
@@ -697,15 +722,19 @@ impl CdpContract {
 
         env.storage().instance().set(
             &DataKey::ProtocolCollateralReserves,
-            &checked_add(Self::protocol_collateral_reserves(env.clone()), seized_collateral)?,
+            &checked_add(
+                Self::protocol_collateral_reserves(env.clone()),
+                seized_collateral,
+            )?,
         );
         env.storage().instance().set(
             &DataKey::TotalBadDebt,
             &checked_add(Self::total_bad_debt(env.clone()), bad_debt)?,
         );
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalDebt, &checked_sub(total_debt(&env), debt_repaid)?);
+        env.storage().instance().set(
+            &DataKey::TotalDebt,
+            &checked_sub(total_debt(&env), debt_repaid)?,
+        );
         env.storage().instance().set(
             &DataKey::TotalCollateral,
             &checked_sub(total_collateral(&env), seized_collateral)?,

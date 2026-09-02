@@ -157,7 +157,13 @@ impl XdrTransactionResultDecoder {
 
     /// Decodes the `resultMetaXdr` returned by Soroban RPC `getTransaction`.
     pub fn decode_result_meta(xdr: &str) -> Result<DecodedTransactionResult, XdrDecodeError> {
-        let result: TransactionResultMeta = Self::decode_xdr_base64(xdr, "transaction result metadata")?;
+        let result =
+            TransactionResultMeta::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
+                XdrDecodeError::InvalidXdr {
+                    kind: "transaction result metadata",
+                    source,
+                }
+            })?;
         let meta = soroban_meta(&result.tx_apply_processing)
             .ok_or(XdrDecodeError::MissingSorobanMetadata)?;
         Ok(Self::decode_soroban_meta(meta))
@@ -165,18 +171,33 @@ impl XdrTransactionResultDecoder {
 
     /// Decodes standalone `SorobanTransactionMeta` XDR.
     pub fn decode_soroban_meta_xdr(xdr: &str) -> Result<DecodedTransactionResult, XdrDecodeError> {
-        let meta: SorobanTransactionMeta = Self::decode_xdr_base64(xdr, "Soroban transaction metadata")?;
+        let meta =
+            SorobanTransactionMeta::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
+                XdrDecodeError::InvalidXdr {
+                    kind: "Soroban transaction metadata",
+                    source,
+                }
+            })?;
         Ok(Self::decode_soroban_meta(&meta))
     }
 
     /// Decodes host-function invocations from an RPC `envelopeXdr` value.
     pub fn decode_envelope(xdr: &str) -> Result<Vec<DecodedInvocation>, XdrDecodeError> {
-        let envelope: TransactionEnvelope = Self::decode_xdr_base64(xdr, "transaction envelope")?;
+        let envelope =
+            TransactionEnvelope::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
+                XdrDecodeError::InvalidXdr {
+                    kind: "transaction envelope",
+                    source,
+                }
+            })?;
         Ok(decode_envelope(&envelope))
     }
 
     /// Decodes a result and optionally enriches it with invocation details.
-    pub fn decode(result_xdr: &str, envelope_xdr: Option<&str>) -> Result<DecodedTransactionResult, XdrDecodeError> {
+    pub fn decode(
+        result_xdr: &str,
+        envelope_xdr: Option<&str>,
+    ) -> Result<DecodedTransactionResult, XdrDecodeError> {
         let mut decoded = Self::decode_result_meta(result_xdr)?;
         if let Some(xdr) = envelope_xdr {
             decoded.invocations = Self::decode_envelope(xdr)?;
@@ -191,7 +212,8 @@ impl XdrTransactionResultDecoder {
                 non_refundable: fees.total_non_refundable_resource_fee_charged,
                 refundable: fees.total_refundable_resource_fee_charged,
                 rent: fees.rent_fee_charged,
-                total: fees.total_non_refundable_resource_fee_charged + fees.total_refundable_resource_fee_charged,
+                total: fees.total_non_refundable_resource_fee_charged
+                    + fees.total_refundable_resource_fee_charged,
             },
         };
         DecodedTransactionResult {
@@ -232,7 +254,10 @@ fn decode_envelope(envelope: &TransactionEnvelope) -> Vec<DecodedInvocation> {
     }
 }
 
-fn decode_operations(source: &soroban_sdk::xdr::MuxedAccount, operations: &[Operation]) -> Vec<DecodedInvocation> {
+fn decode_operations(
+    source: &soroban_sdk::xdr::MuxedAccount,
+    operations: &[Operation],
+) -> Vec<DecodedInvocation> {
     operations
         .iter()
         .filter_map(|operation| match &operation.body {

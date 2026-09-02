@@ -1,9 +1,8 @@
 pub mod cache;
 pub mod call_trace_parser;
 pub mod comparison;
-pub mod config;
-pub mod cors;
 pub mod contract_registry;
+pub mod cors;
 pub mod errors;
 pub mod gas_golfing;
 pub mod insights;

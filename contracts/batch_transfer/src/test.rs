@@ -89,7 +89,7 @@ fn partial_mode_skips_failures_and_continues() {
         &env,
         recipient_a.clone(),
         recipient_b.clone(),
-        recipient_c.clone()
+        recipient_c.clone(),
     ];
     let amounts = vec![&env, 400i128, -1i128, 700i128];
 
@@ -103,7 +103,10 @@ fn partial_mode_skips_failures_and_continues() {
 
     assert_eq!(results.len(), 3);
     assert_eq!(results.get(0).unwrap().success, true);
-    assert_eq!(results.get(1).unwrap().failure, TransferFailure::InvalidAmount);
+    assert_eq!(
+        results.get(1).unwrap().failure,
+        TransferFailure::InvalidAmount
+    );
     assert_eq!(
         results.get(2).unwrap().failure,
         TransferFailure::InsufficientBalance

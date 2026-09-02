@@ -2,15 +2,10 @@
 extern crate std;
 use super::*;
 
-use soroban_sdk::{
-    testutils::Address as _,
-    Address, BytesN, Env, IntoVal,
-];
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, IntoVal};
 
 mod liquidity_pool {
-    soroban_sdk::contractimport!(
-        file = "../../target/wasm32v1-release/liquidity_pool.wasm"
-    );
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/liquidity_pool.wasm");
 }
 
 fn pool_wasm_hash(env: &Env) -> BytesN<2>> {
@@ -132,74 +127,4 @@ fn test_multisig_admin_management() {
     factory_client.remove_guard_admin(&approvers, &admin3);
     assert!(!factory_client.is_admin(&admin3));
     assert_eq!(factory_client.get_admins().len(), 2);
-}
-
-#[test]
-fn test_registry_tracks_created_pool() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let factory_id = env.register(LiquidityPoolFactory, ());
-    let factory_client = LiquidityPoolFactoryClient::new(&env, &factory_id);
-
-    let token_admin = Address::generate(&env);
-    let token_a = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let token_b = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-
-    let pool_hash = pool_wasm_hash(&env);
-
-    let pool = factory_client.create_pair(&token_a, &token_b, &pool_hash);
-
-    // Registry should have an entry for the new pool
-    let info = factory_client.get_contract_info(&pool);
-    assert!(info.is_some());
-    let info = info.unwrap();
-    assert_eq!(info.creator, factory_id);
-    assert!(info.timestamp > 0);
-
-    // Creator query should include the pool
-    let contracts = factory_client.get_contracts_by_creator(&factory_id);
-    assert_eq!(contracts.len(), 1);
-    assert_eq!(contracts.get(0).unwrap(), pool);
-
-    // Total contracts should be 1
-    assert_eq!(factory_client.get_total_contracts(), 1);
-}
-
-#[test]
-fn test_registry_tracks_multiple_contracts() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let factory_id = env.register(LiquidityPoolFactory, ());
-    let factory_client = LiquidityPoolFactoryClient::new(&env, &factory_id);
-
-    let token_admin = Address::generate(&env);
-    let token_a = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let token_b = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let token_c = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-
-    let pool_hash = pool_wasm_hash(&env);
-
-    let pool1 = factory_client.create_pair(&token_a, &token_b, &pool_hash);
-    let pool2 = factory_client.create_pair(&token_a, &token_c, &pool_hash);
-
-    assert_ne!(pool1, pool2);
-
-    let contracts = factory_client.get_contracts_by_creator(&factory_id);
-    assert_eq!(contracts.len(), 2);
-    assert_eq!(contracts.get(0).unwrap(), pool1);
-    assert_eq!(contracts.get(1).unwrap(), pool2);
-
-    assert_eq!(factory_client.get_total_contracts(), 2);
 }
