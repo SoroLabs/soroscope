@@ -12,6 +12,10 @@ import {
   Tooltip,
   CartesianGrid,
   Legend,
+  ReferenceLine,
+  PieChart,
+  Pie,
+  Cell,
 } from 'recharts';
 import {
   TrendingUp,
@@ -21,6 +25,12 @@ import {
   BarChart3,
   Calendar,
   Layers,
+  Zap,
+  Activity,
+  TrendingUpIcon,
+  AlertTriangle,
+  PieChart as PieChartIcon,
+  Clock,
 } from 'lucide-react';
 
 export type Timeframe = '7D' | '30D' | '90D' | '1Y' | 'ALL';
@@ -31,6 +41,22 @@ export interface PoolDataPoint {
   apy: number;
   tvl: number;
   volume24h: number;
+  fees24h: number;
+  impermanentLoss: number;
+  utilizationRate: number;
+}
+
+export interface PoolMetrics {
+  feesApr: number;
+  incentiveApr: number;
+  totalApr: number;
+  protocolFee: number;
+  poolUtilization: number;
+  impermanentLossPercent: number;
+  volumeToTvlRatio: number;
+  riskScore: 'low' | 'medium' | 'high';
+  slippageBps: number;
+  concentrationScore: number;
 }
 
 export interface LiquidityPoolAnalyticsProps {
@@ -55,6 +81,7 @@ export const generateMockPoolHistory = (totalDays: number = 365): PoolDataPoint[
   let baseApy = 14.5;
   let baseTvl = 2_500_000;
   let baseVolume = 450_000;
+  let baseFees = 8_500;
 
   for (let i = totalDays; i >= 0; i--) {
     const timestamp = now - i * dayMs;
@@ -76,12 +103,24 @@ export const generateMockPoolHistory = (totalDays: number = 365): PoolDataPoint[
     const volNoise = (Math.random() - 0.5) * 120000;
     const volume24h = Math.max(50000, Math.round(baseVolume + sinWave * 15000 + volNoise));
 
+    const feesNoise = (Math.random() - 0.5) * 2500;
+    const fees24h = Math.max(2000, Math.round(baseFees + sinWave * 800 + feesNoise));
+
+    const ilNoise = (Math.random() - 0.5) * 0.8;
+    const impermanentLoss = parseFloat((sinWave * 0.3 + ilNoise).toFixed(2));
+
+    const utilizationNoise = (Math.random() - 0.5) * 8;
+    const utilizationRate = Math.min(95, Math.max(15, 45 + sinWave * 5 + utilizationNoise));
+
     points.push({
       timestamp,
       date: dateStr,
       apy,
       tvl,
       volume24h,
+      fees24h,
+      impermanentLoss,
+      utilizationRate,
     });
   }
 
@@ -110,10 +149,14 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
     apy: boolean;
     tvl: boolean;
     volume: boolean;
+    fees: boolean;
+    utilization: boolean;
   }>({
     apy: true,
     tvl: true,
     volume: true,
+    fees: false,
+    utilization: false,
   });
 
   const rawData = useMemo(() => {
@@ -136,6 +179,17 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
         currentVolume: 0,
         volumeChange: 0,
         peakApy: 0,
+        currentFees: 0,
+        feesApr: 0,
+        incentiveApr: 0,
+        totalApr: 0,
+        protocolFee: 0.15,
+        avgUtilization: 0,
+        avgImpermanentLoss: 0,
+        volumeToTvlRatio: 0,
+        riskScore: 'medium' as const,
+        slippageBps: 25,
+        concentrationScore: 0,
       };
     }
 
@@ -155,6 +209,26 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
 
     const peakApy = Math.max(...filteredData.map((d) => d.apy));
 
+    const currentFees = last.fees24h;
+    const feesApr = parseFloat(((currentFees * 365) / currentTvl * 100).toFixed(2));
+    const incentiveApr = parseFloat((currentApy - feesApr).toFixed(2));
+    const totalApr = currentApy;
+
+    const avgUtilization = parseFloat(
+      (filteredData.reduce((sum, d) => sum + d.utilizationRate, 0) / filteredData.length).toFixed(1),
+    );
+
+    const avgImpermanentLoss = parseFloat(
+      (filteredData.reduce((sum, d) => sum + Math.abs(d.impermanentLoss), 0) / filteredData.length).toFixed(2),
+    );
+
+    const volumeToTvlRatio = parseFloat(((currentVolume / currentTvl) * 100).toFixed(2));
+
+    const riskScore =
+      avgUtilization > 80 || tvlChange < -20 ? 'high' : avgUtilization > 60 || tvlChange < -10 ? 'medium' : 'low';
+
+    const concentrationScore = parseFloat((100 - Math.abs(last.impermanentLoss) * 2).toFixed(1));
+
     return {
       currentApy,
       apyChange,
@@ -163,13 +237,24 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
       currentVolume,
       volumeChange,
       peakApy,
+      currentFees,
+      feesApr,
+      incentiveApr,
+      totalApr,
+      protocolFee: 0.15,
+      avgUtilization,
+      avgImpermanentLoss,
+      volumeToTvlRatio,
+      riskScore,
+      slippageBps: 25,
+      concentrationScore,
     };
   }, [filteredData]);
 
-  const toggleMetric = (key: 'apy' | 'tvl' | 'volume') => {
+  const toggleMetric = (key: 'apy' | 'tvl' | 'volume' | 'fees' | 'utilization') => {
     setActiveMetrics((prev) => {
       const next = { ...prev, [key]: !prev[key] };
-      if (!next.apy && !next.tvl && !next.volume) return prev;
+      if (!next.apy && !next.tvl && !next.volume && !next.fees && !next.utilization) return prev;
       return next;
     });
   };
@@ -235,7 +320,7 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
             </span>
           </div>
           <div className="mt-2 text-[11px] text-slate-500">
-            Peak APY in range: <span className="text-slate-300 font-semibold">{formatPercent(summary.peakApy)}</span>
+            Peak APY: <span className="text-slate-300 font-semibold">{formatPercent(summary.peakApy)}</span>
           </div>
         </div>
 
@@ -263,7 +348,7 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
             </span>
           </div>
           <div className="mt-2 text-[11px] text-slate-500">
-            Filtered period trend indicator
+            Volume/TVL: <span className="text-slate-300 font-semibold">{summary.volumeToTvlRatio}%</span>
           </div>
         </div>
 
@@ -291,7 +376,98 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
             </span>
           </div>
           <div className="mt-2 text-[11px] text-slate-500">
-            24-hour trading activity
+            24h Fees: <span className="text-slate-300 font-semibold">{formatCurrency(summary.currentFees)}</span>
+          </div>
+        </div>
+
+        {/* APR Breakdown */}
+        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 transition hover:border-slate-700">
+          <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
+            <span className="font-medium">APR Breakdown</span>
+            <Zap className="h-4 w-4 text-amber-400" />
+          </div>
+          <div className="space-y-1.5 mt-1">
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-400">Fees APR:</span>
+              <span className="text-emerald-400 font-medium">{formatPercent(summary.feesApr)}</span>
+            </div>
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-400">Incentive:</span>
+              <span className="text-cyan-400 font-medium">{formatPercent(summary.incentiveApr)}</span>
+            </div>
+            <div className="flex justify-between text-xs pt-1 border-t border-slate-800">
+              <span className="text-slate-300 font-medium">Protocol Fee:</span>
+              <span className="text-slate-400">{(summary.protocolFee * 100).toFixed(1)}%</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Utilization Rate */}
+        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 transition hover:border-slate-700">
+          <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
+            <span className="font-medium">Pool Utilization</span>
+            <Activity className="h-4 w-4 text-orange-400" />
+          </div>
+          <div className="flex items-baseline justify-between">
+            <span className="text-2xl font-black text-orange-400">
+              {summary.avgUtilization.toFixed(1)}%
+            </span>
+            <div className="w-16 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all ${
+                  summary.avgUtilization > 80
+                    ? 'bg-red-500'
+                    : summary.avgUtilization > 60
+                    ? 'bg-yellow-500'
+                    : 'bg-emerald-500'
+                }`}
+                style={{ width: `${Math.min(summary.avgUtilization, 100)}%` }}
+              />
+            </div>
+          </div>
+          <div className="mt-2 text-[11px] text-slate-500">
+            Avg IL: <span className="text-amber-400 font-semibold">{summary.avgImpermanentLoss.toFixed(2)}%</span>
+          </div>
+        </div>
+
+        {/* Risk Score */}
+        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 transition hover:border-slate-700">
+          <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
+            <span className="font-medium">Risk Assessment</span>
+            <AlertTriangle className={`h-4 w-4 ${
+              summary.riskScore === 'high' ? 'text-red-400' :
+              summary.riskScore === 'medium' ? 'text-yellow-400' : 'text-emerald-400'
+            }`} />
+          </div>
+          <div className="flex items-baseline justify-between">
+            <span className={`text-2xl font-black capitalize ${
+              summary.riskScore === 'high' ? 'text-red-400' :
+              summary.riskScore === 'medium' ? 'text-yellow-400' : 'text-emerald-400'
+            }`}>
+              {summary.riskScore}
+            </span>
+            <span className="text-xs text-slate-400">
+              Slippage: <span className="text-slate-300">{summary.slippageBps} bps</span>
+            </span>
+          </div>
+          <div className="mt-2 text-[11px] text-slate-500">
+            Concentration: <span className="text-cyan-400 font-semibold">{summary.concentrationScore}%</span>
+          </div>
+        </div>
+
+        {/* 24h Fees */}
+        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 transition hover:border-slate-700">
+          <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
+            <span className="font-medium">24h Fees Generated</span>
+            <DollarSign className="h-4 w-4 text-green-400" />
+          </div>
+          <div className="flex items-baseline justify-between">
+            <span className="text-2xl font-black text-green-400">
+              {formatCurrency(summary.currentFees)}
+            </span>
+          </div>
+          <div className="mt-2 text-[11px] text-slate-500">
+            Fee Yield: <span className="text-slate-300 font-semibold">{formatPercent(summary.feesApr)}/yr</span>
           </div>
         </div>
 
@@ -304,7 +480,7 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
           <div className="flex items-baseline justify-between">
             <span className="text-2xl font-black text-amber-400">{timeframe}</span>
             <span className="text-xs text-slate-400 font-semibold">
-              {filteredData.length} data points
+              {filteredData.length} points
             </span>
           </div>
           <div className="mt-2 text-[11px] text-slate-500">
@@ -318,7 +494,7 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
         <span className="text-xs font-medium text-slate-400 flex items-center gap-1.5">
           <Layers className="h-3.5 w-3.5 text-cyan-400" /> Display Metrics:
         </span>
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-4 flex-wrap">
           <button
             type="button"
             onClick={() => toggleMetric('apy')}
@@ -345,6 +521,24 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
             }`}
           >
             <span className="h-2.5 w-2.5 rounded-full bg-purple-400" /> Volume ($)
+          </button>
+          <button
+            type="button"
+            onClick={() => toggleMetric('fees')}
+            className={`flex items-center gap-1.5 text-xs font-medium transition ${
+              activeMetrics.fees ? 'text-green-400 font-bold' : 'text-slate-500 opacity-60'
+            }`}
+          >
+            <span className="h-2.5 w-2.5 rounded-full bg-green-400" /> Fees ($)
+          </button>
+          <button
+            type="button"
+            onClick={() => toggleMetric('utilization')}
+            className={`flex items-center gap-1.5 text-xs font-medium transition ${
+              activeMetrics.utilization ? 'text-orange-400 font-bold' : 'text-slate-500 opacity-60'
+            }`}
+          >
+            <span className="h-2.5 w-2.5 rounded-full bg-orange-400" /> Utilization
           </button>
         </div>
       </div>
@@ -464,6 +658,33 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
                 strokeWidth={3}
                 dot={false}
                 activeDot={{ r: 6, fill: '#06b6d4', stroke: '#090d16', strokeWidth: 2 }}
+              />
+            )}
+
+            {/* Fees Line */}
+            {activeMetrics.fees && (
+              <Line
+                yAxisId="right"
+                type="monotone"
+                dataKey="fees24h"
+                name="24h Fees"
+                stroke="#22c55e"
+                strokeWidth={2}
+                dot={false}
+                strokeDasharray="5 5"
+              />
+            )}
+
+            {/* Utilization Line */}
+            {activeMetrics.utilization && (
+              <Line
+                yAxisId="right"
+                type="monotone"
+                dataKey="utilizationRate"
+                name="Utilization %"
+                stroke="#f97316"
+                strokeWidth={2}
+                dot={false}
               />
             )}
           </ComposedChart>
