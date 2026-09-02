@@ -58,20 +58,45 @@ pub fn mul_div_u128(a: u128, b: u128, d: u128) -> Result<u128, MathError> {
 /// Price = 1.0001 ^ tick. SqrtPrice = 1.0001 ^ (tick / 2).
 /// We approximate it for the sake of this task to avoid heavy exponentiation
 /// if not needed, or implement a basic version.
+/// Bitwise shift integer square root calculation for high precision u128 values.
+pub fn sqrt_u128(x: u128) -> u128 {
+    if x == 0 {
+        return 0;
+    }
+    let mut res = 0u128;
+    let mut bit = 1u128 << 126;
+    while bit > x {
+        bit >>= 2;
+    }
+    let mut temp_x = x;
+    while bit != 0 {
+        if temp_x >= res + bit {
+            temp_x -= res + bit;
+            res = (res >> 1) + bit;
+        } else {
+            res >>= 1;
+        }
+        bit >>= 2;
+    }
+    res
+}
+
+/// Sqrt Price X64 mapping:
+/// We represent price as Q64.64. tick is integer. 
+/// Price = 1.0001 ^ tick. SqrtPrice = 1.0001 ^ (tick / 2).
 pub fn get_sqrt_ratio_at_tick(tick: i32) -> Result<u128, MathError> {
     let abs_tick = tick.abs() as u32;
-    // 1.00005 in Q64 = 18447669818844880896
-    let base: u128 = 18447669818844880896;
+    let base: u128 = 18447669818844880896; 
     let mut ratio: u128 = Q64;
     let mut current_base = base;
     let mut t = abs_tick;
 
     while t > 0 {
-        if t % 2 == 1 {
+        if (t & 1) == 1 {
             ratio = mul_div_u128(ratio, current_base, Q64)?;
         }
         current_base = mul_div_u128(current_base, current_base, Q64)?;
-        t /= 2;
+        t >>= 1;
     }
 
     if tick < 0 {
@@ -82,7 +107,7 @@ pub fn get_sqrt_ratio_at_tick(tick: i32) -> Result<u128, MathError> {
 }
 
 /// Computes the amount of token 0 (token A) for a given liquidity and price range
-/// delta_amount0 = liquidity * (sqrt(upper) - sqrt(lower)) / (sqrt(upper) * sqrt(lower))
+/// Prevents precision loss by calculating numerator delta before denominator division.
 pub fn get_amount_0_delta(
     sqrt_ratio_ax64: u128,
     sqrt_ratio_bx64: u128,
@@ -93,19 +118,14 @@ pub fn get_amount_0_delta(
     } else {
         (sqrt_ratio_bx64, sqrt_ratio_ax64)
     };
-
-    // num1 = liquidity << 64
-    // num2 = upper - lower
-    // den = upper * lower
-    // Actually, amount0 = (liquidity * (upper - lower)) / upper / lower * 2^64
-    let num1 = mul_div_u128(liquidity, Q64, upper)?;
-    let num2 = upper.checked_sub(lower).ok_or(MathError::Overflow)?;
-    let amount0 = mul_div_u128(num1, num2, lower)?;
+    
+    let diff = upper.checked_sub(lower).ok_or(MathError::Overflow)?;
+    let prod_div_upper = mul_div_u128(liquidity, diff, upper)?;
+    let amount0 = mul_div_u128(prod_div_upper, Q64, lower)?;
     Ok(amount0)
 }
 
 /// Computes the amount of token 1 (token B) for a given liquidity and price range
-/// delta_amount1 = liquidity * (sqrt(upper) - sqrt(lower))
 pub fn get_amount_1_delta(
     sqrt_ratio_ax64: u128,
     sqrt_ratio_bx64: u128,

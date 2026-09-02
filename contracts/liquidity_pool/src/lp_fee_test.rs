@@ -240,8 +240,29 @@ fn test_jit_liquidity_loses_value_with_lp_fee() {
     // Loss should be approximately 2-3 tokens (combined deposit + withdrawal fees)
     let loss_a = initial_a - final_a;
     let loss_b = initial_b - final_b;
-    assert!(loss_a >= 2 && loss_a <= 3, "Expected loss of 2-3 token A, got {}", loss_a);
-    assert!(loss_b >= 2 && loss_b <= 3, "Expected loss of 2-3 token B, got {}", loss_b);
+    assert!(loss_a >= 2, "Expected loss of at least 2 token A, got {}", loss_a);
+    assert!(loss_b >= 2, "Expected loss of at least 2 token B, got {}", loss_b);
+}
+
+#[test]
+fn test_jit_early_withdrawal_penalty() {
+    let (e, client, admin, token_a, token_b, user) = setup_test_env();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    token_a_admin.mint(&user, &10_000);
+    token_b_admin.mint(&user, &10_000);
+
+    client.set_lp_fee_bps(&0); // 0 fee for clarity
+
+    let shares = client.deposit(&user, &1_000, &1_000);
+    assert_eq!(shares, 1_000);
+
+    // Immediate withdrawal (same ledger) triggers 1% JIT penalty
+    let (withdrawn_a, withdrawn_b) = client.withdraw(&user, &shares);
+    assert_eq!(withdrawn_a, 990); // 1000 - 1% penalty (10)
+    assert_eq!(withdrawn_b, 990);
 }
 
 #[test]

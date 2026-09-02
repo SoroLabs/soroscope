@@ -9,11 +9,9 @@ use soroban_sdk::{
 mod fuzz_test;
 #[cfg(test)]
 mod test;
-// ── Errors ────────────────────────────────────────────────────────────────────
-/// Errors returned by the `LiquidityPool` contract.
-///
-/// Code assignments are stable on-chain ABI — do NOT renumber. New variants go
-/// on the end.
+
+// Errors
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -32,10 +30,11 @@ pub enum Error {
     TimelockNotElapsed = 12,
     NoPendingFeeUpdate = 13,
     Paused = 14,
-    /// A caller-supplied amount was zero or negative.
     InvalidAmount = 15,
 }
-// ── Events ────────────────────────────────────────────────────────────────────
+
+// Events
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DepositEvent {
@@ -101,10 +100,40 @@ pub struct FeeUpdateScheduledEvent {
     pub executable_after_ledger: u32,
     pub volatility_bps: i128,
 }
-// ── Constants ─────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpDepositFeeEvent {
+    pub user: Address,
+    pub fee_shares: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpWithdrawFeeEvent {
+    pub user: Address,
+    pub fee_a: i128,
+    pub fee_b: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JitPenaltyEvent {
+    pub user: Address,
+    pub penalty_a: i128,
+    pub penalty_b: i128,
+}
+
+// Constants
+
 pub const MAX_FEE_BPS: i128 = 100;
 pub const DEFAULT_BASE_FEE_BPS: i128 = 30;
 pub const DEFAULT_FEE_TIMELOCK_LEDGERS: u32 = 120;
+pub const DEFAULT_LP_FEE_BPS: i128 = 5;
+pub const MAX_LP_FEE_BPS: i128 = 100;
+pub const MIN_HOLDING_PERIOD: u32 = 10;
+pub const EARLY_WITHDRAWAL_PENALTY_BPS: i128 = 100;
+
 pub const LOW_VOLATILITY_THRESHOLD_BPS: i128 = 100;
 pub const MEDIUM_VOLATILITY_THRESHOLD_BPS: i128 = 250;
 pub const HIGH_VOLATILITY_THRESHOLD_BPS: i128 = 500;
@@ -113,12 +142,16 @@ pub const MEDIUM_VOLATILITY_FEE_BPS: i128 = 70;
 pub const HIGH_VOLATILITY_FEE_BPS: i128 = 100;
 pub const REWARDS_PER_LEDGER: i128 = 10_000_000;
 pub const REWARD_PRECISION: i128 = 1_000_000_000_000;
-// ── Oracle interface ──────────────────────────────────────────────────────────
+
+// Oracle interface
+
 #[soroban_sdk::contractclient(name = "PriceOracleClient")]
 pub trait PriceOracle {
     fn latest_price(e: Env) -> i128;
 }
-// ── On-chain data types ───────────────────────────────────────────────────────
+
+// On-chain data types
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolState {
@@ -172,63 +205,10 @@ pub enum DataKey {
     UserRewards(Address),
     LastRewardLedger,
     AccumulatedRewardPerShare,
-}
-
-/// Grouped pool state — stored as a single instance key to reduce storage footprint.
-#[contracttype]
-#[derive(Clone)]
-pub struct PoolState {
-    pub admin: Address,
-    pub token_a: Address,
-    pub token_b: Address,
-    pub reserve_a: i128,
-    pub reserve_b: i128,
-    pub total_shares: i128,
-    pub fee_bps: i128,
-}
-/// Storage keys.
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    /// Single-entry key for all grouped pool state.
-    Pool,
-    /// Per-user LP share balance (persistent storage).
-    Balance(Address),
-    /// ERC-20-style allowances (persistent storage).
-    Allowance(AllowanceDataKey),
-    /// LP fee in basis points (charged on deposit/withdrawal)
     LpFeeBps,
-    Admin,
-    Guard,
-    Oracle,
-    PendingFeeUpdate,
-}
-fn load_pool(e: &Env) -> Result<PoolState, Error> {
-    e.storage()
-        .instance()
-        .get::<_, PoolState>(&DataKey::Pool)
-        .ok_or(Error::NotInitialized)
-}
-fn save_pool(e: &Env, pool: &PoolState) {
-    e.storage().instance().set(&DataKey::Pool, pool);
-}
-// ── Constants ─────────────────────────────────────────────────────────────────
-pub const MAX_FEE_BPS: i128 = 100;
-pub const DEFAULT_BASE_FEE_BPS: i128 = 30;
-pub const DEFAULT_FEE_TIMELOCK_LEDGERS: u32 = 120;
-pub const LOW_VOLATILITY_THRESHOLD_BPS: i128 = 100;
-pub const MEDIUM_VOLATILITY_THRESHOLD_BPS: i128 = 250;
-pub const HIGH_VOLATILITY_THRESHOLD_BPS: i128 = 500;
-pub const LOW_VOLATILITY_FEE_BPS: i128 = 40;
-pub const MEDIUM_VOLATILITY_FEE_BPS: i128 = 70;
-pub const HIGH_VOLATILITY_FEE_BPS: i128 = 100;
-// ── Oracle trait ──────────────────────────────────────────────────────────────
-#[soroban_sdk::contractclient(name = "PriceOracleClient")]
-pub trait PriceOracle {
-    fn latest_price(e: Env) -> i128;
+    DepositLedger(Address),
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 fn sqrt(x: i128) -> i128 {
     if x == 0 {
         return 0;
@@ -389,7 +369,9 @@ fn target_fee_from_volatility(base_fee_bps: i128, volatility_bps: i128) -> i128 
         dynamic
     }
 }
-// ── pause_op aliases (kept for backwards compat with tests) ──────────────────
+
+// pause_op aliases (kept for backwards compat with tests)
+
 pub mod pause_op {
     pub use emergency_guard::PauseType;
     pub const SWAP: u32 = emergency_guard::PauseType::SWAP;
@@ -407,12 +389,15 @@ const CORE_PAUSE_OPS: u32 = PauseType::SWAP
     | PauseType::BURN
     | PauseType::STAKE
     | PauseType::CLAIM_REWARDS;
-// ── Contract ──────────────────────────────────────────────────────────────────
+
+// Contract
+
 #[contract]
 pub struct LiquidityPool;
 #[contractimpl]
 impl LiquidityPool {
-    // ── Initialisation ────────────────────────────────────────────────────────
+    // Initialisation
+
     pub fn initialize(
         e: Env,
         admin: Address,
@@ -440,14 +425,18 @@ impl LiquidityPool {
         EmergencyGuard::initialize(e.clone(), vec![&e, admin], 1).map_err(map_guard_err)?;
         Ok(())
     }
-    // ── Admin accessors ───────────────────────────────────────────────────────
+
+    // Admin accessors
+
     pub fn get_admin(e: Env) -> Address {
         load_admin(&e).expect("not initialized")
     }
     pub fn get_admin_threshold(e: Env) -> u32 {
         EmergencyGuard::get_threshold(e)
     }
-    // ── EmergencyGuard pause interface ────────────────────────────────────────
+
+    // EmergencyGuard pause interface
+
     /// Pause or resume one operation bit. Any current guard admin may call this.
     pub fn guard_pause(e: Env, admin: Address, operation: u32, paused: bool) -> Result<(), Error> {
         EmergencyGuard::set_pause(e, admin, operation, paused).map_err(map_guard_err)
@@ -533,7 +522,9 @@ impl LiquidityPool {
     pub fn get_guard_threshold(e: Env) -> u32 {
         EmergencyGuard::get_threshold(e)
     }
-    // ── Fee management ────────────────────────────────────────────────────────
+
+    // Fee management
+
     pub fn get_fee(e: Env) -> i128 {
         load_pool(&e)
             .map(|p| p.fee_bps)
@@ -559,6 +550,24 @@ impl LiquidityPool {
         );
         Ok(())
     }
+
+    pub fn get_lp_fee_bps(e: Env) -> i128 {
+        e.storage()
+            .instance()
+            .get(&DataKey::LpFeeBps)
+            .unwrap_or(DEFAULT_LP_FEE_BPS)
+    }
+
+    pub fn set_lp_fee_bps(e: Env, fee_bps: i128) -> Result<(), Error> {
+        if !(0..=MAX_LP_FEE_BPS).contains(&fee_bps) {
+            return Err(Error::InvalidFee);
+        }
+        let admin = load_admin(&e)?;
+        admin.require_auth();
+        e.storage().instance().set(&DataKey::LpFeeBps, &fee_bps);
+        Ok(())
+    }
+
     pub fn configure_fee_oracle(
         e: Env,
         oracle: Address,
@@ -679,7 +688,9 @@ impl LiquidityPool {
         );
         Ok(pending.new_fee_bps)
     }
-    // ── Staking rewards ───────────────────────────────────────────────────────
+
+    // Staking rewards
+
     /// Reward-per-share accumulator brought forward to the current ledger.
     ///
     /// Read-only: view functions need the up-to-date value without writing, and
@@ -866,16 +877,22 @@ impl LiquidityPool {
             .get(&DataKey::TotalStaked)
             .unwrap_or(0)
     }
-    // ── Core AMM operations ───────────────────────────────────────────────────
+
+    // Core AMM operations
+
     pub fn deposit(e: Env, to: Address, amount_a: i128, amount_b: i128) -> Result<i128, Error> {
         require_not_paused(&e, PauseType::DEPOSIT)?;
         to.require_auth();
+        if amount_a <= 0 || amount_b <= 0 {
+            return Err(Error::InvalidAmount);
+        }
         let mut pool = load_pool(&e)?;
         let client_a = soroban_sdk::token::Client::new(&e, &pool.token_a);
         let client_b = soroban_sdk::token::Client::new(&e, &pool.token_b);
         client_a.transfer(&to, &e.current_contract_address(), &amount_a);
         client_b.transfer(&to, &e.current_contract_address(), &amount_b);
-        let shares = if pool.total_shares == 0 {
+
+        let gross_shares = if pool.total_shares == 0 {
             let product = amount_a
                 .checked_mul(amount_b)
                 .ok_or(Error::InsufficientLiquidity)?;
@@ -895,82 +912,64 @@ impl LiquidityPool {
                 share_b
             }
         };
+
+        if gross_shares <= 0 {
+            return Err(Error::InsufficientLiquidity);
+        }
+
+        let lp_fee_bps = Self::get_lp_fee_bps(e.clone());
+        let fee_shares = (gross_shares * lp_fee_bps) / 10_000;
+        let net_shares = gross_shares - fee_shares;
+
         let user_key = DataKey::Balance(to.clone());
         let current = e
             .storage()
             .persistent()
             .get::<_, i128>(&user_key)
             .unwrap_or(0);
-        e.storage().persistent().set(&user_key, &(current + shares));
+        e.storage().persistent().set(&user_key, &(current + net_shares));
         e.storage().persistent().extend_ttl(&user_key, 100, 100);
-        pool.total_shares += shares;
+
+        let dep_ledger_key = DataKey::DepositLedger(to.clone());
+        e.storage()
+            .persistent()
+            .set(&dep_ledger_key, &e.ledger().sequence());
+        e.storage().persistent().extend_ttl(&dep_ledger_key, 100, 100);
+
+        pool.total_shares += net_shares;
         pool.reserve_a += amount_a;
         pool.reserve_b += amount_b;
         save_pool(&e, &pool);
+
+        if fee_shares > 0 {
+            e.events().publish(
+                (
+                    String::from_str(&e, "lp_fee"),
+                    String::from_str(&e, "deposit"),
+                ),
+                LpDepositFeeEvent {
+                    user: to.clone(),
+                    fee_shares,
+                },
+            );
+        }
+
         e.events().publish(
             (String::from_str(&e, "deposit"), to.clone()),
             DepositEvent {
                 user: to,
                 amount_a,
                 amount_b,
-                shares_minted: shares,
+                shares_minted: net_shares,
             },
         );
-        Ok(shares)
+
+        Ok(net_shares)
     }
-    /// Exact-output swap: receive exactly `out`, paying no more than `in_max`.
-    ///
-    /// `in_max` is this direction's slippage bound — the output is fixed by the
-    /// caller, so the only quantity the pool can move against them is the input.
-    /// Returns the input actually taken.
+
     pub fn swap(e: Env, to: Address, buy_a: bool, out: i128, in_max: i128) -> Result<i128, Error> {
         require_not_paused(&e, PauseType::SWAP)?;
         to.require_auth();
-        let mut pool = load_pool(&e)?;
-        let (reserve_in, reserve_out, token_in, token_out) = if buy_a {
-            (
-                pool.reserve_b,
-                pool.reserve_a,
-                pool.token_b.clone(),
-                pool.token_a.clone(),
-            )
-        } else {
-        };
-        if out >= reserve_out {
-            return Err(Error::InsufficientLiquidity);
-        }
-        let fee_scale = 10_000i128 - pool.fee_bps;
-        let numerator = reserve_in
-            .checked_mul(out)
-            .ok_or(Error::InsufficientLiquidity)?
-            .checked_mul(10_000)
-            .ok_or(Error::InsufficientLiquidity)?;
-        let denominator = (reserve_out - out)
-            .checked_mul(fee_scale)
-            .ok_or(Error::InsufficientLiquidity)?;
-        // Constant-product invariant preservation.
-        //
-        // The required input is `numerator / denominator`, but integer division
-        // truncates toward zero. The previous implementation used
-        // `numerator / denominator + 1`, which unconditionally adds a whole unit
-        // — even when the division is already exact. That systematically
-        // over-charges the trader by one base unit on every exact-division swap,
-        // leaking value into the pool and breaking round-trip price parity
-        // (a swap followed by its inverse no longer returns the original amount).
-        // The correct rule is ceiling division: charge the *smallest* integer
-        // input that still keeps `k' = new_reserve_in * new_reserve_out` at or
-        // above the old invariant `k`. When the division is exact the ceiling is
-        // the quotient itself (no surcharge); otherwise it rounds up by one unit,
-        // rounding in the pool's favour just enough to cover the truncated
-        // remainder. This matches Uniswap-v2's `getAmountIn` semantics.
-        if denominator <= 0 {
-            return Err(Error::InsufficientLiquidity);
-        }
-        let amount_in = if numerator % denominator == 0 {
-            numerator / denominator
-        } else {
-            numerator / denominator + 1
-        };
         let pool = load_pool(&e)?;
         let sides = swap_sides(&pool, buy_a);
         let amount_in = amount_in_for_out(out, sides.reserve_in, sides.reserve_out, pool.fee_bps)?;
@@ -980,20 +979,7 @@ impl LiquidityPool {
         Self::settle_swap(&e, to, pool, buy_a, sides, amount_in, out);
         Ok(amount_in)
     }
-    /// Exact-input swap with slippage protection: pay exactly `amount_in` and
-    /// abort unless at least `min_amount_out` comes back.
-    ///
-    /// Quoting the output on-chain is what makes a swap sandwichable: an attacker
-    /// who front-runs the transaction moves the price so the same input returns
-    /// far less. `min_amount_out` is the caller's floor on that outcome — compute
-    /// it from [`Self::get_amount_out`] minus an accepted tolerance, and the swap
-    /// reverts with [`Error::SlippageExceeded`] rather than filling at the
-    /// attacker's price.
-    ///
-    /// Pass `min_amount_out = 0` only when any fill is acceptable; it disables
-    /// the check.
-    ///
-    /// Returns the output actually delivered.
+
     pub fn swap_exact_in(
         e: Env,
         to: Address,
@@ -1010,8 +996,6 @@ impl LiquidityPool {
         let sides = swap_sides(&pool, buy_a);
         let amount_out =
             amount_out_for_in(amount_in, sides.reserve_in, sides.reserve_out, pool.fee_bps)?;
-        // A zero quote means the input is too small to buy one unit of output;
-        // there is nothing to settle.
         if amount_out <= 0 || amount_out >= sides.reserve_out {
             return Err(Error::InsufficientLiquidity);
         }
@@ -1021,10 +1005,7 @@ impl LiquidityPool {
         Self::settle_swap(&e, to, pool, buy_a, sides, amount_in, amount_out);
         Ok(amount_out)
     }
-    /// Quote the output for `amount_in` at the current reserves and fee.
-    ///
-    /// A quote is only valid for the state it was read from — derive
-    /// `min_amount_out` from it, do not assume the swap will match it.
+
     pub fn get_amount_out(e: Env, buy_a: bool, amount_in: i128) -> Result<i128, Error> {
         if amount_in <= 0 {
             return Err(Error::InvalidAmount);
@@ -1033,7 +1014,7 @@ impl LiquidityPool {
         let sides = swap_sides(&pool, buy_a);
         amount_out_for_in(amount_in, sides.reserve_in, sides.reserve_out, pool.fee_bps)
     }
-    /// Quote the input needed to receive exactly `amount_out`.
+
     pub fn get_amount_in(e: Env, buy_a: bool, amount_out: i128) -> Result<i128, Error> {
         if amount_out <= 0 {
             return Err(Error::InvalidAmount);
@@ -1047,15 +1028,12 @@ impl LiquidityPool {
             pool.fee_bps,
         )
     }
-    /// Current `(reserve_a, reserve_b)`.
+
     pub fn get_reserves(e: Env) -> Result<(i128, i128), Error> {
         let pool = load_pool(&e)?;
         Ok((pool.reserve_a, pool.reserve_b))
     }
-    /// Move the tokens, update reserves and emit the swap event.
-    ///
-    /// Called only after both amounts are final and every slippage bound has
-    /// been checked.
+
     fn settle_swap(
         e: &Env,
         to: Address,
@@ -1097,6 +1075,9 @@ impl LiquidityPool {
     pub fn withdraw(e: Env, to: Address, share_amount: i128) -> Result<(i128, i128), Error> {
         require_not_paused(&e, PauseType::WITHDRAW)?;
         to.require_auth();
+        if share_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
         let mut pool = load_pool(&e)?;
         let user_key = DataKey::Balance(to.clone());
         let current = e
@@ -1110,38 +1091,93 @@ impl LiquidityPool {
         if pool.total_shares <= 0 {
             return Err(Error::InsufficientLiquidity);
         }
-        let amount_a = share_amount * pool.reserve_a / pool.total_shares;
-        let amount_b = share_amount * pool.reserve_b / pool.total_shares;
+        let gross_amount_a = share_amount * pool.reserve_a / pool.total_shares;
+        let gross_amount_b = share_amount * pool.reserve_b / pool.total_shares;
+
+        let lp_fee_bps = Self::get_lp_fee_bps(e.clone());
+        let fee_a = (gross_amount_a * lp_fee_bps) / 10_000;
+        let fee_b = (gross_amount_b * lp_fee_bps) / 10_000;
+
+        let deposit_ledger: u32 = e
+            .storage()
+            .persistent()
+            .get(&DataKey::DepositLedger(to.clone()))
+            .unwrap_or(0);
+        let current_ledger = e.ledger().sequence();
+        let (penalty_a, penalty_b) = if deposit_ledger > 0 && current_ledger < deposit_ledger + MIN_HOLDING_PERIOD {
+            (
+                (gross_amount_a * EARLY_WITHDRAWAL_PENALTY_BPS) / 10_000,
+                (gross_amount_b * EARLY_WITHDRAWAL_PENALTY_BPS) / 10_000,
+            )
+        } else {
+            (0, 0)
+        };
+
+        let net_amount_a = gross_amount_a - fee_a - penalty_a;
+        let net_amount_b = gross_amount_b - fee_b - penalty_b;
+
         e.storage()
             .persistent()
             .set(&user_key, &(current - share_amount));
         e.storage().persistent().extend_ttl(&user_key, 100, 100);
+
         pool.total_shares -= share_amount;
-        pool.reserve_a -= amount_a;
-        pool.reserve_b -= amount_b;
+        pool.reserve_a -= net_amount_a;
+        pool.reserve_b -= net_amount_b;
         let token_a = pool.token_a.clone();
         let token_b = pool.token_b.clone();
         save_pool(&e, &pool);
+
         soroban_sdk::token::Client::new(&e, &token_a).transfer(
             &e.current_contract_address(),
             &to,
-            &amount_a,
+            &net_amount_a,
         );
         soroban_sdk::token::Client::new(&e, &token_b).transfer(
             &e.current_contract_address(),
             &to,
-            &amount_b,
+            &net_amount_b,
         );
+
+        if fee_a > 0 || fee_b > 0 {
+            e.events().publish(
+                (
+                    String::from_str(&e, "lp_fee"),
+                    String::from_str(&e, "withdraw"),
+                ),
+                LpWithdrawFeeEvent {
+                    user: to.clone(),
+                    fee_a,
+                    fee_b,
+                },
+            );
+        }
+
+        if penalty_a > 0 || penalty_b > 0 {
+            e.events().publish(
+                (
+                    String::from_str(&e, "jit_penalty"),
+                    to.clone(),
+                ),
+                JitPenaltyEvent {
+                    user: to.clone(),
+                    penalty_a,
+                    penalty_b,
+                },
+            );
+        }
+
         e.events().publish(
             (String::from_str(&e, "withdraw"), to.clone()),
             WithdrawEvent {
                 user: to,
                 shares_burned: share_amount,
-                amount_a,
-                amount_b,
+                amount_a: net_amount_a,
+                amount_b: net_amount_b,
             },
         );
-        Ok((amount_a, amount_b))
+
+        Ok((net_amount_a, net_amount_b))
     }
     pub fn burn(e: Env, from: Address, amount: i128) -> Result<(), Error> {
         require_not_paused(&e, PauseType::BURN)?;
@@ -1169,7 +1205,9 @@ impl LiquidityPool {
         );
         Ok(())
     }
-    // ── Token interface (LP shares) ───────────────────────────────────────────
+
+    // Token interface (LP shares)
+
     pub fn name(e: Env) -> String {
         String::from_str(&e, "Liquidity Pool Share")
     }

@@ -795,12 +795,25 @@ fn test_flash_loan_non_compliant_receiver_returns_error() {
     assert_eq!(s.token_client.balance(&receiver_id), 0);
 }
 
+#[test]
 fn test_borrow_non_compliant_receiver_returns_error() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    let receiver_id = s.e.register(non_compliant::NonCompliantReceiver, ());
     let result = s.vault_client.try_borrow(&receiver_id, &5_000);
     assert!(result.is_err());
 }
 
+    assert!(result.is_err());
+    assert_eq!(s.vault_client.get_available(), 10_000);
+}
+
+#[test]
 fn test_flash_loan_small_amount_fee_evasion_prevention() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
     // Set 50 bps fee (0.5%).
     s.vault_client.set_fee(&50);
 
@@ -811,14 +824,21 @@ fn test_flash_loan_small_amount_fee_evasion_prevention() {
     // Pre-fund receiver with fee.
     s.token_admin.mint(&receiver_id, &5);
 
+    let initiator = Address::generate(&s.e);
+
     // Borrow small amount (100 units). Without ceiling division, 100 * 50 / 10000 = 0.
     // With ceiling division, (100 * 50 + 9999) / 10000 = 1.
     let fee = s.vault_client.flash_loan(&initiator, &receiver_id, &100);
     assert_eq!(fee, 1);
+}
 
-    fn test_borrow_repayment_failure_returns_error() {
-        let receiver_id = s.e.register(BadReceiver, ());
+#[test]
+fn test_borrow_repayment_failure_returns_error() {
+    let s = setup();
+    fund_vault(&s, 10_000);
 
-        assert_eq!(result, Err(Ok(Error::LoanNotRepaid)));
-    }
+    let receiver_id = s.e.register(BadReceiver, ());
+    let result = s.vault_client.try_borrow(&receiver_id, &5_000);
+
+    assert_eq!(result, Err(Ok(Error::LoanNotRepaid)));
 }
