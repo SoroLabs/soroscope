@@ -12,7 +12,7 @@
 //!    If the borrower fails to repay, the balance check at step 9 fails and
 //!    the transfer at step 6 is rolled back — funds never leave the vault.
 //!
-//! 2. **Reentrancy guard**: A `FlashLoanActive` flag prevents nested flash
+//! 2. **Reentrancy guard**: A `ReentrancyLock` flag prevents nested flash
 //!    loans from the same vault during a callback.
 //!
 //! ## Flow
@@ -20,15 +20,15 @@
 //! ```text
 //! 1. if BorrowPaused → Err(BorrowPaused)
 //! 2. check_not_paused(PauseType::BORROW)
-//! 3. if FlashLoanActive → Err(Reentrancy)
-//! 4. set FlashLoanActive = true
+//! 3. if ReentrancyLock → Err(Reentrancy)
+//! 4. set ReentrancyLock = true
 //! 5. pre_balance = token.balance(self)
 //! 6. fee = amount * fee_bps / 10_000
 //! 7. token.transfer(self → receiver, amount)
 //! 8. ReceiverClient::execute_operation(token, amount, fee, initiator)
 //! 9. post_balance = token.balance(self)
 //! 10. assert post_balance >= pre_balance + fee
-//! 11. set FlashLoanActive = false
+//! 11. set ReentrancyLock = false
 //! 12. emit FlashLoanEvent
 //! ```
 
@@ -115,7 +115,7 @@ pub enum DataKey {
     /// Flash loan fee in basis points (0–100).
     FeeBps,
     /// Reentrancy guard: true while a flash loan callback is executing.
-    FlashLoanActive,
+    ReentrancyLock,
     /// Granular pause: blocks BORROW/flash_loan only, without affecting admin ops.
     BorrowPaused,
     /// Total amount the admin has deposited (tracked for withdrawal cap).
@@ -203,7 +203,7 @@ fn calculate_fee(e: &Env, amount: i128) -> i128 {
 fn is_flash_loan_active(e: &Env) -> bool {
     e.storage()
         .instance()
-        .get(&DataKey::FlashLoanActive)
+        .get(&DataKey::ReentrancyLock)
         .unwrap_or(false)
 }
 
@@ -218,7 +218,7 @@ fn check_no_flash_loan_active(e: &Env) -> Result<(), Error> {
 fn set_flash_loan_active(e: &Env, active: bool) {
     e.storage()
         .instance()
-        .set(&DataKey::FlashLoanActive, &active);
+        .set(&DataKey::ReentrancyLock, &active);
 }
 
 fn get_total_deposited(e: &Env) -> i128 {
@@ -269,7 +269,7 @@ impl FlashLoanVault {
             .set(&DataKey::FeeBps, &DEFAULT_FEE_BPS);
         e.storage()
             .instance()
-            .set(&DataKey::FlashLoanActive, &false);
+            .set(&DataKey::ReentrancyLock, &false);
         e.storage().instance().set(&DataKey::BorrowPaused, &false);
         e.storage().instance().set(&DataKey::TotalDeposited, &0i128);
 
@@ -593,6 +593,9 @@ impl FlashLoanVault {
                 &DataKey::BorrowRecord(borrower.clone()),
                 &BorrowRecord { fee: 0, total_repayment: 0 },
             );
+        }
+        
+        
         if post_balance < required_balance {
             e.storage()
                 .instance()
