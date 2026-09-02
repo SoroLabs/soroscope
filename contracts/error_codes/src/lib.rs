@@ -41,6 +41,7 @@ pub enum ContractError {
     Overflow = 15,
     DivisionByZero = 16,
     InvalidInput = 17,
+    InvalidAmount = 18,
 }
 
 impl ContractError {
@@ -69,6 +70,7 @@ impl ContractError {
             15 => Some(Self::Overflow),
             16 => Some(Self::DivisionByZero),
             17 => Some(Self::InvalidInput),
+            18 => Some(Self::InvalidAmount),
             _ => None,
         }
     }
@@ -97,7 +99,8 @@ pub const ERROR_SCHEMA_JSON: &str = r#"{
     { "name": "Paused", "code": 14, "description": "Contract execution is currently paused by emergency guard." },
     { "name": "Overflow", "code": 15, "description": "Arithmetic overflow occurred." },
     { "name": "DivisionByZero", "code": 16, "description": "Attempted division by zero." },
-    { "name": "InvalidInput", "code": 17, "description": "Input argument provided is invalid." }
+    { "name": "InvalidInput", "code": 17, "description": "Input argument provided is invalid." },
+    { "name": "InvalidAmount", "code": 18, "description": "Amount is invalid, negative, or below the minimum required." }
   ]
 }"#;
 
@@ -124,23 +127,25 @@ mod test {
         assert_eq!(ContractError::Overflow.as_u32(), 15);
         assert_eq!(ContractError::DivisionByZero.as_u32(), 16);
         assert_eq!(ContractError::InvalidInput.as_u32(), 17);
+        assert_eq!(ContractError::InvalidAmount.as_u32(), 18);
     }
 
     #[test]
     fn test_from_u32_conversion() {
-        for code in 1..=17 {
+        for code in 1..=18 {
             let err = ContractError::from_u32(code).expect("Valid discriminant should convert");
             assert_eq!(err.as_u32(), code);
         }
         assert_eq!(ContractError::from_u32(0), None);
-        assert_eq!(ContractError::from_u32(18), None);
+        assert_eq!(ContractError::from_u32(19), None);
     }
 
     #[test]
     fn test_schema_json_contains_all_variants() {
         assert!(ERROR_SCHEMA_JSON.contains("AlreadyInitialized"));
         assert!(ERROR_SCHEMA_JSON.contains("InvalidInput"));
+        assert!(ERROR_SCHEMA_JSON.contains("InvalidAmount"));
         assert!(ERROR_SCHEMA_JSON.contains("\"code\": 1"));
-        assert!(ERROR_SCHEMA_JSON.contains("\"code\": 17"));
+        assert!(ERROR_SCHEMA_JSON.contains("\"code\": 18"));
     }
 }

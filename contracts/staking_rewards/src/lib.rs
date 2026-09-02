@@ -159,6 +159,39 @@ fn multiply_amount(amount: i128, multiplier: Fixed) -> Result<i128, ContractErro
     mul_div(amount, multiplier.0, SCALE).ok_or(ContractError::Overflow)
 }
 
+// ── Reward Index Computation ────────────────────────────────
+
+/// Computes the compounded reward for a staker from a compounding multiplier.
+///
+/// All arithmetic uses checked helpers so an unexpected state (e.g. a zero or
+/// corrupted staked balance) can never panic the host with a math underflow.
+/// If the resulting reward index would be negative the operation fails with
+/// `InvalidAmount` instead of silently proceeding.
+fn compute_reward_index(
+    staked_amount: i128,
+    accrued_rewards: i128,
+    multiplier: &Fixed,
+) -> Result<i128, ContractError> {
+    if staked_amount <= 0 || accrued_rewards < 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    // Virtual Balance V = S + R
+    let v_old = staked_amount
+        .checked_add(accrued_rewards)
+        .ok_or(ContractError::Overflow)?;
+
+    // V_new = v_old * multiplier (guarded multiply via mul_div)
+    let v_new = multiply_amount(v_old, *multiplier)?;
+
+    // R_new = V_new - S — guarded subtraction; never underflow panics.
+    let r_new = v_new
+        .checked_sub(staked_amount)
+        .ok_or(ContractError::InvalidAmount)?;
+
+    Ok(r_new)
+}
+
 // ── Epoch Helpers ─────────────────────────────────────────────
 
 fn epoch_for_block(start_block: u32, epoch_length: u32, block: u32) -> u32 {
@@ -735,18 +768,14 @@ impl StakingRewards {
         if state.staked_amount > 0 && t_curr > state.last_update_block {
             // Time-based reward calculation: V_new = V_old * multiplier, where
             // multiplier = exp(integral of reward rate over time). Rewards are
-            // computed as R_new = V_new - staked_amount to avoid rounding errors.
+            // computed as R_new = V_new - staked_amount. Uses checked math so a
+            // zero-stake edge case can never trigger a subtraction-underflow panic.
             let multiplier_res = calculate_multiplier(&e, &config, state.last_update_block, t_curr);
             if let Ok(multiplier) = multiplier_res {
-                let v_old_res = state.staked_amount.checked_add(state.accrued_rewards);
-                if let Some(v_old) = v_old_res {
-                    let v_new_res = multiply_amount(v_old, multiplier);
-                    if let Ok(v_new) = v_new_res {
-                        let r_new_res = v_new.checked_sub(state.staked_amount);
-                        if let Some(r_new) = r_new_res {
-                            return r_new;
-                        }
-                    }
+                if let Ok(r_new) =
+                    compute_reward_index(state.staked_amount, state.accrued_rewards, &multiplier)
+                {
+                    return r_new;
                 }
             }
         }
@@ -785,24 +814,12 @@ impl StakingRewards {
         if state.staked_amount > 0 && t_curr > state.last_update_block {
             // Time-based reward calculation: V_new = V_old * multiplier, where
             // multiplier = exp(integral of reward rate over time). Rewards are
-            // computed as R_new = V_new - staked_amount to avoid rounding errors.
-            let multiplier = calculate_multiplier(e, config, state.last_update_block, t_curr)?;
-
-            // Virtual Balance V = S + R
-            let v_old = state
-                .staked_amount
-                .checked_add(state.accrued_rewards)
-                .ok_or(ContractError::Overflow)?;
-
-            // V_new = v_old * multiplier
-            let v_new = multiply_amount(v_old, multiplier)?;
-
-            // R_new = V_new - S
-            let r_new = v_new
-                .checked_sub(state.staked_amount)
-                .ok_or(ContractError::Overflow)?;
-
-            state.accrued_rewards = r_new;
+            // computed as R_new = V_new - staked_amount. The reward index is
+            // computed with checked math only — a zero or underflowing balance
+            // can never cause a subtraction-underflow panic.
+            let multiplier = calculate_multiplier(&e, &config, state.last_update_block, t_curr)?;
+            state.accrued_rewards =
+                compute_reward_index(state.staked_amount, state.accrued_rewards, &multiplier)?;
         }
 
         state.last_update_block = t_curr.max(config.start_block);
