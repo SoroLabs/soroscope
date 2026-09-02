@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-core-binaries:
+    name: Build release binaries (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: soroscope-core-linux-x86_64.tar.gz
+            binary: soroscope-core
+          - name: macos-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            archive: soroscope-core-macos-arm64.tar.gz
+            binary: soroscope-core
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }} -p soroscope-core
+
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="release-${{ matrix.name }}"
+          mkdir -p "$artifact_dir"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$artifact_dir/"
+          tar -czf "${{ matrix.archive }}" -C . "$artifact_dir"
+          ls -lh "${{ matrix.archive }}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.archive }}
+
+  build-contract-wasm:
+    name: Build Soroban contract WASM artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Compile all contract crates to WASM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-wasm
+          while IFS= read -r manifest; do
+            cargo build --locked --release --target wasm32-unknown-unknown --manifest-path "$manifest"
+          done < <(find contracts -mindepth 2 -maxdepth 2 -name Cargo.toml | sort)
+
+          find target/wasm32-unknown-unknown/release -maxdepth 1 -type f -name '*.wasm' -exec cp {} release-wasm/ \;
+          ls -1 release-wasm | head
+
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: soroban-contract-wasm
+          path: release-wasm/*.wasm
+
+  publish-release:
+    name: Publish GitHub release
+    needs:
+      - build-core-binaries
+      - build-contract-wasm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Flatten release payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find release-artifacts -type f \( -name '*.tar.gz' -o -name '*.wasm' \) -exec cp {} release-assets/ \;
+          ls -lh release-assets
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
