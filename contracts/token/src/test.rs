@@ -1,4 +1,4 @@
-use crate::contract::{Token, TokenClient, BurnEvent};
+use crate::contract::{Token, TokenClient};
 use emergency_guard::{GuardError, PauseType};
 use soroban_sdk::{testutils::Address as _, Address, Env, String, Symbol, vec, Vec, IntoVal, TryIntoVal};
 
@@ -484,10 +484,8 @@ fn test_burn_emits_event() {
 
     assert_eq!(burn_events.len(), 1);
     let (_, _, data) = &burn_events[0];
-    let burn_event: BurnEvent = data.try_into_val(&env).unwrap();
-    assert_eq!(burn_event.burner, user);
-    assert_eq!(burn_event.target_account, user);
-    assert_eq!(burn_event.amount, 400);
+    let amount: i128 = data.try_into_val(&env).unwrap();
+    assert_eq!(amount, 400);
 }
 
 #[test]
@@ -530,14 +528,12 @@ fn test_burn_from_emits_event() {
             c_id == &contract_id
                 && topics.len() == 2
                 && topics.get(0).unwrap() == burn_event_name.clone().into_val(&env)
-                && topics.get(1).unwrap() == user.clone().into_val(&env)
+                && topics.get(1).unwrap() == user.clone().into_val(&env) // wait, burn uses from address. spender isn't in topics for standard burn. 
         })
         .collect();
 
     assert_eq!(burn_events.len(), 1);
     let (_, _, data) = &burn_events[0];
-    let burn_event: BurnEvent = data.try_into_val(&env).unwrap();
-    assert_eq!(burn_event.burner, spender);
-    assert_eq!(burn_event.target_account, user);
-    assert_eq!(burn_event.amount, 300);
+    let amount: i128 = data.try_into_val(&env).unwrap();
+    assert_eq!(amount, 300);
 }
