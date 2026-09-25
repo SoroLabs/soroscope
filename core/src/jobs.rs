@@ -1535,6 +1535,326 @@ impl JobWorker {
     }
 }
 
+/// Lifecycle of a long-running profiling job on [`ProfilingWorkerPool`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProfilingJobStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Snapshot of one profiling job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfilingJobSnapshot {
+    pub id: Uuid,
+    pub status: ProfilingJobStatus,
+    pub output: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Why a profiling job ended in [`ProfilingJobStatus::Failed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfilingJobFailure {
+    Cancelled,
+    TimedOut,
+    Worker(String),
+}
+
+impl std::fmt::Display for ProfilingJobFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProfilingJobFailure::Cancelled => write!(f, "cancelled"),
+            ProfilingJobFailure::TimedOut => write!(f, "timed out"),
+            ProfilingJobFailure::Worker(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ProfilingPoolError {
+    #[error("profiling job not found: {0}")]
+    NotFound(Uuid),
+    #[error("profiling job {id} cannot be cancelled from status {status:?}")]
+    CannotCancel {
+        id: Uuid,
+        status: ProfilingJobStatus,
+    },
+    #[error("worker pool size must be at least 1")]
+    InvalidPoolSize,
+}
+
+/// Configurable async worker pool for long-running profiling jobs.
+///
+/// At most `pool_size` jobs run at once. Each job moves through
+/// Pending → Running → Completed or Failed. Cancellation and the
+/// per-job timeout both finish the job as Failed and invoke the
+/// registered handlers.
+pub struct ProfilingWorkerPool {
+    pool_size: usize,
+    timeout: Duration,
+    permits: Arc<tokio::sync::Semaphore>,
+    jobs: Arc<tokio::sync::Mutex<HashMap<Uuid, ProfilingJobSnapshot>>>,
+    cancel_flags: Arc<tokio::sync::Mutex<HashMap<Uuid, tokio::sync::watch::Sender<bool>>>>,
+    on_cancel: Arc<tokio::sync::Mutex<Option<Arc<dyn Fn(Uuid) + Send + Sync>>>>,
+    on_timeout: Arc<tokio::sync::Mutex<Option<Arc<dyn Fn(Uuid) + Send + Sync>>>>,
+}
+
+impl ProfilingWorkerPool {
+    /// Build a pool that runs at most `pool_size` jobs concurrently.
+    /// Each job fails if it has not finished within `timeout`.
+    pub fn new(pool_size: usize, timeout: Duration) -> Result<Self, ProfilingPoolError> {
+        if pool_size == 0 {
+            return Err(ProfilingPoolError::InvalidPoolSize);
+        }
+        Ok(Self {
+            pool_size,
+            timeout,
+            permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
+            jobs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            cancel_flags: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            on_cancel: Arc::new(tokio::sync::Mutex::new(None)),
+            on_timeout: Arc::new(tokio::sync::Mutex::new(None)),
+        })
+    }
+
+    pub fn pool_size(&self) -> usize {
+        self.pool_size
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Called after a job is cancelled.
+    pub async fn set_cancel_handler<F>(&self, handler: F)
+    where
+        F: Fn(Uuid) + Send + Sync + 'static,
+    {
+        *self.on_cancel.lock().await = Some(Arc::new(handler));
+    }
+
+    /// Called after a job exceeds its timeout.
+    pub async fn set_timeout_handler<F>(&self, handler: F)
+    where
+        F: Fn(Uuid) + Send + Sync + 'static,
+    {
+        *self.on_timeout.lock().await = Some(Arc::new(handler));
+    }
+
+    /// Enqueue `work`. The job stays Pending until a worker slot is free.
+    pub async fn submit<F, Fut>(&self, work: F) -> Uuid
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+    {
+        let id = Uuid::new_v4();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut jobs = self.jobs.lock().await;
+            jobs.insert(
+                id,
+                ProfilingJobSnapshot {
+                    id,
+                    status: ProfilingJobStatus::Pending,
+                    output: None,
+                    error: None,
+                },
+            );
+        }
+        self.cancel_flags.lock().await.insert(id, cancel_tx);
+
+        let jobs = Arc::clone(&self.jobs);
+        let permits = Arc::clone(&self.permits);
+        let cancel_flags = Arc::clone(&self.cancel_flags);
+        let on_cancel = Arc::clone(&self.on_cancel);
+        let on_timeout = Arc::clone(&self.on_timeout);
+        let timeout = self.timeout;
+
+        tokio::spawn(async move {
+            let permit = match permits.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    finish_job(
+                        &jobs,
+                        id,
+                        ProfilingJobStatus::Failed,
+                        None,
+                        Some(ProfilingJobFailure::Cancelled.to_string()),
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            if *cancel_rx.borrow() {
+                finish_job(
+                    &jobs,
+                    id,
+                    ProfilingJobStatus::Failed,
+                    None,
+                    Some(ProfilingJobFailure::Cancelled.to_string()),
+                )
+                .await;
+                invoke_handler(&on_cancel, id).await;
+                cancel_flags.lock().await.remove(&id);
+                drop(permit);
+                return;
+            }
+
+            set_status(&jobs, id, ProfilingJobStatus::Running).await;
+
+            let work_fut = work();
+            tokio::pin!(work_fut);
+
+            let outcome = tokio::select! {
+                biased;
+                _ = watch_cancelled(cancel_rx) => {
+                    Err(ProfilingJobFailure::Cancelled)
+                }
+                result = tokio::time::timeout(timeout, &mut work_fut) => {
+                    match result {
+                        Ok(Ok(output)) => Ok(output),
+                        Ok(Err(err)) => Err(ProfilingJobFailure::Worker(err)),
+                        Err(_) => Err(ProfilingJobFailure::TimedOut),
+                    }
+                }
+            };
+
+            match outcome {
+                Ok(output) => {
+                    finish_job(
+                        &jobs,
+                        id,
+                        ProfilingJobStatus::Completed,
+                        Some(output),
+                        None,
+                    )
+                    .await;
+                }
+                Err(ProfilingJobFailure::Cancelled) => {
+                    finish_job(
+                        &jobs,
+                        id,
+                        ProfilingJobStatus::Failed,
+                        None,
+                        Some(ProfilingJobFailure::Cancelled.to_string()),
+                    )
+                    .await;
+                    invoke_handler(&on_cancel, id).await;
+                }
+                Err(ProfilingJobFailure::TimedOut) => {
+                    finish_job(
+                        &jobs,
+                        id,
+                        ProfilingJobStatus::Failed,
+                        None,
+                        Some(ProfilingJobFailure::TimedOut.to_string()),
+                    )
+                    .await;
+                    invoke_handler(&on_timeout, id).await;
+                }
+                Err(ProfilingJobFailure::Worker(err)) => {
+                    finish_job(&jobs, id, ProfilingJobStatus::Failed, None, Some(err)).await;
+                }
+            }
+
+            cancel_flags.lock().await.remove(&id);
+            drop(permit);
+        });
+
+        id
+    }
+
+    pub async fn get(&self, id: Uuid) -> Option<ProfilingJobSnapshot> {
+        self.jobs.lock().await.get(&id).cloned()
+    }
+
+    /// Cancel a Pending or Running job. The job ends as Failed.
+    pub async fn cancel(&self, id: Uuid) -> Result<(), ProfilingPoolError> {
+        let status = self
+            .jobs
+            .lock()
+            .await
+            .get(&id)
+            .map(|job| job.status)
+            .ok_or(ProfilingPoolError::NotFound(id))?;
+
+        match status {
+            ProfilingJobStatus::Pending | ProfilingJobStatus::Running => {
+                if let Some(flag) = self.cancel_flags.lock().await.get(&id) {
+                    let _ = flag.send(true);
+                }
+                Ok(())
+            }
+            other => Err(ProfilingPoolError::CannotCancel { id, status: other }),
+        }
+    }
+
+    /// Wait until the job is Completed or Failed.
+    pub async fn wait(&self, id: Uuid) -> Result<ProfilingJobSnapshot, ProfilingPoolError> {
+        loop {
+            if let Some(job) = self.get(id).await {
+                match job.status {
+                    ProfilingJobStatus::Completed | ProfilingJobStatus::Failed => return Ok(job),
+                    ProfilingJobStatus::Pending | ProfilingJobStatus::Running => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
+            } else {
+                return Err(ProfilingPoolError::NotFound(id));
+            }
+        }
+    }
+}
+
+async fn set_status(
+    jobs: &tokio::sync::Mutex<HashMap<Uuid, ProfilingJobSnapshot>>,
+    id: Uuid,
+    status: ProfilingJobStatus,
+) {
+    if let Some(job) = jobs.lock().await.get_mut(&id) {
+        job.status = status;
+    }
+}
+
+async fn finish_job(
+    jobs: &tokio::sync::Mutex<HashMap<Uuid, ProfilingJobSnapshot>>,
+    id: Uuid,
+    status: ProfilingJobStatus,
+    output: Option<String>,
+    error: Option<String>,
+) {
+    if let Some(job) = jobs.lock().await.get_mut(&id) {
+        job.status = status;
+        job.output = output;
+        job.error = error;
+    }
+}
+
+async fn invoke_handler(
+    slot: &tokio::sync::Mutex<Option<Arc<dyn Fn(Uuid) + Send + Sync>>>,
+    id: Uuid,
+) {
+    if let Some(handler) = slot.lock().await.clone() {
+        handler(id);
+    }
+}
+
+async fn watch_cancelled(mut rx: tokio::sync::watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    loop {
+        if rx.changed().await.is_err() {
+            return;
+        }
+        if *rx.borrow() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1857,5 +2177,151 @@ mod tests {
             result.is_ok(),
             "cleanup task must exit promptly upon shutdown signal"
         );
+    }
+
+    fn test_pool(size: usize, timeout: Duration) -> ProfilingWorkerPool {
+        ProfilingWorkerPool::new(size, timeout).expect("valid pool size")
+    }
+
+    #[tokio::test]
+    async fn profiling_pool_rejects_zero_workers() {
+        let result = ProfilingWorkerPool::new(0, Duration::from_secs(1));
+        assert!(matches!(result, Err(ProfilingPoolError::InvalidPoolSize)));
+    }
+
+    #[tokio::test]
+    async fn profiling_job_runs_pending_to_completed() {
+        let pool = test_pool(2, Duration::from_secs(2));
+        let id = pool.submit(|| async { Ok("profiled".to_string()) }).await;
+
+        let finished = pool.wait(id).await.expect("job exists");
+        assert_eq!(finished.status, ProfilingJobStatus::Completed);
+        assert_eq!(finished.output.as_deref(), Some("profiled"));
+        assert!(finished.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn profiling_pool_size_keeps_extra_jobs_pending() {
+        let pool = Arc::new(test_pool(1, Duration::from_secs(5)));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+
+        let first = {
+            let release_rx = Arc::clone(&release_rx);
+            pool.submit(move || async move {
+                if let Some(rx) = release_rx.lock().await.take() {
+                    let _ = rx.await;
+                }
+                Ok("first".to_string())
+            })
+            .await
+        };
+
+        let second = pool
+            .submit(|| async { Ok("second".to_string()) })
+            .await;
+
+        let queued = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let first_status = pool.get(first).await.map(|job| job.status);
+                let second_status = pool.get(second).await.map(|job| job.status);
+                if first_status == Some(ProfilingJobStatus::Running)
+                    && second_status == Some(ProfilingJobStatus::Pending)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            queued.is_ok(),
+            "pool size 1 keeps the second job pending while the first is running"
+        );
+
+        let _ = release_tx.send(());
+        let first_done = pool.wait(first).await.unwrap();
+        let second_done = pool.wait(second).await.unwrap();
+        assert_eq!(first_done.status, ProfilingJobStatus::Completed);
+        assert_eq!(second_done.status, ProfilingJobStatus::Completed);
+        assert_eq!(second_done.output.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn profiling_job_cancel_handler_marks_failed() {
+        let pool = test_pool(1, Duration::from_secs(5));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        pool.set_cancel_handler(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+
+        let id = pool
+            .submit(|| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok("should-not-finish".to_string())
+            })
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if pool.get(id).await.map(|job| job.status) == Some(ProfilingJobStatus::Running) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("job starts running");
+
+        pool.cancel(id).await.expect("cancel running job");
+        let finished = pool.wait(id).await.unwrap();
+        assert_eq!(finished.status, ProfilingJobStatus::Failed);
+        assert_eq!(finished.error.as_deref(), Some("cancelled"));
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+
+        let err = pool.cancel(id).await.unwrap_err();
+        assert!(matches!(
+            err,
+            ProfilingPoolError::CannotCancel {
+                status: ProfilingJobStatus::Failed,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn profiling_job_timeout_handler_marks_failed() {
+        let pool = test_pool(1, Duration::from_millis(40));
+        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&timed_out);
+        pool.set_timeout_handler(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+
+        let id = pool
+            .submit(|| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok("late".to_string())
+            })
+            .await;
+
+        let finished = pool.wait(id).await.unwrap();
+        assert_eq!(finished.status, ProfilingJobStatus::Failed);
+        assert_eq!(finished.error.as_deref(), Some("timed out"));
+        assert!(timed_out.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn profiling_worker_error_is_failed() {
+        let pool = test_pool(1, Duration::from_secs(2));
+        let id = pool
+            .submit(|| async { Err("profile trap".to_string()) })
+            .await;
+        let finished = pool.wait(id).await.unwrap();
+        assert_eq!(finished.status, ProfilingJobStatus::Failed);
+        assert_eq!(finished.error.as_deref(), Some("profile trap"));
     }
 }
