@@ -1,13 +1,20 @@
 name: Release
 
+# Trigger on version tags only (e.g. v1.0.0, v0.3.1-rc1)
 on:
   push:
     tags:
       - 'v*'
 
+env:
+  CARGO_TERM_COLOR: always
+
 permissions:
   contents: write
 
+# ---------------------------------------------------------------------------
+# Job 1 – Build core binaries (matrix: Linux x86_64 + macOS arm64)
+# ---------------------------------------------------------------------------
 jobs:
   build-core-binaries:
     name: Build release binaries (${{ matrix.name }})
@@ -18,14 +25,12 @@ jobs:
         include:
           - name: linux-x86_64
             runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             archive: soroscope-core-linux-x86_64.tar.gz
-            binary: soroscope-core
           - name: macos-arm64
             runner: macos-14
             target: aarch64-apple-darwin
             archive: soroscope-core-macos-arm64.tar.gz
-            binary: soroscope-core
 
     steps:
       - name: Checkout
@@ -36,17 +41,31 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --locked --release --target ${{ matrix.target }} -p soroscope-core
+      - name: Install musl-tools (Linux only)
+        if: matrix.name == 'linux-x86_64'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Package binary
+      - name: Build soroscope-core
+        working-directory: core
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }} \
+            --bin soroscope-core
+
+      - name: Build rpc-proxy
+        working-directory: core
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }} \
+            --bin rpc-proxy
+
+      - name: Package binaries
         shell: bash
         run: |
           set -euo pipefail
           artifact_dir="release-${{ matrix.name }}"
           mkdir -p "$artifact_dir"
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$artifact_dir/"
-          tar -czf "${{ matrix.archive }}" -C . "$artifact_dir"
+          cp "core/target/${{ matrix.target }}/release/soroscope-core" "$artifact_dir/"
+          cp "core/target/${{ matrix.target }}/release/rpc-proxy" "$artifact_dir/"
+          tar -czf "${{ matrix.archive }}" -C "$artifact_dir" soroscope-core rpc-proxy
           ls -lh "${{ matrix.archive }}"
 
       - name: Upload binary artifact
@@ -55,6 +74,9 @@ jobs:
           name: ${{ matrix.name }}
           path: ${{ matrix.archive }}
 
+  # ---------------------------------------------------------------------------
+  # Job 2 – Build all Soroban contract WASMs and package them
+  # ---------------------------------------------------------------------------
   build-contract-wasm:
     name: Build Soroban contract WASM artifacts
     runs-on: ubuntu-latest
@@ -68,24 +90,54 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Install system dependencies (binaryen for wasm-opt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev libudev-dev binaryen
+
       - name: Compile all contract crates to WASM
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p release-wasm
           while IFS= read -r manifest; do
-            cargo build --locked --release --target wasm32-unknown-unknown --manifest-path "$manifest"
+            cargo build --locked --release \
+              --target wasm32-unknown-unknown \
+              --manifest-path "$manifest"
           done < <(find contracts -mindepth 2 -maxdepth 2 -name Cargo.toml | sort)
 
-          find target/wasm32-unknown-unknown/release -maxdepth 1 -type f -name '*.wasm' -exec cp {} release-wasm/ \;
-          ls -1 release-wasm | head
+          find target/wasm32-unknown-unknown/release \
+            -maxdepth 1 -type f -name '*.wasm' \
+            -exec cp {} release-wasm/ \;
+          echo "Compiled WASM files:"
+          ls -1 release-wasm
 
-      - name: Upload WASM artifacts
+      # The .cargo/config.toml already strips reference-types at compile time;
+      # wasm-opt adds an additional size/speed optimisation pass on top.
+      - name: Optimise WASM files with wasm-opt
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in release-wasm/*.wasm; do
+            echo "Optimising $f …"
+            wasm-opt --disable-reference-types -O2 "$f" -o "$f"
+          done
+
+      - name: Package WASM artifacts
+        shell: bash
+        run: |
+          tar -czf soroscope-contracts-wasm.tar.gz -C release-wasm $(ls release-wasm)
+          ls -lh soroscope-contracts-wasm.tar.gz
+
+      - name: Upload WASM artifact
         uses: actions/upload-artifact@v4
         with:
           name: soroban-contract-wasm
-          path: release-wasm/*.wasm
+          path: soroscope-contracts-wasm.tar.gz
 
+  # ---------------------------------------------------------------------------
+  # Job 3 – Create GitHub Release and attach all artifacts
+  # ---------------------------------------------------------------------------
   publish-release:
     name: Publish GitHub release
     needs:
@@ -96,21 +148,81 @@ jobs:
       contents: write
 
     steps:
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
 
-      - name: Flatten release payload
+      - name: Flatten and checksum release assets
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          find release-artifacts -type f \( -name '*.tar.gz' -o -name '*.wasm' \) -exec cp {} release-assets/ \;
+          find release-artifacts -type f \( -name '*.tar.gz' -o -name '*.wasm' \) \
+            -exec cp {} release-assets/ \;
+          echo "Release assets:"
           ls -lh release-assets
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
-      - name: Create GitHub release
+      - name: Derive release metadata
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u '+%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+          # Mark as pre-release if tag contains -rc, -alpha, or -beta
+          if echo "$TAG" | grep -qE '\-(rc|alpha|beta)'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/*
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: "SoroScope ${{ steps.meta.outputs.tag }}"
+          draft: false
+          prerelease: ${{ steps.meta.outputs.prerelease }}
           generate_release_notes: true
+          body: |
+            ## SoroScope ${{ steps.meta.outputs.tag }} — ${{ steps.meta.outputs.date }}
+
+            ### 📦 Release Artifacts
+
+            | Artifact | Description |
+            |---|---|
+            | `soroscope-core-linux-x86_64.tar.gz` | Core server + RPC proxy — Linux x86_64 (static musl binary) |
+            | `soroscope-core-macos-arm64.tar.gz` | Core server + RPC proxy — macOS arm64 (Apple Silicon) |
+            | `soroscope-contracts-wasm.tar.gz` | All Soroban contracts compiled to WASM (wasm-opt -O2) |
+            | `SHA256SUMS.txt` | SHA-256 checksums for all artifacts |
+
+            ### 🚀 Quick Start
+
+            **Linux x86_64**
+            ```bash
+            tar xzf soroscope-core-linux-x86_64.tar.gz
+            RUST_LOG=info ./soroscope-core
+            ```
+
+            **macOS arm64**
+            ```bash
+            tar xzf soroscope-core-macos-arm64.tar.gz
+            RUST_LOG=info ./soroscope-core
+            ```
+
+            **WASM contracts** — extract and upload to the SoroScope dashboard for profiling:
+            ```bash
+            tar xzf soroscope-contracts-wasm.tar.gz
+            ```
+
+            ### 🔍 Verify Checksums
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            ```
+
+            ---
+            Built from commit ${{ github.sha }}
+          files: release-assets/*
