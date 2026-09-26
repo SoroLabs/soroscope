@@ -20,6 +20,20 @@ const PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(3600);
 /// for development. The wildcard cannot be combined with credentialed browser
 /// requests, so deployments that authenticate from the browser should set an
 /// explicit origin list via the `CORS_ALLOWED_ORIGINS` environment variable.
+/// Build the CORS layer reading allowed origins from the `CORS_ALLOWED_ORIGINS` environment variable.
+pub fn build_cors_layer_from_env() -> CorsLayer {
+    let origins_str = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default();
+    build_cors_layer(&origins_str)
+}
+
+/// Build the CORS layer applied to the public API router.
+///
+/// `allowed_origins` is a comma-separated list of origins, e.g.
+/// `"https://app.example.com,https://staging.example.com"`. When the list is
+/// empty (the default) every origin is allowed — a permissive fallback meant
+/// for development. The wildcard cannot be combined with credentialed browser
+/// requests, so deployments that authenticate from the browser should set an
+/// explicit origin list via the `CORS_ALLOWED_ORIGINS` environment variable.
 pub fn build_cors_layer(allowed_origins: &str) -> CorsLayer {
     let origins: Vec<HeaderValue> = allowed_origins
         .split(',')
@@ -34,11 +48,25 @@ pub fn build_cors_layer(allowed_origins: &str) -> CorsLayer {
         })
         .collect();
 
+    let is_prod = std::env::var("APP_ENV").map(|v| v == "production").unwrap_or(false)
+        || std::env::var("ENVIRONMENT").map(|v| v == "production").unwrap_or(false);
+
     let allow_origin = if origins.is_empty() {
-        tracing::warn!(
-            "CORS_ALLOWED_ORIGINS is not set; allowing any origin (development fallback)"
-        );
-        AllowOrigin::any()
+        if is_prod {
+            tracing::error!(
+                "CORS_ALLOWED_ORIGINS is not set in production; wildcard disabled"
+            );
+            AllowOrigin::list(vec![])
+        } else {
+            tracing::warn!(
+                "CORS_ALLOWED_ORIGINS is not set; allowing any origin (development fallback)"
+            );
+            AllowOrigin::any()
+        }
+    } else if is_prod && origins.iter().any(|h| h == "*") {
+        tracing::error!("Wildcard CORS origin '*' is disabled in production");
+        let filtered: Vec<HeaderValue> = origins.into_iter().filter(|h| h != "*").collect();
+        AllowOrigin::list(filtered)
     } else {
         AllowOrigin::list(origins)
     };
@@ -175,5 +203,20 @@ mod tests {
             resp.headers().get(ACAO).is_none(),
             "origins outside the configured list must not be granted access"
         );
+    }
+
+    #[tokio::test]
+    async fn cors_from_env_and_production_wildcard_restriction() {
+        std::env::set_var("CORS_ALLOWED_ORIGINS", "https://env.example.com");
+        let app = app(build_cors_layer_from_env());
+        let resp = send(app, get_with_origin("/ok", "https://env.example.com")).await;
+        assert_eq!(resp.headers().get(ACAO).unwrap(), "https://env.example.com");
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+
+        std::env::set_var("APP_ENV", "production");
+        let app_prod = app(build_cors_layer(""));
+        let resp_prod = send(app_prod, get_with_origin("/ok", "https://random.example")).await;
+        assert!(resp_prod.headers().get(ACAO).is_none());
+        std::env::remove_var("APP_ENV");
     }
 }

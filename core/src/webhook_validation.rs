@@ -105,6 +105,8 @@ where
         let signature_val = req
             .headers()
             .get(SIGNATURE_HEADER)
+            .or_else(|| req.headers().get("x-signature-256"))
+            .or_else(|| req.headers().get("X-Signature-256"))
             .and_then(|v| v.to_str().ok())
             .ok_or(WebhookValidationError::MissingHeader(SIGNATURE_HEADER))?
             .to_owned();
@@ -147,11 +149,21 @@ where
 // Core verification logic
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Compute an HMAC-SHA256 signature for a payload.
+pub fn generate_signature(secret: &str, timestamp: &str, body: &[u8]) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
+    mac.update(timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
 /// Verify an HMAC-SHA256 signature.
 pub fn verify_signature(secret: &str, timestamp: &str, body: &[u8], signature: &str) -> bool {
     let hex_sig = match signature.strip_prefix("sha256=") {
         Some(h) => h,
-        None => return false,
+        None => signature,
     };
 
     let sig_bytes = match hex::decode(hex_sig) {
@@ -372,5 +384,44 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn extractor_accepts_x_signature_256_header() {
+        let secret = Arc::new(SECRET.to_string());
+        let app = Router::new()
+            .route(
+                "/test",
+                post(|ValidatedWebhook(body): ValidatedWebhook| async move {
+                    assert_eq!(body, BODY);
+                    StatusCode::OK
+                }),
+            )
+            .layer(Extension(InboundWebhookSecret(secret)));
+
+        let ts = now_str();
+        let sig = generate_signature(SECRET, &ts, BODY);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header(TIMESTAMP_HEADER, &ts)
+            .header("X-Signature-256", &sig)
+            .header(DELIVERY_HEADER, "some-uuid")
+            .body(Body::from(BODY))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn hmac_known_test_vector_verification() {
+        let secret = "test-secret-key-32-bytes-long!!";
+        let ts = "1700000000";
+        let body = b"hello world";
+        let generated = generate_signature(secret, ts, body);
+        assert!(verify_signature(secret, ts, body, &generated));
+        assert!(!verify_signature(secret, ts, b"tampered", &generated));
     }
 }

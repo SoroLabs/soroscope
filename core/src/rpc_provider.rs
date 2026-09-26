@@ -741,7 +741,7 @@ impl ProviderRegistry {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "getLatestLedger",
+            "method": "getHealth",
             "params": null
         });
 
@@ -750,13 +750,21 @@ impl ProviderRegistry {
             req = req.header(header.as_str(), value.as_str());
         }
 
+        let start = Instant::now();
         let response = tokio::time::timeout(HEALTH_CHECK_TIMEOUT, req.send())
             .await
             .map_err(|_| "timeout".to_string())?
             .map_err(|error| format!("request error: {error}"))?;
 
+        let rtt_us = start.elapsed().as_micros() as u64;
+        state.stats.record(rtt_us);
+
         if !response.status().is_success() {
             return Err(format!("HTTP {}", response.status().as_u16()));
+        }
+
+        if rtt_us > 2_000_000 {
+            return Err(format!("RTT latency high: {}ms (> 2000ms)", rtt_us / 1000));
         }
 
         let json: serde_json::Value = response
@@ -764,9 +772,18 @@ impl ProviderRegistry {
             .await
             .map_err(|error| format!("parse error: {error}"))?;
 
-        json["result"]["sequence"]
+        if let Some(status) = json["result"]["status"].as_str() {
+            if status != "healthy" {
+                return Err(format!("RPC status unhealthy: {status}"));
+            }
+        }
+
+        let sequence = json["result"]["sequence"]
             .as_u64()
-            .ok_or_else(|| "missing sequence in response".to_string())
+            .or_else(|| json["result"]["latestLedger"].as_u64())
+            .unwrap_or(0);
+
+        Ok(sequence)
     }
 
     async fn find_by_url(&self, url: &str) -> Option<Arc<ProviderState>> {

@@ -462,6 +462,16 @@ mod tests {
     }
 
     #[test]
+    fn exponential_backoff_sequence_matches_specification() {
+        let config = WebhookConfig::default();
+        assert_eq!(config.retry_delay(1), Duration::from_secs(1));
+        assert_eq!(config.retry_delay(2), Duration::from_secs(2));
+        assert_eq!(config.retry_delay(3), Duration::from_secs(4));
+        assert_eq!(config.retry_delay(4), Duration::from_secs(8));
+        assert_eq!(config.retry_delay(5), Duration::from_secs(16));
+    }
+
+    #[test]
     fn rejects_weak_subscription_configuration() {
         let result = ContractSubscription::new("", Vec::new(), "https://example.com", "short");
         assert!(matches!(result, Err(WebhookError::InvalidSubscription(_))));
