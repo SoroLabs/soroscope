@@ -745,12 +745,23 @@ mod tests {
     }
 
     /// A well-formed contract: bounded memory, integer-only, one good export.
-    fn clean_module() -> Vec<u8> {
+    pub fn clean_module() -> Vec<u8> {
         wasm_module(&[
             type_section(),
             func_section(),
             memory_section(1, Some(16)),
             export_section("transfer"),
+            code_section(&[]),
+        ])
+    }
+
+    pub fn clean_module_with_custom(custom: (u8, Vec<u8>)) -> Vec<u8> {
+        wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("transfer"),
+            custom,
             code_section(&[]),
         ])
     }
