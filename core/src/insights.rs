@@ -233,6 +233,52 @@ impl InsightRule for MemoryPressureRule {
     }
 }
 
+/// Detects repeated reads and writes of the same ledger key within a single invocation.
+pub struct RepeatedKeyAccessRule;
+
+impl InsightRule for RepeatedKeyAccessRule {
+    fn name(&self) -> &str {
+        "repeated_key_access"
+    }
+
+    fn evaluate(&self, r: &SorobanResources) -> Vec<Insight> {
+        let mut out = Vec::new();
+
+        if let Some(trace) = &r.access_trace {
+            if trace.status == "available" {
+                for key_analysis in &trace.flagged_keys {
+                    if key_analysis.multiple_writes {
+                        out.push(Insight {
+                            severity: Severity::Warning,
+                            rule: self.name().to_string(),
+                            message: format!(
+                                "Ledger key '{}' was written {} times during invocation",
+                                key_analysis.key, key_analysis.write_count
+                            ),
+                            suggested_fix: "Mutate a local variable and perform a single write at the end of execution."
+                                .to_string(),
+                        });
+                    }
+                    if key_analysis.read_after_write {
+                        out.push(Insight {
+                            severity: Severity::Warning,
+                            rule: self.name().to_string(),
+                            message: format!(
+                                "Ledger key '{}' was read after being written in the same invocation",
+                                key_analysis.key
+                            ),
+                            suggested_fix: "Reuse the local value in scope instead of re-reading from storage."
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        out
+    }
+}
+
 // ── Engine ────────────────────────────────────────────────────────────────────
 
 /// The insights engine holds a set of rules and evaluates them against resource
@@ -256,6 +302,7 @@ impl InsightsEngine {
                 Box::new(InstructionDensityRule),
                 Box::new(FootprintBloatRule),
                 Box::new(MemoryPressureRule),
+                Box::new(RepeatedKeyAccessRule),
             ],
         }
     }
@@ -598,5 +645,74 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let deserialized: InsightsReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, deserialized);
+    }
+
+    // ── Repeated key access rule ──────────────────────────────────────────
+
+    #[test]
+    fn test_repeated_key_access_rule_none_or_unavailable() {
+        let rule = RepeatedKeyAccessRule;
+        let r = SorobanResources::default();
+        assert!(rule.evaluate(&r).is_empty());
+    }
+
+    #[test]
+    fn test_repeated_key_access_rule_multiple_writes() {
+        use crate::simulation::{KeyAccessAnalysis, LedgerAccessTraceReport};
+
+        let rule = RepeatedKeyAccessRule;
+        let r = SorobanResources {
+            access_trace: Some(LedgerAccessTraceReport {
+                status: "available".to_string(),
+                access_list: vec![],
+                analyzed_keys: vec![],
+                flagged_keys: vec![KeyAccessAnalysis {
+                    key: "COUNTER".to_string(),
+                    durability: "persistent".to_string(),
+                    read_count: 1,
+                    write_count: 3,
+                    multiple_writes: true,
+                    read_after_write: false,
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let insights = rule.evaluate(&r);
+        assert_eq!(insights.len(), 1);
+        assert_eq!(insights[0].severity, Severity::Warning);
+        assert_eq!(insights[0].rule, "repeated_key_access");
+        assert!(insights[0].message.contains("COUNTER"));
+        assert!(insights[0].message.contains("written 3 times"));
+    }
+
+    #[test]
+    fn test_repeated_key_access_rule_read_after_write() {
+        use crate::simulation::{KeyAccessAnalysis, LedgerAccessTraceReport};
+
+        let rule = RepeatedKeyAccessRule;
+        let r = SorobanResources {
+            access_trace: Some(LedgerAccessTraceReport {
+                status: "available".to_string(),
+                access_list: vec![],
+                analyzed_keys: vec![],
+                flagged_keys: vec![KeyAccessAnalysis {
+                    key: "USER_BAL".to_string(),
+                    durability: "instance".to_string(),
+                    read_count: 2,
+                    write_count: 1,
+                    multiple_writes: false,
+                    read_after_write: true,
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let insights = rule.evaluate(&r);
+        assert_eq!(insights.len(), 1);
+        assert_eq!(insights[0].severity, Severity::Warning);
+        assert_eq!(insights[0].rule, "repeated_key_access");
+        assert!(insights[0].message.contains("USER_BAL"));
+        assert!(insights[0].message.contains("read after being written"));
     }
 }

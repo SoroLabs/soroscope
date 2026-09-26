@@ -100,6 +100,98 @@ impl From<soroban_env_host::HostError> for SimulationError {
     }
 }
 
+/// Ordered entry in a ledger key access trace.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct LedgerAccessEntry {
+    pub ordinal: usize,
+    pub key: String,
+    pub durability: String,
+    pub access_type: String,
+}
+
+/// Analysis summary for a single ledger key accessed during invocation.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct KeyAccessAnalysis {
+    pub key: String,
+    pub durability: String,
+    pub read_count: usize,
+    pub write_count: usize,
+    pub multiple_writes: bool,
+    pub read_after_write: bool,
+}
+
+/// Ordered access trace report identifying repeated reads/writes of ledger keys.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct LedgerAccessTraceReport {
+    pub status: String,
+    pub access_list: Vec<LedgerAccessEntry>,
+    pub analyzed_keys: Vec<KeyAccessAnalysis>,
+    pub flagged_keys: Vec<KeyAccessAnalysis>,
+}
+
+pub fn analyze_ledger_access_trace(entries: &[LedgerAccessEntry]) -> LedgerAccessTraceReport {
+    if entries.is_empty() {
+        return LedgerAccessTraceReport {
+            status: "unavailable".to_string(),
+            access_list: vec![],
+            analyzed_keys: vec![],
+            flagged_keys: vec![],
+        };
+    }
+
+    let mut key_order: Vec<String> = Vec::new();
+    let mut key_map: std::collections::HashMap<String, KeyAccessAnalysis> = std::collections::HashMap::new();
+
+    for entry in entries {
+        if !key_map.contains_key(&entry.key) {
+            key_order.push(entry.key.clone());
+            key_map.insert(
+                entry.key.clone(),
+                KeyAccessAnalysis {
+                    key: entry.key.clone(),
+                    durability: entry.durability.clone(),
+                    read_count: 0,
+                    write_count: 0,
+                    multiple_writes: false,
+                    read_after_write: false,
+                },
+            );
+        }
+
+        let analysis = key_map.get_mut(&entry.key).unwrap();
+        if entry.access_type == "read" {
+            analysis.read_count += 1;
+            if analysis.write_count > 0 {
+                analysis.read_after_write = true;
+            }
+        } else if entry.access_type == "write" {
+            analysis.write_count += 1;
+            if analysis.write_count > 1 {
+                analysis.multiple_writes = true;
+            }
+        }
+    }
+
+    let mut analyzed_keys = Vec::new();
+    let mut flagged_keys = Vec::new();
+
+    for key in key_order {
+        if let Some(analysis) = key_map.remove(&key) {
+            if analysis.multiple_writes || analysis.read_after_write {
+                flagged_keys.push(analysis.clone());
+            }
+            analyzed_keys.push(analysis);
+        }
+    }
+
+    LedgerAccessTraceReport {
+        status: "available".to_string(),
+        access_list: entries.to_vec(),
+        analyzed_keys,
+        flagged_keys,
+    }
+}
+
 /// Soroban resource consumption data
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Default)]
 pub struct SorobanResources {
@@ -113,6 +205,12 @@ pub struct SorobanResources {
     pub ledger_write_bytes: u64,
     /// Transaction size in bytes
     pub transaction_size_bytes: u64,
+    /// Event XDR bytes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_xdr_bytes: Option<u64>,
+    /// Access trace for repeated key reads/writes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_trace: Option<LedgerAccessTraceReport>,
 }
 
 /// Per-function instruction profiling result
@@ -4616,6 +4714,67 @@ mod tests {
         let parsed_legacy = extract_soroban_budget_from_logs(legacy_logs);
         assert_eq!(parsed_legacy.cpu_instructions, 500000);
         assert_eq!(parsed_legacy.memory_bytes, 250000);
+    }
+
+    #[test]
+    fn test_analyze_ledger_access_trace_empty() {
+        let report = analyze_ledger_access_trace(&[]);
+        assert_eq!(report.status, "unavailable");
+        assert!(report.analyzed_keys.is_empty());
+        assert!(report.flagged_keys.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_ledger_access_trace_multiple_writes_and_read_after_write() {
+        let entries = vec![
+            LedgerAccessEntry {
+                ordinal: 0,
+                key: "COUNTER".to_string(),
+                durability: "persistent".to_string(),
+                access_type: "read".to_string(),
+            },
+            LedgerAccessEntry {
+                ordinal: 1,
+                key: "COUNTER".to_string(),
+                durability: "persistent".to_string(),
+                access_type: "write".to_string(),
+            },
+            LedgerAccessEntry {
+                ordinal: 2,
+                key: "COUNTER".to_string(),
+                durability: "persistent".to_string(),
+                access_type: "write".to_string(),
+            },
+            LedgerAccessEntry {
+                ordinal: 3,
+                key: "USER_BAL".to_string(),
+                durability: "instance".to_string(),
+                access_type: "write".to_string(),
+            },
+            LedgerAccessEntry {
+                ordinal: 4,
+                key: "USER_BAL".to_string(),
+                durability: "instance".to_string(),
+                access_type: "read".to_string(),
+            },
+        ];
+
+        let report = analyze_ledger_access_trace(&entries);
+        assert_eq!(report.status, "available");
+        assert_eq!(report.analyzed_keys.len(), 2);
+        assert_eq!(report.flagged_keys.len(), 2);
+
+        let counter_analysis = report.flagged_keys.iter().find(|k| k.key == "COUNTER").unwrap();
+        assert_eq!(counter_analysis.read_count, 1);
+        assert_eq!(counter_analysis.write_count, 2);
+        assert!(counter_analysis.multiple_writes);
+        assert!(!counter_analysis.read_after_write);
+
+        let bal_analysis = report.flagged_keys.iter().find(|k| k.key == "USER_BAL").unwrap();
+        assert_eq!(bal_analysis.read_count, 1);
+        assert_eq!(bal_analysis.write_count, 1);
+        assert!(!bal_analysis.multiple_writes);
+        assert!(bal_analysis.read_after_write);
     }
 }
 
