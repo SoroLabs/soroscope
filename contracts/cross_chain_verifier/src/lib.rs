@@ -1,3 +1,4 @@
+// Issue #863: Contract optimization metrics
 #![no_std]
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Vec};
