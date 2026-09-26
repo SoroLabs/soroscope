@@ -578,6 +578,219 @@ impl WasmSecurityScanner {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract Spec & Env Meta Validation (Issue #1013)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const MAX_SUPPORTED_ENV_VERSION: u64 = 22;
+
+#[derive(Error, Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub enum SpecValidationError {
+    #[error("No contract spec section found in WASM module")]
+    NoSpec,
+    #[error("Truncated or malformed {section} section at byte offset {offset}")]
+    TruncatedSection { section: String, offset: usize },
+    #[error("Mismatched env meta interface version {version} in {section} section at byte offset {offset}")]
+    MismatchedEnvVersion {
+        section: String,
+        offset: usize,
+        version: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ArgumentDescriptor {
+    Supported {
+        name: String,
+        type_name: String,
+    },
+    Unsupported {
+        name: String,
+        function: String,
+        type_name: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionSpec {
+    pub name: String,
+    pub arguments: Vec<ArgumentDescriptor>,
+    pub env_meta_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecAnalysisResult {
+    pub env_meta_version: Option<u64>,
+    pub functions: Vec<FunctionSpec>,
+    pub unsupported_types_count: usize,
+}
+
+pub struct ContractSpecValidator;
+
+impl ContractSpecValidator {
+    pub fn parse_and_validate(wasm_bytes: &[u8]) -> Result<SpecAnalysisResult, SpecValidationError> {
+        let mut spec_data: Option<(Vec<u8>, usize)> = None;
+        let mut env_meta_version: Option<(u64, usize)> = None;
+
+        for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
+            match payload {
+                Ok(wasmparser::Payload::CustomSection(custom)) => {
+                    let name = custom.name();
+                    if name == "contractspecv0" {
+                        spec_data = Some((custom.data().to_vec(), custom.data_offset()));
+                    } else if name == "contractenvmetav0" {
+                        let data = custom.data();
+                        let mut cursor = std::io::Cursor::new(data);
+                        match ScEnvMetaEntry::read_xdr(&mut cursor, Limits::none()) {
+                            Ok(entry) => match entry {
+                                ScEnvMetaEntry::InterfaceVersion(ver) => {
+                                    if ver > MAX_SUPPORTED_ENV_VERSION {
+                                        return Err(SpecValidationError::MismatchedEnvVersion {
+                                            section: "contractenvmetav0".to_string(),
+                                            offset: custom.data_offset(),
+                                            version: ver,
+                                        });
+                                    }
+                                    env_meta_version = Some((ver, custom.data_offset()));
+                                }
+                            },
+                            Err(_) => {
+                                return Err(SpecValidationError::TruncatedSection {
+                                    section: "contractenvmetav0".to_string(),
+                                    offset: custom.data_offset(),
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+                _ => {}
+            }
+        }
+
+        let (data, spec_offset) = match spec_data {
+            Some(s) => s,
+            None => return Err(SpecValidationError::NoSpec),
+        };
+
+        let mut cursor = std::io::Cursor::new(&data);
+        let mut entries = Vec::new();
+
+        while (cursor.position() as usize) < data.len() {
+            let offset_before = cursor.position() as usize;
+            match ScSpecEntry::read_xdr(&mut cursor, Limits::none()) {
+                Ok(entry) => entries.push(entry),
+                Err(_) => {
+                    return Err(SpecValidationError::TruncatedSection {
+                        section: "contractspecv0".to_string(),
+                        offset: spec_offset + offset_before,
+                    });
+                }
+            }
+        }
+
+        let mut functions = Vec::new();
+        let mut unsupported_types_count = 0;
+        let env_ver = env_meta_version.map(|(v, _)| v);
+
+        for entry in entries {
+            if let ScSpecEntry::Function(func) = entry {
+                let func_name = func.name.to_string_lossy();
+                let mut arguments = Vec::new();
+
+                for input in func.inputs.iter() {
+                    let arg_name = input.name.to_string_lossy();
+                    let is_supp = Self::is_type_supported(&input.type_);
+                    let type_name = Self::type_to_string(&input.type_);
+
+                    if is_supp {
+                        arguments.push(ArgumentDescriptor::Supported {
+                            name: arg_name,
+                            type_name,
+                        });
+                    } else {
+                        unsupported_types_count += 1;
+                        arguments.push(ArgumentDescriptor::Unsupported {
+                            name: arg_name,
+                            function: func_name.clone(),
+                            type_name,
+                        });
+                    }
+                }
+
+                functions.push(FunctionSpec {
+                    name: func_name,
+                    arguments,
+                    env_meta_version: env_ver,
+                });
+            }
+        }
+
+        Ok(SpecAnalysisResult {
+            env_meta_version: env_ver,
+            functions,
+            unsupported_types_count,
+        })
+    }
+
+    fn is_type_supported(type_def: &ScSpecTypeDef) -> bool {
+        match type_def {
+            ScSpecTypeDef::U32
+            | ScSpecTypeDef::I32
+            | ScSpecTypeDef::U64
+            | ScSpecTypeDef::I64
+            | ScSpecTypeDef::U128
+            | ScSpecTypeDef::I128
+            | ScSpecTypeDef::U256
+            | ScSpecTypeDef::I256
+            | ScSpecTypeDef::Bool
+            | ScSpecTypeDef::Void
+            | ScSpecTypeDef::String
+            | ScSpecTypeDef::Symbol
+            | ScSpecTypeDef::Bytes
+            | ScSpecTypeDef::Address => true,
+            ScSpecTypeDef::Option(opt) => Self::is_type_supported(&opt.value_type),
+            ScSpecTypeDef::Vec(vec) => Self::is_type_supported(&vec.element_type),
+            ScSpecTypeDef::Map(map) => {
+                Self::is_type_supported(&map.key_type) && Self::is_type_supported(&map.value_type)
+            }
+            ScSpecTypeDef::Tuple(tuple) => tuple.type_vec.iter().all(Self::is_type_supported),
+            _ => false,
+        }
+    }
+
+    fn type_to_string(type_def: &ScSpecTypeDef) -> String {
+        match type_def {
+            ScSpecTypeDef::U32 => "u32".to_string(),
+            ScSpecTypeDef::I32 => "i32".to_string(),
+            ScSpecTypeDef::U64 => "u64".to_string(),
+            ScSpecTypeDef::I64 => "i64".to_string(),
+            ScSpecTypeDef::U128 => "u128".to_string(),
+            ScSpecTypeDef::I128 => "i128".to_string(),
+            ScSpecTypeDef::U256 => "u256".to_string(),
+            ScSpecTypeDef::I256 => "i256".to_string(),
+            ScSpecTypeDef::Bool => "bool".to_string(),
+            ScSpecTypeDef::Void => "void".to_string(),
+            ScSpecTypeDef::String => "string".to_string(),
+            ScSpecTypeDef::Symbol => "symbol".to_string(),
+            ScSpecTypeDef::Bytes => "bytes".to_string(),
+            ScSpecTypeDef::Address => "address".to_string(),
+            ScSpecTypeDef::Option(opt) => format!("Option<{}>", Self::type_to_string(&opt.value_type)),
+            ScSpecTypeDef::Vec(vec) => format!("Vec<{}>", Self::type_to_string(&vec.element_type)),
+            ScSpecTypeDef::Map(map) => format!(
+                "Map<{}, {}>",
+                Self::type_to_string(&map.key_type),
+                Self::type_to_string(&map.value_type)
+            ),
+            ScSpecTypeDef::Tuple(_) => "Tuple".to_string(),
+            ScSpecTypeDef::UdtUnionCaseV0(_) => "udt_union".to_string(),
+            ScSpecTypeDef::UdtStructCaseV0(_) => "udt_struct".to_string(),
+            _ => "unsupported_udt".to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,5 +1187,122 @@ mod tests {
         let report = WasmSecurityScanner::new().scan(&clean_module());
         let json = serde_json::to_string(&report).expect("report should serialise");
         assert!(json.contains("\"verified\":true"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Contract Spec & Env Meta Validation tests (Issue #1013)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn spec_validation_returns_nospec_when_section_missing() {
+        let wasm = clean_module();
+        let res = ContractSpecValidator::parse_and_validate(&wasm);
+        assert_eq!(res.unwrap_err(), SpecValidationError::NoSpec);
+    }
+
+    #[test]
+    fn spec_validation_returns_truncated_section() {
+        let section_data = vec![0x00, 0x01, 0xff]; // malformed XDR
+        let mut body = vec!["contractspecv0".len() as u8];
+        body.extend_from_slice("contractspecv0".as_bytes());
+        body.extend_from_slice(&section_data);
+        let custom_section = (0u8, body);
+
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("transfer"),
+            custom_section,
+            code_section(&[]),
+        ]);
+
+        let res = ContractSpecValidator::parse_and_validate(&wasm);
+        assert!(matches!(res.unwrap_err(), SpecValidationError::TruncatedSection { .. }));
+    }
+
+    #[test]
+    fn spec_validation_returns_mismatched_env_version() {
+        use soroban_sdk::xdr::Limits;
+        let env_meta = ScEnvMetaEntry::InterfaceVersion(999);
+        let env_bytes = env_meta.to_xdr(Limits::none()).unwrap();
+
+        let mut body = vec!["contractenvmetav0".len() as u8];
+        body.extend_from_slice("contractenvmetav0".as_bytes());
+        body.extend_from_slice(&env_bytes);
+        let env_section = (0u8, body);
+
+        let mut spec_body = vec!["contractspecv0".len() as u8];
+        spec_body.extend_from_slice("contractspecv0".as_bytes());
+        let spec_section = (0u8, spec_body);
+
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("transfer"),
+            env_section,
+            spec_section,
+            code_section(&[]),
+        ]);
+
+        let res = ContractSpecValidator::parse_and_validate(&wasm);
+        assert!(matches!(res.unwrap_err(), SpecValidationError::MismatchedEnvVersion { version: 999, .. }));
+    }
+
+    #[test]
+    fn spec_validation_inventory_supported_and_unsupported_types() {
+        use soroban_sdk::xdr::{
+            Limits, ScSpecFunctionV0, ScSpecFunctionInputV0, ScSpecTypeDef, StringM, VecM, WriteXdr,
+        };
+
+        let fn_entry = ScSpecEntry::Function(ScSpecFunctionV0 {
+            doc: StringM::default(),
+            name: "test_fn".try_into().unwrap(),
+            inputs: vec![
+                ScSpecFunctionInputV0 {
+                    doc: StringM::default(),
+                    name: "arg_u64".try_into().unwrap(),
+                    type_: ScSpecTypeDef::U64,
+                },
+                ScSpecFunctionInputV0 {
+                    doc: StringM::default(),
+                    name: "arg_unsupported".try_into().unwrap(),
+                    type_: ScSpecTypeDef::UdtUnionCaseV0(Box::new(soroban_sdk::xdr::ScSpecUdtUnionCaseV0::Tuple(
+                        soroban_sdk::xdr::ScSpecUdtUnionCaseTupleV0 {
+                            doc: StringM::default(),
+                            name: "Case".try_into().unwrap(),
+                            type_vec: VecM::default(),
+                        },
+                    ))),
+                },
+            ].try_into().unwrap(),
+            outputs: VecM::default(),
+        });
+
+        let spec_bytes = fn_entry.to_xdr(Limits::none()).unwrap();
+
+        let mut body = vec!["contractspecv0".len() as u8];
+        body.extend_from_slice("contractspecv0".as_bytes());
+        body.extend_from_slice(&spec_bytes);
+        let spec_section = (0u8, body);
+
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("test_fn"),
+            spec_section,
+            code_section(&[]),
+        ]);
+
+        let res = ContractSpecValidator::parse_and_validate(&wasm).unwrap();
+        assert_eq!(res.functions.len(), 1);
+        let func = &res.functions[0];
+        assert_eq!(func.name, "test_fn");
+        assert_eq!(func.arguments.len(), 2);
+        assert!(matches!(&func.arguments[0], ArgumentDescriptor::Supported { name, .. } if name == "arg_u64"));
+        assert!(matches!(&func.arguments[1], ArgumentDescriptor::Unsupported { name, function, .. } if name == "arg_unsupported" && function == "test_fn"));
+        assert_eq!(res.unsupported_types_count, 1);
     }
 }
