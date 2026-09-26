@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Cpu, Database, HardDrive, Zap, Activity, Info, Sliders, Grid, AlertTriangle } from 'lucide-react';
 import { cn } from '../lib/utils';
 
@@ -10,6 +10,23 @@ const LIMITS = {
   LEDGER_WRITE: 100 * 1024,  // 100KB
   TX_SIZE: 70 * 1024,        // 70KB
 };
+
+// Matrix canvas constants
+const CELL_SIZE = 32;
+const GAP = 8;
+const PADDING = 16;
+const GRID_COLS = 6;
+const GRID_ROWS = 6;
+const NATURAL_WIDTH = GRID_COLS * CELL_SIZE + (GRID_COLS - 1) * GAP + PADDING * 2;
+const NATURAL_HEIGHT = GRID_ROWS * CELL_SIZE + (GRID_ROWS - 1) * GAP + PADDING * 2;
+
+interface Cell {
+  id: string;
+  row: number;
+  col: number;
+  type: 'CPU' | 'RAM' | 'READ' | 'WRITE';
+  load: number;
+}
 
 interface ResourceHeatmapProps {
   resourceCost: {
@@ -27,10 +44,19 @@ interface ResourceHeatmapProps {
   };
 }
 
+function getCellColors(load: number): { fill: string; stroke: string } {
+  if (load > 80) return { fill: 'rgba(244,63,94,0.8)', stroke: 'rgba(244,63,94,1)' };
+  if (load > 50) return { fill: 'rgba(245,158,11,0.6)', stroke: 'rgba(245,158,11,1)' };
+  if (load > 20) return { fill: 'rgba(8,145,178,0.4)', stroke: 'rgba(6,182,212,0.4)' };
+  if (load > 5) return { fill: 'rgba(6,78,59,0.2)', stroke: 'rgba(16,185,129,0.2)' };
+  return { fill: 'rgba(30,41,59,1)', stroke: 'rgba(51,65,85,1)' };
+}
+
 export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
   const [activeTab, setActiveTab] = useState<'gauges' | 'matrix' | 'footprint'>('gauges');
   const [hoveredCell, setHoveredCell] = useState<string | null>(null);
   const [hoveredKey, setHoveredKey] = useState<string | null>(null);
+  const [tooltip, setTooltip] = useState<{ x: number; y: number; cell: Cell } | null>(null);
 
   const {
     cpu_instructions,
@@ -38,7 +64,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
     ledger_read_bytes,
     ledger_write_bytes,
     transaction_size_bytes,
-    cost_stroops = 120, // default if missing
+    cost_stroops = 120,
     state_snapshot
   } = resourceCost;
 
@@ -75,13 +101,12 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
   // Build footprint array
   const footprintItems = Object.keys(ledgerEntries).length > 0
     ? Object.entries(ledgerEntries).map(([key, value]) => {
-        const sizeBytes = Math.floor((key.length + value.length) * 0.75); // approx size
-        const isWrite = ledger_write_bytes > 0 && Math.random() > 0.6; // heuristically simulate write based on cost
+        const sizeBytes = Math.floor((key.length + value.length) * 0.75);
+        const isWrite = ledger_write_bytes > 0 && Math.random() > 0.6;
         const ttl = ttlEntries[key] || Math.floor(Math.random() * 4000) + 1000;
         return { key, sizeBytes, isWrite, ttl, name: key };
       })
     : [
-        // Simulated premium fallback list if snapshot empty
         { key: 'admin_thresholds', sizeBytes: 120, isWrite: false, ttl: 4800, name: 'Admin Thresholds (Key: ADM-1)' },
         { key: 'contract_instance', sizeBytes: 2048, isWrite: false, ttl: 6200, name: 'Contract Code Instance (Key: INST-1)' },
         { key: 'balance_owner_acc', sizeBytes: 256, isWrite: true, ttl: 2900, name: 'Balance Store (Key: ACC-BAL-1)' },
@@ -98,12 +123,11 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
     return `${(bytes / 1024).toFixed(1)} KB`;
   };
 
-  // Generate 6x6 Core Matrix points
-  const matrixCells = Array.from({ length: 36 }).map((_, index) => {
+  // Generate 6x6 Core Matrix points (memoized for canvas performance)
+  const matrixCells = useMemo(() => Array.from({ length: 36 }).map((_, index) => {
     const row = Math.floor(index / 6);
     const col = index % 6;
     
-    // Distribute weights across matrix cells for realistic processor thermal layout
     let metricType: 'CPU' | 'RAM' | 'READ' | 'WRITE';
     let weight = 0;
     
@@ -121,7 +145,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
       weight = ioWritePct * (0.4 + Math.cos(row) * 0.3);
     }
 
-    weight = Math.max(2, Math.min(weight, 100)); // Clamp weight between 2% and 100%
+    weight = Math.max(2, Math.min(weight, 100));
 
     return {
       id: `cell-${row}-${col}`,
@@ -130,7 +154,174 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
       type: metricType,
       load: weight,
     };
-  });
+  }), [cpuPct, ramPct, ioReadPct, ioWritePct]);
+
+  // Canvas refs and transform state for matrix zoom/pan
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const transformRef = useRef({ scale: 1, offsetX: 0, offsetY: 0 });
+  const isPanning = useRef(false);
+  const panStart = useRef({ x: 0, y: 0 });
+  const animationFrameRef = useRef<number | null>(null);
+  const hoveredCellRef = useRef<string | null>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+
+  const requestRedraw = useCallback(() => {
+    if (animationFrameRef.current !== null) {
+      cancelAnimationFrame(animationFrameRef.current);
+    }
+    animationFrameRef.current = requestAnimationFrame(() => {
+      drawMatrix();
+      animationFrameRef.current = null;
+    });
+  }, []);
+
+  const drawMatrix = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const { scale, offsetX, offsetY } = transformRef.current;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.save();
+    ctx.translate(offsetX, offsetY);
+    ctx.scale(scale, scale);
+
+    const totalCellSize = CELL_SIZE + GAP;
+
+    for (const cell of matrixCells) {
+      const x = PADDING + cell.col * totalCellSize;
+      const y = PADDING + cell.row * totalCellSize;
+      const colors = getCellColors(cell.load);
+
+      // Cell fill
+      ctx.fillStyle = colors.fill;
+      ctx.fillRect(x, y, CELL_SIZE, CELL_SIZE);
+
+      // Cell border
+      ctx.strokeStyle = colors.stroke;
+      ctx.lineWidth = 1 / scale;
+      ctx.strokeRect(x, y, CELL_SIZE, CELL_SIZE);
+
+      // Type letter
+      ctx.fillStyle = 'rgba(148,163,184,0.2)';
+      ctx.font = `${Math.max(8, 12 / scale)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(cell.type[0], x + CELL_SIZE / 2, y + CELL_SIZE / 2);
+
+      // Hover highlight
+      if (hoveredCellRef.current === cell.id) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+        ctx.lineWidth = 2 / scale;
+        ctx.strokeRect(x - 1, y - 1, CELL_SIZE + 2, CELL_SIZE + 2);
+      }
+    }
+
+    ctx.restore();
+  }, [matrixCells]);
+
+  // Initial draw and resize handling
+  useEffect(() => {
+    drawMatrix();
+  }, [drawMatrix]);
+
+  useEffect(() => {
+    const handleResize = () => requestRedraw();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [requestRedraw]);
+
+  const handleWheel = useCallback((e: React.WheelEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+    const { scale, offsetX, offsetY } = transformRef.current;
+    const newScale = Math.min(Math.max(scale * zoomFactor, 0.1), 10);
+
+    const newOffsetX = mouseX - (mouseX - offsetX) * (newScale / scale);
+    const newOffsetY = mouseY - (mouseY - offsetY) * (newScale / scale);
+
+    transformRef.current = { scale: newScale, offsetX: newOffsetX, offsetY: newOffsetY };
+    requestRedraw();
+  }, [requestRedraw]);
+
+  const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    isPanning.current = true;
+    panStart.current = { x: e.clientX - transformRef.current.offsetX, y: e.clientY - transformRef.current.offsetY };
+    if (canvasRef.current) {
+      canvasRef.current.style.cursor = 'grabbing';
+    }
+  }, []);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (isPanning.current) {
+      transformRef.current.offsetX = e.clientX - panStart.current.x;
+      transformRef.current.offsetY = e.clientY - panStart.current.y;
+      requestRedraw();
+      return;
+    }
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    const { scale, offsetX, offsetY } = transformRef.current;
+    const canvasX = (mouseX - offsetX) / scale;
+    const canvasY = (mouseY - offsetY) / scale;
+
+    const totalCellSize = CELL_SIZE + GAP;
+    let found: Cell | null = null;
+    for (const cell of matrixCells) {
+      const x = PADDING + cell.col * totalCellSize;
+      const y = PADDING + cell.row * totalCellSize;
+      if (canvasX >= x && canvasX < x + CELL_SIZE && canvasY >= y && canvasY < y + CELL_SIZE) {
+        found = cell;
+        break;
+      }
+    }
+
+    const newHoveredId = found ? found.id : null;
+    if (hoveredCellRef.current !== newHoveredId) {
+      hoveredCellRef.current = newHoveredId;
+      setHoveredCell(newHoveredId);
+      if (found) {
+        setTooltip({ x: e.clientX, y: e.clientY, cell: found });
+      } else {
+        setTooltip(null);
+      }
+      requestRedraw();
+    } else if (found && tooltip) {
+      setTooltip({ ...tooltip, x: e.clientX, y: e.clientY });
+    }
+  }, [matrixCells, requestRedraw, tooltip]);
+
+  const handleMouseUp = useCallback(() => {
+    isPanning.current = false;
+    if (canvasRef.current) {
+      canvasRef.current.style.cursor = 'crosshair';
+    }
+  }, []);
+
+  const handleMouseLeave = useCallback(() => {
+    isPanning.current = false;
+    hoveredCellRef.current = null;
+    setHoveredCell(null);
+    setTooltip(null);
+    if (canvasRef.current) {
+      canvasRef.current.style.cursor = 'crosshair';
+    }
+    requestRedraw();
+  }, [requestRedraw]);
 
   return (
     <div className="w-full bg-slate-900/90 backdrop-blur-2xl border border-slate-800 rounded-xl shadow-2xl p-6 relative overflow-hidden font-sans select-none">
@@ -209,9 +400,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
               </div>
               <div className="relative h-32 w-32 flex items-center justify-center mt-2">
                 <svg className="absolute inset-0 h-full w-full -rotate-90">
-                  {/* Background loop */}
                   <circle cx="64" cy="64" r="50" fill="transparent" stroke="#1e293b" strokeWidth="6" />
-                  {/* Active gauge progress */}
                   <circle 
                     cx="64" 
                     cy="64" 
@@ -225,7 +414,6 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                     className="transition-all duration-1000 ease-out drop-shadow-[0_0_6px_rgba(6,182,212,0.4)]"
                   />
                 </svg>
-                {/* Center data panel */}
                 <div className="text-center">
                   <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">CPU LOAD</span>
                   <div className="text-xl font-extrabold text-cyan-400 font-mono mt-0.5 tracking-tight">
@@ -284,7 +472,6 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
             </div>
 
             {/* SVG Ring 3: Ledger I/O */}
-            {/* Combines Read and Write to show overall storage pressure */}
             <div className="flex flex-col items-center bg-slate-950/40 p-5 rounded-xl border border-slate-800/60 shadow-sm relative group hover:border-slate-800 transition-all duration-300">
               <div className="absolute top-2 right-2 flex gap-1">
                 <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">BUDGET</span>
@@ -292,7 +479,6 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
               <div className="relative h-32 w-32 flex items-center justify-center mt-2">
                 <svg className="absolute inset-0 h-full w-full -rotate-90">
                   <circle cx="64" cy="64" r="50" fill="transparent" stroke="#1e293b" strokeWidth="6" />
-                  {/* Read Layer (Cyan) */}
                   <circle 
                     cx="64" 
                     cy="64" 
@@ -330,41 +516,36 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
         {activeTab === 'matrix' && (
           <div className="flex flex-col lg:flex-row gap-6 items-center">
             
-            {/* The 6x6 Thermal Grid Map */}
-            <div className="grid grid-cols-6 gap-2 bg-slate-950/80 p-4 rounded-xl border border-slate-800/70 shadow-inner w-fit">
-              {matrixCells.map((cell) => {
-                // Map load levels to sleek tailwind colors
-                let colorClass = "bg-slate-900 border-slate-800 hover:border-slate-700";
-                if (cell.load > 80) {
-                  colorClass = "bg-rose-500/80 border-rose-400 shadow-[0_0_10px_rgba(244,63,94,0.5)] animate-pulse";
-                } else if (cell.load > 50) {
-                  colorClass = "bg-amber-500/60 border-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.3)]";
-                } else if (cell.load > 20) {
-                  colorClass = "bg-cyan-600/40 border-cyan-500/40";
-                } else if (cell.load > 5) {
-                  colorClass = "bg-emerald-800/20 border-emerald-500/20";
-                }
-
-                return (
-                  <div
-                    key={cell.id}
-                    onMouseEnter={() => setHoveredCell(cell.id)}
-                    onMouseLeave={() => setHoveredCell(null)}
-                    className={cn(
-                      "w-8 h-8 rounded border transition-all duration-300 cursor-crosshair relative flex items-center justify-center text-[8px] font-bold font-mono",
-                      colorClass,
-                      hoveredCell === cell.id ? "scale-110 z-20 border-white ring-2 ring-white/10" : ""
-                    )}
-                  >
-                    <span className={cn(
-                      "opacity-20 transition-opacity", 
-                      hoveredCell === cell.id ? "opacity-100 text-white" : "text-slate-400"
-                    )}>
-                      {cell.type[0]}
-                    </span>
+            {/* Canvas-based 6x6 Thermal Grid Map */}
+            <div className="relative w-fit">
+              <canvas
+                ref={canvasRef}
+                width={NATURAL_WIDTH}
+                height={NATURAL_HEIGHT}
+                className="rounded-xl border border-slate-800/70 shadow-inner cursor-crosshair"
+                style={{ width: NATURAL_WIDTH, height: NATURAL_HEIGHT }}
+                onWheel={handleWheel}
+                onMouseDown={handleMouseDown}
+                onMouseMove={handleMouseMove}
+                onMouseUp={handleMouseUp}
+                onMouseLeave={handleMouseLeave}
+              />
+              {tooltip && (
+                <div
+                  ref={tooltipRef}
+                  className="fixed z-50 pointer-events-none bg-slate-950/95 border border-slate-800 rounded-lg px-3 py-2 text-xs shadow-xl backdrop-blur-xl"
+                  style={{ left: tooltip.x + 12, top: tooltip.y + 12 }}
+                >
+                  <div className="font-bold text-slate-100 mb-1">{tooltip.cell.type} Core</div>
+                  <div className="text-slate-400">Load: {tooltip.cell.load.toFixed(1)}%</div>
+                  <div className="text-slate-500 text-[10px] mt-1">
+                    {tooltip.cell.type === 'CPU' && `${((tooltip.cell.load / 100) * LIMITS.CPU).toLocaleString(undefined, { maximumFractionDigits: 0 })} instr`}
+                    {tooltip.cell.type === 'RAM' && formatBytes((tooltip.cell.load / 100) * LIMITS.RAM)}
+                    {tooltip.cell.type === 'READ' && formatBytes((tooltip.cell.load / 100) * LIMITS.LEDGER_READ)}
+                    {tooltip.cell.type === 'WRITE' && formatBytes((tooltip.cell.load / 100) * LIMITS.LEDGER_WRITE)}
                   </div>
-                );
-              })}
+                </div>
+              )}
             </div>
 
             {/* Matrix Operational Details Display Panel */}
