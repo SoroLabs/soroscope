@@ -189,6 +189,50 @@ impl InsightRule for FootprintBloatRule {
     }
 }
 
+/// Flags when total event XDR volume exceeds a configurable fraction of transaction size.
+pub struct EventVolumeRule {
+    pub max_event_tx_ratio: f64,
+}
+
+impl Default for EventVolumeRule {
+    fn default() -> Self {
+        Self { max_event_tx_ratio: 0.5 }
+    }
+}
+
+impl InsightRule for EventVolumeRule {
+    fn name(&self) -> &str {
+        "event_volume"
+    }
+
+    fn evaluate(&self, r: &SorobanResources) -> Vec<Insight> {
+        let mut out = Vec::new();
+        if r.transaction_size_bytes == 0 {
+            return out;
+        }
+
+        if let Some(event_bytes) = r.event_xdr_bytes {
+            let ratio = event_bytes as f64 / r.transaction_size_bytes as f64;
+            if ratio > self.max_event_tx_ratio {
+                out.push(Insight {
+                    severity: Severity::Warning,
+                    rule: self.name().to_string(),
+                    message: format!(
+                        "Event XDR volume ({} bytes) is {:.1}% of transaction size ({}) — high indexer overhead",
+                        event_bytes,
+                        ratio * 100.0,
+                        r.transaction_size_bytes
+                    ),
+                    suggested_fix: "Consolidate event emissions or remove redundant diagnostic topic logs."
+                        .to_string(),
+                });
+            }
+        }
+
+        out
+    }
+}
+
 /// Flags high RAM usage which may push against per-transaction memory limits.
 pub struct MemoryPressureRule;
 

@@ -40,6 +40,8 @@ pub struct CallNode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CallGraph {
     pub root: CallNode,
+    #[serde(default)]
+    pub diagnostics_truncated: bool,
 }
 
 impl CallGraph {
@@ -61,6 +63,18 @@ impl CallGraph {
     }
 }
 
+/// Event XDR volume and diagnostic truncation summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventVolumeReport {
+    pub contract_event_count: usize,
+    pub diagnostic_event_count: usize,
+    pub total_event_xdr_bytes: usize,
+    pub largest_event_xdr_bytes: usize,
+    pub diagnostics_truncated: bool,
+}
+
+pub const DEFAULT_DIAGNOSTIC_CAP: usize = 100;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Parser
 // ─────────────────────────────────────────────────────────────────────────────
@@ -68,11 +82,13 @@ impl CallGraph {
 /// Parse a slice of base64-encoded XDR `DiagnosticEvent` strings and produce
 /// a [`CallGraph`] if at least one complete `fn_call`/`fn_return` pair is
 /// found.
-///
-/// Events that cannot be decoded or do not match the expected schema are
-/// silently skipped so that partial or future-format event streams degrade
-/// gracefully.
 pub fn parse_call_trace(events: &[String]) -> Option<CallGraph> {
+    parse_call_trace_with_cap(events, DEFAULT_DIAGNOSTIC_CAP)
+}
+
+/// Parse a slice of base64-encoded XDR `DiagnosticEvent` strings with explicit diagnostic cap.
+pub fn parse_call_trace_with_cap(events: &[String], diagnostic_cap: usize) -> Option<CallGraph> {
+    let diagnostics_truncated = diagnostic_cap > 0 && events.len() >= diagnostic_cap;
     let mut stack: Vec<CallNode> = Vec::new();
     let mut root: Option<CallNode> = None;
 
@@ -136,14 +152,59 @@ pub fn parse_call_trace(events: &[String]) -> Option<CallGraph> {
     }
 
     // Flush any dangling stack entries as top-level roots (malformed traces).
-    // If there is exactly one remaining node and no root yet, use it.
     if root.is_none() {
         if let Some(node) = stack.into_iter().next() {
             root = Some(node);
         }
     }
 
-    root.map(|r| CallGraph { root: r })
+    root.map(|r| CallGraph {
+        root: r,
+        diagnostics_truncated,
+    })
+}
+
+pub fn analyze_event_volume(
+    contract_events_b64: &[String],
+    diagnostic_events_b64: &[String],
+    diagnostic_cap: usize,
+) -> EventVolumeReport {
+    let mut contract_count = 0;
+    let mut total_bytes = 0;
+    let mut largest_bytes = 0;
+
+    for b64 in contract_events_b64 {
+        if let Ok(bytes) = BASE64.decode(b64) {
+            contract_count += 1;
+            let len = bytes.len();
+            total_bytes += len;
+            if len > largest_bytes {
+                largest_bytes = len;
+            }
+        }
+    }
+
+    let mut diag_count = 0;
+    for b64 in diagnostic_events_b64 {
+        if let Ok(bytes) = BASE64.decode(b64) {
+            diag_count += 1;
+            let len = bytes.len();
+            total_bytes += len;
+            if len > largest_bytes {
+                largest_bytes = len;
+            }
+        }
+    }
+
+    let diagnostics_truncated = diagnostic_cap > 0 && diag_count >= diagnostic_cap;
+
+    EventVolumeReport {
+        contract_event_count: contract_count,
+        diagnostic_event_count: diag_count,
+        total_event_xdr_bytes: total_bytes,
+        largest_event_xdr_bytes: largest_bytes,
+        diagnostics_truncated,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -284,5 +345,44 @@ mod tests {
         let events = vec![make_diag_event("fn_call", "dangling")];
         let graph = parse_call_trace(&events).expect("should produce a graph for dangling call");
         assert_eq!(graph.root.function, "dangling");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Event XDR Volume & Truncation tests (Issue #1015)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_event_volume_analysis_under_cap() {
+        let e1 = BASE64.encode(b"contract_event_payload_1");
+        let e2 = BASE64.encode(b"diagnostic_event_payload_2");
+
+        let report = analyze_event_volume(&[e1], &[e2], 10);
+        assert_eq!(report.contract_event_count, 1);
+        assert_eq!(report.diagnostic_event_count, 1);
+        assert_eq!(report.total_event_xdr_bytes, b"contract_event_payload_1".len() + b"diagnostic_event_payload_2".len());
+        assert_eq!(report.largest_event_xdr_bytes, b"diagnostic_event_payload_2".len());
+        assert!(!report.diagnostics_truncated);
+    }
+
+    #[test]
+    fn test_event_volume_analysis_at_cap_sets_truncated() {
+        let e = BASE64.encode(b"diag");
+        let diag_events = vec![e.clone(); 5];
+
+        let report = analyze_event_volume(&[], &diag_events, 5);
+        assert_eq!(report.contract_event_count, 0);
+        assert_eq!(report.diagnostic_event_count, 5);
+        assert!(report.diagnostics_truncated);
+    }
+
+    #[test]
+    fn test_parse_call_trace_at_cap_sets_diagnostics_truncated() {
+        let events = vec![
+            make_diag_event("fn_call", "transfer"),
+            make_diag_event("fn_return", "transfer"),
+        ];
+
+        let graph = parse_call_trace_with_cap(&events, 2).expect("should produce graph");
+        assert!(graph.diagnostics_truncated);
     }
 }
