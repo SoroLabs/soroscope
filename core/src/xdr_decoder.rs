@@ -124,6 +124,12 @@ impl XdrTransactionResultDecoder {
     #[allow(dead_code)]
     fn decode_xdr_base64<T: ReadXdr>(xdr: &str, kind: &'static str) -> Result<T, XdrDecodeError> {
         let trimmed = xdr.trim();
+        if trimmed.is_empty() {
+            return Err(XdrDecodeError::InvalidBase64 {
+                offset: None,
+                message: "empty base64 string".to_string(),
+            });
+        }
         let bytes = match BASE64.decode(trimmed.as_bytes()) {
             Ok(b) => b,
             Err(e) => {
@@ -144,7 +150,7 @@ impl XdrTransactionResultDecoder {
             Ok(val) => Ok(val),
             Err(source) => Err(XdrDecodeError::InvalidXdr {
                 kind,
-                offset: None,
+                offset: Some(0),
                 message: format!("{source}"),
                 source: Some(source),
             }),
@@ -153,15 +159,7 @@ impl XdrTransactionResultDecoder {
 
     /// Decodes the `resultMetaXdr` returned by Soroban RPC `getTransaction`.
     pub fn decode_result_meta(xdr: &str) -> Result<DecodedTransactionResult, XdrDecodeError> {
-        let result =
-            TransactionResultMeta::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
-                XdrDecodeError::InvalidXdr {
-                    kind: "transaction result metadata",
-                    offset: None,
-                    message: format!("{source}"),
-                    source: Some(source),
-                }
-            })?;
+        let result: TransactionResultMeta = Self::decode_xdr_base64(xdr, "transaction result metadata")?;
         let meta = soroban_meta(&result.tx_apply_processing)
             .ok_or(XdrDecodeError::MissingSorobanMetadata)?;
         Ok(Self::decode_soroban_meta(meta))
@@ -169,29 +167,13 @@ impl XdrTransactionResultDecoder {
 
     /// Decodes standalone `SorobanTransactionMeta` XDR.
     pub fn decode_soroban_meta_xdr(xdr: &str) -> Result<DecodedTransactionResult, XdrDecodeError> {
-        let meta =
-            SorobanTransactionMeta::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
-                XdrDecodeError::InvalidXdr {
-                    kind: "Soroban transaction metadata",
-                    offset: None,
-                    message: format!("{source}"),
-                    source: Some(source),
-                }
-            })?;
+        let meta: SorobanTransactionMeta = Self::decode_xdr_base64(xdr, "Soroban transaction metadata")?;
         Ok(Self::decode_soroban_meta(&meta))
     }
 
     /// Decodes host-function invocations from an RPC `envelopeXdr` value.
     pub fn decode_envelope(xdr: &str) -> Result<Vec<DecodedInvocation>, XdrDecodeError> {
-        let envelope =
-            TransactionEnvelope::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
-                XdrDecodeError::InvalidXdr {
-                    kind: "transaction envelope",
-                    offset: None,
-                    message: format!("{source}"),
-                    source: Some(source),
-                }
-            })?;
+        let envelope: TransactionEnvelope = Self::decode_xdr_base64(xdr, "transaction envelope")?;
         Ok(decode_envelope(&envelope))
     }
 
@@ -316,6 +298,125 @@ fn format_sc_val(value: &soroban_sdk::xdr::ScVal) -> String {
     }
 }
 
+// ── Soroban Bytecode Disassembler Utility (Issue #8) ──────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisassemblyInstruction {
+    pub offset: usize,
+    pub op: String,
+    pub args: String,
+    pub estimated_gas_cost: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisassembledModule {
+    pub wat: String,
+    pub instructions: Vec<DisassemblyInstruction>,
+    pub function_count: usize,
+    pub import_count: usize,
+    pub export_count: usize,
+    pub total_gas_metric: u64,
+}
+
+pub struct SorobanDisassembler;
+
+impl SorobanDisassembler {
+    /// Disassemble raw Soroban WASM bytecode into structured disassembly & WAT.
+    pub fn disassemble_bytes(bytes: &[u8]) -> Result<DisassembledModule, XdrDecodeError> {
+        let wat = wasmprinter::print_bytes(bytes).map_err(|e| XdrDecodeError::InvalidXdr {
+            kind: "WASM bytecode disassembly",
+            offset: None,
+            message: format!("wasmprinter error: {e}"),
+            source: None,
+        })?;
+
+        let mut instructions = Vec::new();
+        let mut function_count = 0;
+        let mut import_count = 0;
+        let mut export_count = 0;
+        let mut total_gas_metric = 0u64;
+
+        let parser = wasmparser::Parser::new(0);
+        for payload in parser.parse_all(bytes) {
+            let payload = match payload {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(XdrDecodeError::InvalidXdr {
+                        kind: "WASM binary structure",
+                        offset: Some(e.offset()),
+                        message: format!("wasmparser error: {e}"),
+                        source: None,
+                    });
+                }
+            };
+
+            match payload {
+                wasmparser::Payload::FunctionSection(reader) => {
+                    function_count = reader.count() as usize;
+                }
+                wasmparser::Payload::ImportSection(reader) => {
+                    import_count = reader.count() as usize;
+                }
+                wasmparser::Payload::ExportSection(reader) => {
+                    export_count = reader.count() as usize;
+                }
+                wasmparser::Payload::CodeSectionEntry(body) => {
+                    if let Ok(mut ops_reader) = body.get_operators_reader() {
+                        while !ops_reader.eof() {
+                            let offset = ops_reader.original_position();
+                            if let Ok(op) = ops_reader.read() {
+                                let op_str = format!("{op:?}");
+                                let (op_name, args) = match op_str.split_once(' ') {
+                                    Some((n, a)) => (n.to_string(), a.to_string()),
+                                    None => (op_str.clone(), String::new()),
+                                };
+                                let gas_cost = estimate_op_gas(&op_name);
+                                total_gas_metric += gas_cost;
+                                instructions.push(DisassemblyInstruction {
+                                    offset,
+                                    op: op_name,
+                                    args,
+                                    estimated_gas_cost: gas_cost,
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(DisassembledModule {
+            wat,
+            instructions,
+            function_count,
+            import_count,
+            export_count,
+            total_gas_metric,
+        })
+    }
+
+    /// Disassemble base64-encoded Soroban WASM bytecode.
+    pub fn disassemble_base64(b64: &str) -> Result<DisassembledModule, XdrDecodeError> {
+        let trimmed = b64.trim();
+        let bytes = BASE64.decode(trimmed.as_bytes()).map_err(|e| XdrDecodeError::InvalidBase64 {
+            offset: None,
+            message: format!("base64 decode error: {e}"),
+        })?;
+        Self::disassemble_bytes(&bytes)
+    }
+}
+
+fn estimate_op_gas(op_name: &str) -> u64 {
+    match op_name {
+        s if s.contains("Call") => 100,
+        s if s.contains("Load") || s.contains("Store") => 30,
+        s if s.contains("Div") || s.contains("Rem") => 20,
+        s if s.contains("Mul") => 10,
+        _ => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +480,33 @@ mod tests {
     fn handles_empty_or_whitespace_xdr_gracefully() {
         let error = XdrTransactionResultDecoder::decode_soroban_meta_xdr("   ").unwrap_err();
         assert!(matches!(error, XdrDecodeError::InvalidBase64 { .. }));
+    }
+
+    #[test]
+    fn test_disassemble_wasm_bytes() {
+        use wasm_encoder::{CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection, ValType};
+        let mut module = Module::new();
+        let mut types = TypeSection::new();
+        types.ty().function([], [ValType::I32]);
+        module.section(&types);
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        module.section(&functions);
+        let mut exports = ExportSection::new();
+        exports.export("add", ExportKind::Func, 0);
+        module.section(&exports);
+        let mut codes = CodeSection::new();
+        let mut f = Function::new(vec![]);
+        f.instruction(&wasm_encoder::Instruction::I32Const(42));
+        f.instruction(&wasm_encoder::Instruction::End);
+        codes.function(&f);
+        module.section(&codes);
+        let bytes = module.finish();
+
+        let disasm = SorobanDisassembler::disassemble_bytes(&bytes).unwrap();
+        assert!(disasm.wat.contains("(module"));
+        assert_eq!(disasm.function_count, 1);
+        assert_eq!(disasm.export_count, 1);
+        assert!(!disasm.instructions.is_empty());
     }
 }

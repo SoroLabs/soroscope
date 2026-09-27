@@ -80,18 +80,18 @@ impl FailureKind {
 /// Soroban surfaces a contract error as a `u32` in the diagnostic; on its own
 /// that is not actionable. `contracts/error_codes` is the canonical table, and
 /// this mirrors it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ContractErrorCode {
     pub code: u32,
     /// The `ContractError` variant name, or `None` for a code this table does
     /// not define (a different contract's error space, or a future variant).
-    pub name: Option<&'static str>,
+    pub name: Option<String>,
 }
 
 impl ContractErrorCode {
     /// Resolve a `u32` discriminant against `contracts/error_codes`.
     pub fn from_code(code: u32) -> Self {
-        ContractErrorCode { code, name: contract_error_name(code) }
+        ContractErrorCode { code, name: contract_error_name(code).map(|s| s.to_string()) }
     }
 }
 
@@ -171,7 +171,7 @@ impl ExecutionFailure {
     }
 
     /// Attach contract id, function and cost type in one call.
-    pub fn at(mut self, contract_id: Option<String>, function: Option<String>) -> Self {
+    pub fn at(self, contract_id: Option<String>, function: Option<String>) -> Self {
         self.with_context(TrapContext { contract_id, function, cost_type: None })
     }
 
@@ -294,9 +294,9 @@ mod tests {
         );
 
         assert_eq!(failure.kind, FailureKind::ContractTrap);
-        let code = failure.contract_error.expect("a discriminant was present");
+        let code = failure.contract_error.as_ref().expect("a discriminant was present");
         assert_eq!(code.code, 3);
-        assert_eq!(code.name, Some("Unauthorized"));
+        assert_eq!(code.name.as_deref(), Some("Unauthorized"));
         assert!(failure.describe().contains("contracterror #3 (Unauthorized)"), "got {}", failure.describe());
     }
 
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn an_unknown_error_code_keeps_the_integer_and_has_no_name() {
         let failure = ExecutionFailure::from_diagnostic("HostError: Error(Contract, #9999)");
-        let code = failure.contract_error.expect("code present");
+        let code = failure.contract_error.as_ref().expect("code present");
         assert_eq!(code.code, 9999);
         assert_eq!(code.name, None);
         assert!(failure.describe().contains("contracterror #9999"));

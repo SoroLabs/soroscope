@@ -36,16 +36,16 @@ impl HostImport {
 
 /// One defined (non-imported) function and its decoded body.
 #[derive(Debug, Clone)]
-pub struct FunctionInfo {
+pub struct FunctionInfo<'a> {
     /// Absolute function index: `import_count + ordinal`.
     pub index: u32,
     /// Export name when the function is exported, else `None`.
     pub export_name: Option<String>,
     /// Decoded instruction stream.
-    pub operators: Vec<Operator>,
+    pub operators: Vec<Operator<'a>>,
 }
 
-impl FunctionInfo {
+impl<'a> FunctionInfo<'a> {
     /// Ordinal position of `op_index` within the body, counting only
     /// instructions (not the bytes they occupy).
     pub fn instruction_offset(&self, op_index: usize) -> usize {
@@ -66,25 +66,25 @@ impl FunctionInfo {
     }
 
     /// Offset of the first operator satisfying `predicate`, if any.
-    pub fn find(&self, predicate: impl Fn(&Operator) -> bool) -> Option<usize> {
+    pub fn find(&self, predicate: impl Fn(&Operator<'a>) -> bool) -> Option<usize> {
         self.operators.iter().position(predicate)
     }
 }
 
 /// A decoded module, reduced to what static analysis needs.
 #[derive(Debug, Clone, Default)]
-pub struct ParsedModule {
+pub struct ParsedModule<'a> {
     /// Host function imports, ordered by ascending function index.
     pub host_imports: Vec<HostImport>,
     /// Function index -> position in `host_imports`.
     pub import_by_index: HashMap<u32, usize>,
     /// Defined functions, in index order.
-    pub functions: Vec<FunctionInfo>,
+    pub functions: Vec<FunctionInfo<'a>>,
     /// Function index -> export name, for every exported function.
     pub exports: HashMap<u32, String>,
 }
 
-impl ParsedModule {
+impl<'a> ParsedModule<'a> {
     /// The host import a `call` refers to, if that index is an import.
     pub fn host_import(&self, function_index: u32) -> Option<&HostImport> {
         self.import_by_index.get(&function_index).and_then(|i| self.host_imports.get(*i))
@@ -124,7 +124,7 @@ impl std::error::Error for ParseFailure {}
 /// parses but whose code section is truncated yields fewer functions rather than
 /// an error, so a partially damaged body cannot mask findings from the
 /// functions that did decode.
-pub fn parse_module(wasm_bytes: &[u8]) -> Result<ParsedModule, ParseFailure> {
+pub fn parse_module<'a>(wasm_bytes: &'a [u8]) -> Result<ParsedModule<'a>, ParseFailure> {
     let mut module = ParsedModule::default();
     let mut next_import_func_index: u32 = 0;
     let mut defined_ordinal: u32 = 0;
@@ -257,7 +257,8 @@ mod tests {
 
     #[test]
     fn parses_a_minimal_module() {
-        let module = parse_module(&minimal_module()).expect("valid module");
+        let bytes = minimal_module();
+        let module = parse_module(&bytes).expect("valid module");
         assert_eq!(module.defined_function_count(), 1);
         assert_eq!(module.host_imports.len(), 0);
         assert_eq!(module.export_name(0), Some("run"));
