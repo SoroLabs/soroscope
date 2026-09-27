@@ -233,6 +233,35 @@ impl InsightRule for MemoryPressureRule {
     }
 }
 
+/// Emits an insight when AMM tick crossing projection is inside headroom or next doubling exceeds read-entry limits.
+pub struct ConcentratedAmmTickProfileRule;
+
+impl InsightRule for ConcentratedAmmTickProfileRule {
+    fn name(&self) -> &str {
+        "amm_tick_crossing_profile"
+    }
+
+    fn evaluate(&self, r: &SorobanResources) -> Vec<Insight> {
+        let mut out = Vec::new();
+
+        if let Some(report) = &r.amm_tick_profile_report {
+            if let Some(warning) = &report.warning_insight {
+                out.push(Insight {
+                    severity: Severity::Warning,
+                    rule: self.name().to_string(),
+                    message: warning.clone(),
+                    suggested_fix: format!(
+                        "Limit swap size to cross at most {} ticks or split transactions across multiple blocks",
+                        report.max_supported_ticks
+                    ),
+                });
+            }
+        }
+
+        out
+    }
+}
+
 // ── Engine ────────────────────────────────────────────────────────────────────
 
 /// The insights engine holds a set of rules and evaluates them against resource
@@ -256,6 +285,7 @@ impl InsightsEngine {
                 Box::new(InstructionDensityRule),
                 Box::new(FootprintBloatRule),
                 Box::new(MemoryPressureRule),
+                Box::new(ConcentratedAmmTickProfileRule),
             ],
         }
     }
@@ -598,5 +628,32 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let deserialized: InsightsReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, deserialized);
+    }
+
+    // ── Concentrated AMM tick profile rule ───────────────────────────────
+
+    #[test]
+    fn test_concentrated_amm_tick_profile_rule() {
+        use crate::simulation::ConcentratedAmmTickProfileReport;
+
+        let rule = ConcentratedAmmTickProfileRule;
+        let r = SorobanResources {
+            amm_tick_profile_report: Some(ConcentratedAmmTickProfileReport {
+                status: "success".to_string(),
+                measurements: vec![],
+                max_supported_ticks: 4,
+                warning_insight: Some(
+                    "Next doubling to 8 ticks would exceed read-entry limit (40); max supported ticks is 4"
+                        .to_string(),
+                ),
+            }),
+            ..Default::default()
+        };
+
+        let insights = rule.evaluate(&r);
+        assert_eq!(insights.len(), 1);
+        assert_eq!(insights[0].severity, Severity::Warning);
+        assert_eq!(insights[0].rule, "amm_tick_crossing_profile");
+        assert!(insights[0].message.contains("max supported ticks is 4"));
     }
 }

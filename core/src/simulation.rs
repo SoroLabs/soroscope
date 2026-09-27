@@ -122,6 +122,138 @@ pub struct SorobanResources {
     pub ledger_write_bytes: u64,
     /// Transaction size in bytes
     pub transaction_size_bytes: u64,
+    /// Concentrated AMM tick crossing profile report
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amm_tick_profile_report: Option<ConcentratedAmmTickProfileReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct NetworkLimits {
+    pub max_cpu_instructions: u64,
+    pub max_read_entries: u32,
+    pub max_write_entries: u32,
+}
+
+impl Default for NetworkLimits {
+    fn default() -> Self {
+        Self {
+            max_cpu_instructions: 100_000_000,
+            max_read_entries: 40,
+            max_write_entries: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct HeadroomMetrics {
+    pub cpu_headroom_pct: u32,
+    pub read_entries_headroom_pct: u32,
+    pub write_entries_headroom_pct: u32,
+    pub limiting_dimension: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SwapTickMeasurement {
+    pub ticks_crossed: usize,
+    pub cpu_instructions: u64,
+    pub read_entries: u32,
+    pub write_entries: u32,
+    pub headroom: HeadroomMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ConcentratedAmmTickProfileReport {
+    pub status: String,
+    pub measurements: Vec<SwapTickMeasurement>,
+    pub max_supported_ticks: usize,
+    pub warning_insight: Option<String>,
+}
+
+pub fn profile_concentrated_amm_ticks(
+    measurements_raw: &[(usize, u64, u32, u32)],
+    limits: Option<NetworkLimits>,
+) -> Result<ConcentratedAmmTickProfileReport, String> {
+    let limits = limits.unwrap_or_default();
+
+    if measurements_raw.is_empty() {
+        return Err("No tick measurements provided".to_string());
+    }
+
+    for i in 1..measurements_raw.len() {
+        if measurements_raw[i].2 < measurements_raw[i - 1].2 {
+            return Err(format!(
+                "Non-monotonic read entries detected: step {} had {} reads < step {} with {} reads",
+                i, measurements_raw[i].2, i - 1, measurements_raw[i - 1].2
+            ));
+        }
+    }
+
+    let mut measurements = Vec::new();
+    let mut max_supported_ticks = 0;
+    let mut limiting_tick_count = None;
+
+    for &(ticks, cpu, reads, writes) in measurements_raw {
+        let cpu_used_pct = ((cpu as f64 / limits.max_cpu_instructions as f64) * 100.0) as u32;
+        let read_used_pct = ((reads as f64 / limits.max_read_entries as f64) * 100.0) as u32;
+        let write_used_pct = ((writes as f64 / limits.max_write_entries as f64) * 100.0) as u32;
+
+        let cpu_headroom_pct = 100saturating_sub(cpu_used_pct);
+        let read_headroom_pct = 100saturating_sub(read_used_pct);
+        let write_headroom_pct = 100saturating_sub(write_used_pct);
+
+        let mut limiting_dim = None;
+        if read_used_pct >= 90 {
+            limiting_dim = Some("read_entries".to_string());
+        } else if cpu_used_pct >= 90 {
+            limiting_dim = Some("cpu_instructions".to_string());
+        } else if write_used_pct >= 90 {
+            limiting_dim = Some("write_entries".to_string());
+        }
+
+        if reads <= limits.max_read_entries
+            && cpu <= limits.max_cpu_instructions
+            && writes <= limits.max_write_entries
+        {
+            max_supported_ticks = ticks;
+        } else if limiting_tick_count.is_none() {
+            limiting_tick_count = Some(ticks);
+        }
+
+        measurements.push(SwapTickMeasurement {
+            ticks_crossed: ticks,
+            cpu_instructions: cpu,
+            read_entries: reads,
+            write_entries: writes,
+            headroom: HeadroomMetrics {
+                cpu_headroom_pct,
+                read_entries_headroom_pct: read_headroom_pct,
+                write_entries_headroom_pct: write_headroom_pct,
+                limiting_dimension: limiting_dim,
+            },
+        });
+    }
+
+    let warning_insight = if let Some(&last) = measurements_raw.last() {
+        let next_doubling_ticks = last.0 * 2;
+        let estimated_next_reads = last.2 * 2;
+        if estimated_next_reads > limits.max_read_entries {
+            Some(format!(
+                "Next doubling to {} ticks would exceed read-entry limit ({}); max supported ticks is {}",
+                next_doubling_ticks, limits.max_read_entries, max_supported_ticks
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(ConcentratedAmmTickProfileReport {
+        status: "success".to_string(),
+        measurements,
+        max_supported_ticks,
+        warning_insight,
+    })
 }
 
 /// Per-function instruction profiling result
@@ -4665,6 +4797,49 @@ mod tests {
         let parsed_legacy = extract_soroban_budget_from_logs(legacy_logs);
         assert_eq!(parsed_legacy.cpu_instructions, 500000);
         assert_eq!(parsed_legacy.memory_bytes, 250000);
+    #[test]
+    fn test_profile_concentrated_amm_ticks_monotonic_and_warning() {
+        // Swaps crossing 1, 2, 4, 8 ticks with increasing CPU and reads
+        let raw = vec![
+            (1, 10_000_000, 5, 2),
+            (2, 20_000_000, 10, 4),
+            (4, 40_000_000, 20, 8),
+            (8, 75_000_000, 36, 12),
+        ];
+
+        let limits = NetworkLimits {
+            max_cpu_instructions: 100_000_000,
+            max_read_entries: 40,
+            max_write_entries: 20,
+        };
+
+        let report = profile_concentrated_amm_ticks(&raw, Some(limits)).unwrap();
+        assert_eq!(report.status, "success");
+        assert_eq!(report.measurements.len(), 4);
+        assert_eq!(report.max_supported_ticks, 8);
+
+        // 36 reads is 90% of 40, so read_entries is limiting_dimension
+        assert_eq!(
+            report.measurements[3].headroom.limiting_dimension,
+            Some("read_entries".to_string())
+        );
+
+        // Next doubling to 16 ticks estimated 72 reads > 40 max -> warning insight present
+        assert!(report.warning_insight.is_some());
+        let warning = report.warning_insight.unwrap();
+        assert!(warning.contains("Next doubling to 16 ticks would exceed read-entry limit (40)"));
+    }
+
+    #[test]
+    fn test_profile_concentrated_amm_ticks_fails_on_non_monotonic_reads() {
+        let non_monotonic = vec![
+            (1, 10_000_000, 10, 2),
+            (2, 20_000_000, 8, 4), // Non-monotonic read drop
+        ];
+
+        let result = profile_concentrated_amm_ticks(&non_monotonic, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Non-monotonic read entries detected"));
     }
 }
 
