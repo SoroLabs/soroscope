@@ -6,7 +6,10 @@ use utoipa::ToSchema;
 pub struct GasGolfingSuggestion {
     pub pattern_type: String,
     pub description: String,
-    pub location: Option<String>, // WASM offset or function name
+    /// `export_name#+instruction_offset`, or `func#<index>#+<offset>` when the
+    /// function is not exported. `None` only when there is no function to
+    /// attribute the finding to, i.e. a parse error (#1007).
+    pub location: Option<String>,
     pub severity: String,         // "low", "medium", "high"
     pub gas_saved_estimate: Option<u64>,
     pub suggested_fix: String,
@@ -140,6 +143,18 @@ impl GasGolfingAnalyzer {
             let spans = crate::parsed_module::loop_spans(&function.operators);
 
             for span in &spans {
+                // A loop nested directly inside this one is analysed on its own
+                // span, so counting its body here as well would report the same
+                // host call twice — once for the outer loop, once for the
+                // inner — and inflate the suggestion count for one piece of
+                // code. Only the innermost loop owns a given call.
+                if spans
+                    .iter()
+                    .any(|other| other.depth > span.depth && other.op_index > span.op_index && other.end_index < span.end_index)
+                {
+                    continue;
+                }
+
                 let body = &function.operators[(span.op_index + 1)..=span.end_index.min(function.operators.len() - 1)];
 
                 let host_calls = body
@@ -624,6 +639,76 @@ mod tests {
             report.summary.get("loop_optimization").copied().unwrap_or(0),
             0,
             "a counter loop has nothing to hoist"
+        );
+    }
+
+    /// A call inside a nested loop is reported once, by the innermost loop.
+    ///
+    /// Both spans contain the call, so counting each span's body attributes one
+    /// host call to two loops and reports one piece of code twice.
+    #[test]
+    fn a_call_in_a_nested_loop_is_reported_once_by_the_innermost_loop() {
+        let wasm = Fixture::new()
+            .with_host_import()
+            .internal()
+            .body(&[
+                LOOP, 0x40, // outer loop
+                LOOP, 0x40, // inner loop
+                CALL, 0x00, // the one host call
+                END, // inner
+                END, // outer
+            ])
+            .build();
+
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "nested_loops");
+
+        assert_eq!(
+            report.summary.get("loop_optimization").copied().unwrap_or(0),
+            1,
+            "one call in a nested loop must produce one suggestion, not one per enclosing loop"
+        );
+        let suggestion = report
+            .suggestions
+            .iter()
+            .find(|s| s.pattern_type == "loop_optimization")
+            .expect("a loop suggestion");
+        assert!(suggestion.description.contains("1 host call(s)"), "got {}", suggestion.description);
+    }
+
+    /// Two sibling loops each with their own call are both reported: the
+    /// de-duplication must not swallow genuinely separate loops.
+    #[test]
+    fn sibling_loops_are_each_reported() {
+        let wasm = Fixture::new()
+            .with_host_import()
+            .internal()
+            .body(&[
+                LOOP, 0x40, CALL, 0x00, END,
+                LOOP, 0x40, CALL, 0x00, END,
+            ])
+            .build();
+
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "sibling_loops");
+        assert_eq!(report.summary.get("loop_optimization").copied().unwrap_or(0), 2);
+    }
+
+    /// A call in a block *after* a loop is not part of that loop's body.
+    #[test]
+    fn a_call_in_a_sibling_block_is_not_attributed_to_the_loop() {
+        let wasm = Fixture::new()
+            .with_host_import()
+            .internal()
+            .body(&[
+                LOOP, 0x40, LOCAL_GET, 0x00, I32_CONST, 0x01, I32_ADD, LOCAL_SET, 0x00, END,
+                BLOCK, 0x40, CALL, 0x00, END,
+            ])
+            .build();
+
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "loop_then_block");
+        assert_eq!(
+            report.summary.get("loop_optimization").copied().unwrap_or(0),
+            0,
+            "the call is in a sibling block, not in the loop body"
         );
     }
 
