@@ -138,6 +138,101 @@ pub struct ProfileResult {
     pub granularity: String,
 }
 
+/// Result of a batched simulation snapshot ledger hydration operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotHydrationReport {
+    pub total_keys_requested: usize,
+    pub cache_hits: usize,
+    pub rpc_calls_made: usize,
+    pub fetched_entries: HashMap<String, String>,
+    pub missing_keys: Vec<String>,
+}
+
+/// Batched ledger hydrator for simulation state snapshots and TTL analysis reports.
+#[derive(Debug, Clone)]
+pub struct BatchedLedgerHydrator {
+    pub batch_size: usize,
+}
+
+impl Default for BatchedLedgerHydrator {
+    fn default() -> Self {
+        Self { batch_size: 100 }
+    }
+}
+
+impl BatchedLedgerHydrator {
+    pub fn new(batch_size: usize) -> Self {
+        Self { batch_size }
+    }
+
+    /// Hydrate simulation snapshot keys using cache lookup and batched RPC calls.
+    pub async fn hydrate<F, Fut>(
+        &self,
+        keys: &[String],
+        ledger_sequence: u64,
+        cache_lookup: impl Fn(&str, u64) -> Option<String>,
+        rpc_fetch_batch: F,
+    ) -> SnapshotHydrationReport
+    where
+        F: Fn(Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<HashMap<String, String>, String>>,
+    {
+        if keys.is_empty() {
+            return SnapshotHydrationReport {
+                total_keys_requested: 0,
+                cache_hits: 0,
+                rpc_calls_made: 0,
+                fetched_entries: HashMap::new(),
+                missing_keys: vec![],
+            };
+        }
+
+        let mut fetched_entries = HashMap::new();
+        let mut missing_keys = Vec::new();
+        let mut keys_to_fetch = Vec::new();
+        let mut cache_hits = 0;
+
+        for key in keys {
+            if let Some(cached_xdr) = cache_lookup(key, ledger_sequence) {
+                cache_hits += 1;
+                fetched_entries.insert(key.clone(), cached_xdr);
+            } else {
+                keys_to_fetch.push(key.clone());
+            }
+        }
+
+        let mut rpc_calls_made = 0;
+
+        for chunk in keys_to_fetch.chunks(self.batch_size) {
+            rpc_calls_made += 1;
+            match rpc_fetch_batch(chunk.to_vec()).await {
+                Ok(batch_results) => {
+                    for key in chunk {
+                        if let Some(entry_xdr) = batch_results.get(key) {
+                            fetched_entries.insert(key.clone(), entry_xdr.clone());
+                        } else {
+                            missing_keys.push(key.clone());
+                        }
+                    }
+                }
+                Err(_) => {
+                    for key in chunk {
+                        missing_keys.push(key.clone());
+                    }
+                }
+            }
+        }
+
+        SnapshotHydrationReport {
+            total_keys_requested: keys.len(),
+            cache_hits,
+            rpc_calls_made,
+            fetched_entries,
+            missing_keys,
+        }
+    }
+}
+
 // ── WasmInstrumenter ─────────────────────────────────────────────────────────
 
 /// Instruments a WASM binary by injecting per-function instruction counters.
@@ -4665,6 +4760,108 @@ mod tests {
         let parsed_legacy = extract_soroban_budget_from_logs(legacy_logs);
         assert_eq!(parsed_legacy.cpu_instructions, 500000);
         assert_eq!(parsed_legacy.memory_bytes, 250000);
+    }
+
+    #[tokio::test]
+    async fn test_batched_ledger_hydrator_zero_keys() {
+        let hydrator = BatchedLedgerHydrator::new(100);
+        let calls_made = std::sync::atomic::AtomicUsize::new(0);
+
+        let report = hydrator
+            .hydrate(
+                &[],
+                100,
+                |_key, _seq| None,
+                |_batch| async {
+                    calls_made.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(HashMap::new())
+                },
+            )
+            .await;
+
+        assert_eq!(report.total_keys_requested, 0);
+        assert_eq!(report.rpc_calls_made, 0);
+        assert_eq!(report.cache_hits, 0);
+        assert!(report.fetched_entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_batched_ledger_hydrator_250_keys_3_batches() {
+        let hydrator = BatchedLedgerHydrator::new(100);
+        let keys: Vec<String> = (0..250).map(|i| format!("key_{i}")).collect();
+
+        let report = hydrator
+            .hydrate(
+                &keys,
+                100,
+                |_key, _seq| None,
+                |batch| async move {
+                    let mut map = HashMap::new();
+                    for k in batch {
+                        map.insert(k.clone(), format!("xdr_{k}"));
+                    }
+                    Ok(map)
+                },
+            )
+            .await;
+
+        assert_eq!(report.total_keys_requested, 250);
+        assert_eq!(report.rpc_calls_made, 3);
+        assert_eq!(report.cache_hits, 0);
+        assert_eq!(report.fetched_entries.len(), 250);
+        assert!(report.missing_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_batched_ledger_hydrator_warm_cache_zero_calls() {
+        let hydrator = BatchedLedgerHydrator::new(100);
+        let keys: Vec<String> = (0..50).map(|i| format!("key_{i}")).collect();
+
+        let report = hydrator
+            .hydrate(
+                &keys,
+                100,
+                |key, _seq| Some(format!("cached_xdr_{key}")),
+                |_batch| async {
+                    panic!("RPC call should not be made for warm cache");
+                },
+            )
+            .await;
+
+        assert_eq!(report.total_keys_requested, 50);
+        assert_eq!(report.cache_hits, 50);
+        assert_eq!(report.rpc_calls_made, 0);
+        assert_eq!(report.fetched_entries.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_batched_ledger_hydrator_partial_error() {
+        let hydrator = BatchedLedgerHydrator::new(10);
+        let keys: Vec<String> = (0..15).map(|i| format!("key_{i}")).collect();
+
+        let report = hydrator
+            .hydrate(
+                &keys,
+                100,
+                |_key, _seq| None,
+                |batch| async move {
+                    if batch.contains(&"key_0".to_string()) {
+                        let mut map = HashMap::new();
+                        for k in batch {
+                            map.insert(k, "xdr_val".to_string());
+                        }
+                        Ok(map)
+                    } else {
+                        Err("RPC partial error".to_string())
+                    }
+                },
+            )
+            .await;
+
+        assert_eq!(report.total_keys_requested, 15);
+        assert_eq!(report.rpc_calls_made, 2);
+        assert_eq!(report.fetched_entries.len(), 10);
+        assert_eq!(report.missing_keys.len(), 5);
     }
 }
 
