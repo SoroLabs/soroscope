@@ -410,6 +410,34 @@ mod tests {
             prop_assert_ne!(k1, k2);
         }
 
+        /// Fuzz test automated contract simulation argument generation for Address, i128, Bytes, Symbol.
+        #[test]
+        fn fuzz_automated_contract_simulation_args(
+            cid in prop::sample::select(vec![
+                "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK",
+            ]),
+            func in "[a-zA-Z_][a-zA-Z0-9_]{1,16}",
+            args in proptest::collection::vec(
+                prop_oneof![
+                    Just("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_string()),
+                    Just("CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_string()),
+                    any::<i128>().prop_map(|n| n.to_string()),
+                    "[0-9a-fA-F]{2,64}".prop_map(|h| format!("0x{}", h)),
+                    "[a-zA-Z_][a-zA-Z0-9_]{1,20}".prop_map(|s| format!(":{}", s)),
+                ],
+                0..6
+            ),
+        ) {
+            let engine = SimulationEngine::new("https://test.com".into());
+            for arg in &args {
+                let _ = engine.parse_sc_val_arg(arg);
+            }
+            let arg_refs: Vec<String> = args;
+            let key = SimulationCache::generate_key(&cid, &func, &arg_refs);
+            prop_assert_eq!(key.len(), 64);
+        }
+
         // ─── 10. CallGraph::to_mermaid ──────────────────────────────────
 
         /// Must never panic on arbitrary call trees; output starts correctly.
