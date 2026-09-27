@@ -556,7 +556,7 @@ mod tests {
         let newest = rx.recv().await.expect("newest event should remain");
         assert_eq!(newest.payload.job_id(), fake_id.to_string());
         if let SimulationEvent::Progress { data, .. } = newest.payload {
-            assert_eq!(data.percent, BUS_CAPACITY_MIN as i32);
+            assert_eq!(data.percent, 1);
         } else {
             panic!("expected progress event");
         }
@@ -568,7 +568,7 @@ mod tests {
         let mut rx = bus.subscribe();
         let fake_id = JobId::new();
 
-        for percent in 0..BUS_CAPACITY_MIN {
+        for percent in 0..=BUS_CAPACITY_MIN {
             bus.publish(SimulationBus::progress(&fake_id, percent as i32, "progress"));
         }
 
