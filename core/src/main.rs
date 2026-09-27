@@ -9,24 +9,30 @@ mod benchmarks;
 mod cache;
 mod call_trace_parser;
 mod comparison;
+mod contract_registry;
 mod errors;
+pub mod failure;
 pub mod fee_analytics;
 pub mod fee_collector;
 pub mod fee_store;
 mod gas_golfing;
 mod grpc;
 mod graphql;
+pub mod host_import_heat;
 pub mod insights;
 mod jobs;
 mod leader_lock;
 mod merkle_tree;
 mod parser;
+pub mod parsed_module;
 mod routing;
 pub mod rpc_provider;
 mod rpc_throttle;
 mod runner;
+pub mod sac_transfer;
 mod simulation;
 mod simulation_service;
+pub mod sys_alarms;
 mod task_queue;
 mod trace_propagation;
 mod wasm_branch_analysis;
@@ -1638,6 +1644,66 @@ async fn analyze_gas_golfing(
     Ok(Json(GasGolfingResponse { report }))
 }
 
+// ── Host Import Heat Map ─────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct HostImportHeatRequest {
+    /// Base64-encoded WASM bytecode
+    #[schema(example = "AGFzbQEAAAABBgFgAX8BfwMCAQAFAwMADAEAAQgBAUcBAQABAQgBAUcBAQACAgcABAEGCw==")]
+    pub wasm_bytes: String,
+    /// Contract name for identification
+    #[schema(example = "my_contract")]
+    pub contract_name: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct HostImportHeatResponse {
+    pub heat_map: crate::host_import_heat::HostImportHeatMap,
+}
+
+#[utoipa::path(
+    post,
+    path = "/analyze/host-import-heat",
+    request_body = HostImportHeatRequest,
+    responses(
+        (status = 200, description = "Per-export host import heat map", body = HostImportHeatResponse),
+        (status = 400, description = "Invalid WASM data or unparseable module"),
+        (status = 500, description = "Analysis failed")
+    ),
+    tag = "Analysis"
+)]
+async fn analyze_host_import_heat(
+    Json(payload): Json<HostImportHeatRequest>,
+) -> Result<Json<HostImportHeatResponse>, AppError> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+    tracing::info!(
+        contract_name = %payload.contract_name,
+        "Received host import heat map request"
+    );
+
+    let wasm_bytes = BASE64
+        .decode(&payload.wasm_bytes)
+        .map_err(|e| AppError::BadRequest(format!("Invalid base64 WASM data: {}", e)))?;
+
+    let contract_name = payload.contract_name.clone();
+    // The heat map is a static pass — no ledger state, no RPC, no engine — so
+    // this handler does not need the shared AppState at all. Parsing is
+    // CPU-bound, so it runs on the blocking pool rather than the async workers.
+    let heat_map = tokio::task::spawn_blocking(move || {
+        crate::host_import_heat::build_host_import_heat_map(
+            &wasm_bytes,
+            &contract_name,
+            &crate::host_import_heat::ContractCostParams::network_default(),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Host import heat map task panicked: {}", e)))?
+    .map_err(|e| AppError::BadRequest(format!("Could not parse WASM module: {}", e)))?;
+
+    Ok(Json(HostImportHeatResponse { heat_map }))
+}
+
 // ── Fee Market API Handlers ──────────────────────────────────────────────
 
 #[utoipa::path(
@@ -1779,6 +1845,7 @@ async fn fee_analytics(
 #[openapi(
     paths(
         analyze, analyze_wasm, optimize_limits, compare_handler,
+        analyze_host_import_heat,
         auth::challenge_handler, auth::verify_handler, auth::jwks_handler,
         fee_recommend, fee_history, fee_analytics, batch_contract_state
     ),
@@ -1796,6 +1863,12 @@ async fn fee_analytics(
         auth::JwkSetResponse, auth::JwkResponse,
         crate::simulation::OptimizationBuffer,
         crate::simulation::SorobanResources,
+        HostImportHeatRequest, HostImportHeatResponse,
+        crate::host_import_heat::HostImportHeatMap,
+        crate::host_import_heat::HostImportHeatRow,
+        crate::host_import_heat::ImportHeat,
+        crate::host_import_heat::CostClass,
+        crate::host_import_heat::EstimateKind,
         FeeRecommendationRequest, FeeRecommendationResponse,
         FeeHistoryRequest, FeeHistoryResponse,
         crate::fee_store::LedgerFeeSample,
@@ -2729,6 +2802,7 @@ async fn main() {
         .route("/analyze/optimize-limits", post(optimize_limits))
         .route("/analyze/compare", post(compare_handler))
         .route("/analyze/gas-golfing", post(analyze_gas_golfing))
+        .route("/analyze/host-import-heat", post(analyze_host_import_heat))
         .route_layer(middleware::from_fn(auth::auth_middleware));
 
     let app = Router::new()
