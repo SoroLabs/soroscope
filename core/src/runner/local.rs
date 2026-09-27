@@ -107,6 +107,8 @@ impl LocalRunner {
 
         let function_name = invocation.function_name.clone();
         let args = invocation.args.clone();
+        let called_function = function_name.clone();
+        let contract_id = contract_id_hex(&invocation.contract_hash);
 
         // The Soroban host interpreter is synchronous and CPU-heavy; push
         // it onto the blocking pool so the async runtime keeps serving
@@ -119,7 +121,11 @@ impl LocalRunner {
             SimulationError::ExecutionFailed(crate::failure::ExecutionFailure::from_diagnostic(format!(
                 "blocking task join failed: {e}"
             )))
-        })??;
+        })?
+        // Issue #1006: the classifier knows what failed, but only this frame
+        // knows which contract and function were being invoked, so a classified
+        // failure is localised here instead of arriving with no location.
+        .map_err(|err| err.with_invocation(Some(contract_id), Some(called_function.as_str())))?;
 
         Ok(SimulationResult {
             cost_stroops: estimate_cost_stroops(&resources),
@@ -135,6 +141,20 @@ impl LocalRunner {
             protocol_version: 0,
         })
     }
+}
+
+/// Render a 32-byte contract hash as lowercase hex.
+///
+/// A `C…` strkey would be friendlier, but the host's own diagnostics carry
+/// strkey ids, so the hex form is unambiguous next to them and needs no
+/// base32 dependency.
+fn contract_id_hex(hash: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in hash {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Execute one contract invocation against a freshly spun-up test host and
@@ -282,5 +302,47 @@ mod tests {
         // Same shape as SimulationEngine::calculate_cost:
         // 100_000/10_000 + 8_192/1_024 + (2_048+1_024)/1_024 = 10 + 8 + 3 = 21.
         assert_eq!(super::estimate_cost_stroops(&resources), 21);
+    }
+
+    #[test]
+    fn a_contract_hash_renders_as_64_hex_characters() {
+        let hash = [0xabu8; 32];
+        let rendered = super::contract_id_hex(&hash);
+        assert_eq!(rendered.len(), 64);
+        assert_eq!(rendered, "ab".repeat(32));
+    }
+
+    #[test]
+    fn a_classified_failure_carries_the_contract_and_function_it_came_from() {
+        let err = SimulationError::ExecutionFailed(
+            crate::failure::ExecutionFailure::from_diagnostic("cpu instructions exceeded budget"),
+        )
+        .with_invocation(Some("ab".repeat(32)), Some("withdraw"));
+
+        let SimulationError::ExecutionFailed(failure) = err else {
+            panic!("expected an execution failure");
+        };
+        let context = failure.context().expect("context attached");
+        assert_eq!(context.function.as_deref(), Some("withdraw"));
+        assert_eq!(context.contract_id.as_deref(), Some("ab".repeat(32).as_str()));
+        // The cost type is derived from the kind, not passed in by the caller.
+        assert_eq!(context.cost_type.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    fn attaching_an_invocation_does_not_change_retry_behaviour() {
+        let err = SimulationError::ExecutionFailed(
+            crate::failure::ExecutionFailure::from_diagnostic("memory limit exceeded"),
+        )
+        .with_invocation(Some("cd".repeat(32)), Some("deposit"));
+
+        assert!(!err.is_retriable(), "#1006 must not make a failure retriable");
+    }
+
+    #[test]
+    fn a_non_execution_error_is_passed_through_unchanged() {
+        let err = SimulationError::NodeError("no such contract".to_string())
+            .with_invocation(Some("ef".repeat(32)), Some("transfer"));
+        assert!(matches!(err, SimulationError::NodeError(ref m) if m == "no such contract"));
     }
 }

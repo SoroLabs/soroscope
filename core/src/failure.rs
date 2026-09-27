@@ -175,6 +175,32 @@ impl ExecutionFailure {
         self.with_context(TrapContext { contract_id, function, cost_type: None })
     }
 
+    /// Attach the invocation this failure came from.
+    ///
+    /// The classifier knows *what* went wrong; only the caller knows *where*.
+    /// `From<HostError>` has the diagnostic and nothing else, so every failure
+    /// it produced had `context: None` and the report could not say which
+    /// function to look at. Callers that hold a
+    /// [`ContractInvocation`](crate::runner::ContractInvocation) hand the
+    /// contract and function name in here.
+    pub fn with_invocation(
+        mut self,
+        contract_id: Option<String>,
+        function: Option<&str>,
+    ) -> Self {
+        // A name in the diagnostic is more precise than the name the caller
+        // asked for: a host trap inside a helper reports the helper.
+        let function = function_from_diagnostic(&self.detail).or_else(|| function.map(str::to_string));
+        let contract_id = contract_id_from_diagnostic(&self.detail).or(contract_id);
+        self.with_context(TrapContext { contract_id, function, cost_type: None })
+    }
+
+    /// The contract id, function and cost type, for callers that only want to
+    /// know whether a location was recovered.
+    pub fn context(&self) -> Option<&TrapContext> {
+        self.context.as_ref()
+    }
+
     /// Render the contract error with its resolved name when known, so the
     /// message says `contracterror #3 (Unauthorized)` rather than `#3`.
     pub fn describe(&self) -> String {
@@ -219,6 +245,57 @@ fn extract_contract_error_code(detail: &str) -> Option<ContractErrorCode> {
         idx = end.max(start);
     }
     None
+}
+
+/// Recover the contract function name from a host diagnostic.
+///
+/// Soroban renders a trap with the frames it has, in shapes like
+/// `HostError: Error(Contract, #3,VmError(...,transfer,...))` or a
+/// backtrace mentioning `contract::transfer`. Both a `fn <name>`-style token
+/// and a `Contract(...).<name>(` frame are recognised; anything else yields
+/// `None` rather than a guess, because a wrong function name sends an author
+/// to the wrong place.
+pub fn function_from_diagnostic(detail: &str) -> Option<String> {
+    // A named frame: `Contract(<id>).<name>(` or `contract::<name>`.
+    for (open, close) in [('(', ')'), ('[', ']') {
+        let mut rest = detail;
+        while let Some(start) = rest.find(open) {
+            let after = &rest[start + 1..];
+            if let Some(end) = after.find(close) {
+                let frame = &after[..end];
+                if let Some(name) = frame.rsplit('.').next() {
+                    let name = name.split(&[',', ':'][..]).next().unwrap_or(name).trim();
+                    if is_wasm_function_name(name) {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+            rest = &rest[start + 1..];
+        }
+    }
+    None
+}
+
+/// Recover a `C…` contract id (strkey) from a host diagnostic.
+///
+/// Only the canonical 56-character contract-id form is accepted, so a hex
+/// fragment or a bare number cannot be mistaken for one.
+pub fn contract_id_from_diagnostic(detail: &str) -> Option<String> {
+    detail
+        .split(|c: char| !c.is_ascii_uppercase() && !c.is_ascii_digit())
+        .filter(|token| token.len() == 56 && token.starts_with('C'))
+        .find(|token| token.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
+        .map(str::to_string)
+}
+
+/// Whether a token looks like a WASM export name rather than prose.
+fn is_wasm_function_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '$')
 }
 
 /// Classify a host diagnostic.
@@ -357,6 +434,58 @@ mod tests {
             cost_type: Some("custom".into()),
         });
         assert_eq!(failure.context.unwrap().cost_type.as_deref(), Some("custom"));
+    }
+
+    #[test]
+    fn a_function_named_in_the_diagnostic_is_attached() {
+        let failure = ExecutionFailure::from_diagnostic(
+            "HostError: Error(Contract, #3, VmError(Ok, Error(Contract, transfer)))",
+        )
+        .with_invocation(None, Some("withdraw"));
+
+        let context = failure.context().expect("context attached");
+        // The name inside the diagnostic wins: it is the frame that trapped.
+        assert_eq!(context.function.as_deref(), Some("transfer"));
+        assert_eq!(context.cost_type.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    fn the_invocation_name_is_used_when_the_diagnostic_names_no_frame() {
+        let failure =
+            ExecutionFailure::from_diagnostic(CPU_DIAGNOSTIC).with_invocation(None, Some("withdraw"));
+        assert_eq!(failure.context().unwrap().function.as_deref(), Some("withdraw"));
+    }
+
+    #[test]
+    fn a_contract_id_strkey_in_the_diagnostic_is_attached() {
+        let id = "CBQHNAX3CFZWBUF2J4C6QEBGB2FEHZPXN2O3KILYZQ2X5XNBEHXHDW5TK";
+        let failure = ExecutionFailure::from_diagnostic(&format!(
+            "HostError: Error(Contract, #1, Some(Diagnostic {{ contract: {id}, cpu instructions exceeded budget }}))"
+        ));
+
+        assert_eq!(contract_id_from_diagnostic(&failure.detail).as_deref(), Some(id));
+    }
+
+    #[test]
+    fn a_caller_supplied_contract_id_is_used_when_the_diagnostic_has_none() {
+        let hash = "ab".repeat(32);
+        let failure =
+            ExecutionFailure::from_diagnostic(MEM_DIAGNOSTIC).with_invocation(Some(hash.clone()), None);
+        assert_eq!(failure.context().unwrap().contract_id.as_deref(), Some(hash.as_str()));
+    }
+
+    #[test]
+    fn prose_is_not_mistaken_for_a_function_name() {
+        assert_eq!(function_from_diagnostic("something unrecognised"), None);
+        assert_eq!(contract_id_from_diagnostic("deadbeef is not a contract id"), None);
+    }
+
+    #[test]
+    fn an_exported_style_name_is_recognised() {
+        assert_eq!(
+            function_from_diagnostic("backtrace: contract::set_config").as_deref(),
+            Some("set_config")
+        );
     }
 
     #[test]

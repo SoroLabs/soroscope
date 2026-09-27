@@ -92,6 +92,22 @@ impl SimulationError {
     pub fn is_retriable(&self) -> bool {
         matches!(self, SimulationError::LocalUnavailable)
     }
+
+    /// Attach the contract and function this error came from (#1006).
+    ///
+    /// Only `ExecutionFailed` carries a location; every other variant already
+    /// names its own cause, and leaving them untouched keeps `is_retriable`
+    /// and the error text exactly as they were.
+    pub fn with_invocation(
+        mut self,
+        contract_id: Option<String>,
+        function: Option<&str>,
+    ) -> Self {
+        if let SimulationError::ExecutionFailed(failure) = &mut self {
+            *failure = failure.clone().with_invocation(contract_id, function);
+        }
+        self
+    }
 }
 
 /// Map `soroban-env-host` errors onto `SimulationError` so local-runner
