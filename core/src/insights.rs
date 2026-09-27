@@ -233,6 +233,40 @@ impl InsightRule for MemoryPressureRule {
     }
 }
 
+/// Recommends migrating persistent configuration keys written once at init and read on every call to instance storage.
+pub struct InstanceStorageConfigRule;
+
+impl InsightRule for InstanceStorageConfigRule {
+    fn name(&self) -> &str {
+        "instance_storage_recommendation"
+    }
+
+    fn evaluate(&self, r: &SorobanResources) -> Vec<Insight> {
+        let mut out = Vec::new();
+
+        if let Some(report) = &r.instance_storage_report {
+            if report.status == "available" {
+                for candidate in &report.candidates {
+                    out.push(Insight {
+                        severity: Severity::Warning,
+                        rule: self.name().to_string(),
+                        message: format!(
+                            "Persistent key '{}' is written once at init and read {} times across scenario — consider migrating to instance storage",
+                            candidate.key, candidate.total_reads_after_init
+                        ),
+                        suggested_fix: format!(
+                            "Move '{}' to instance storage (save ~{} read bytes, ~{} stroops rent delta)",
+                            candidate.key, candidate.estimated_read_bytes_saved, candidate.estimated_rent_savings_stroops
+                        ),
+                    });
+                }
+            }
+        }
+
+        out
+    }
+}
+
 // ── Engine ────────────────────────────────────────────────────────────────────
 
 /// The insights engine holds a set of rules and evaluates them against resource
@@ -256,6 +290,7 @@ impl InsightsEngine {
                 Box::new(InstructionDensityRule),
                 Box::new(FootprintBloatRule),
                 Box::new(MemoryPressureRule),
+                Box::new(InstanceStorageConfigRule),
             ],
         }
     }
@@ -598,5 +633,34 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let deserialized: InsightsReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, deserialized);
+    }
+
+    // ── Instance storage config recommendation rule ───────────────────────
+
+    #[test]
+    fn test_instance_storage_config_rule() {
+        use crate::simulation::{InstanceStorageRecommendationReport, WriteOnceReadManyCandidate};
+
+        let rule = InstanceStorageConfigRule;
+        let r = SorobanResources {
+            instance_storage_report: Some(InstanceStorageRecommendationReport {
+                status: "available".to_string(),
+                candidates: vec![WriteOnceReadManyCandidate {
+                    key: "ADMIN_CONFIG".to_string(),
+                    first_step_written: 0,
+                    total_reads_after_init: 3,
+                    estimated_read_bytes_saved: 192,
+                    estimated_rent_savings_stroops: 1920,
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let insights = rule.evaluate(&r);
+        assert_eq!(insights.len(), 1);
+        assert_eq!(insights[0].severity, Severity::Warning);
+        assert_eq!(insights[0].rule, "instance_storage_recommendation");
+        assert!(insights[0].message.contains("ADMIN_CONFIG"));
+        assert!(insights[0].suggested_fix.contains("192 read bytes"));
     }
 }

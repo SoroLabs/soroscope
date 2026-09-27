@@ -122,6 +122,104 @@ pub struct SorobanResources {
     pub ledger_write_bytes: u64,
     /// Transaction size in bytes
     pub transaction_size_bytes: u64,
+    /// Instance storage configuration recommendation report
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_storage_report: Option<InstanceStorageRecommendationReport>,
+}
+
+/// Key access entry within a multi-step scenario step.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ScenarioKeyAccess {
+    pub step_index: usize,
+    pub key: String,
+    pub key_type: String,
+    pub access_type: String,
+    pub key_bytes: u64,
+}
+
+/// Candidate persistent key that is written once (init) and only read afterward.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct WriteOnceReadManyCandidate {
+    pub key: String,
+    pub first_step_written: usize,
+    pub total_reads_after_init: usize,
+    pub estimated_read_bytes_saved: u64,
+    pub estimated_rent_savings_stroops: u64,
+}
+
+/// Analysis report recommending instance storage for configuration keys.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct InstanceStorageRecommendationReport {
+    pub status: String,
+    pub candidates: Vec<WriteOnceReadManyCandidate>,
+}
+
+pub fn analyze_instance_storage_candidates(
+    scenario_steps: &[Vec<ScenarioKeyAccess>],
+    cost_param_multiplier: u64,
+) -> InstanceStorageRecommendationReport {
+    if scenario_steps.len() <= 1 {
+        return InstanceStorageRecommendationReport {
+            status: "insufficient_steps".to_string(),
+            candidates: vec![],
+        };
+    }
+
+    let mut key_written_in_step_0: std::collections::HashMap<String, (u64, String)> =
+        std::collections::HashMap::new();
+    let mut key_written_after_step_0: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut key_read_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
+    for (step_idx, step_accesses) in scenario_steps.iter().enumerate() {
+        for access in step_accesses {
+            if access.key_type == "persistent" {
+                if step_idx == 0 {
+                    if access.access_type == "write" {
+                        key_written_in_step_0
+                            .insert(access.key.clone(), (access.key_bytes, access.key_type.clone()));
+                    }
+                } else {
+                    if access.access_type == "write" {
+                        key_written_after_step_0.insert(access.key.clone());
+                    } else if access.access_type == "read" {
+                        *key_read_counts.entry(access.key.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+
+    for (key, (key_bytes, _)) in key_written_in_step_0 {
+        if !key_written_after_step_0.contains(&key) {
+            let read_count = *key_read_counts.get(&key).unwrap_or(&0);
+            if read_count > 0 {
+                let bytes_saved = (read_count as u64) * key_bytes;
+                let rent_saved = bytes_saved * 10 * cost_param_multiplier;
+
+                candidates.push(WriteOnceReadManyCandidate {
+                    key,
+                    first_step_written: 0,
+                    total_reads_after_init: read_count,
+                    estimated_read_bytes_saved: bytes_saved,
+                    estimated_rent_savings_stroops: rent_saved,
+                });
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| a.key.cmp(&b.key));
+
+    let status = if candidates.is_empty() {
+        "no_recommendation".to_string()
+    } else {
+        "available".to_string()
+    };
+
+    InstanceStorageRecommendationReport { status, candidates }
 }
 
 /// Per-function instruction profiling result
@@ -4611,6 +4709,79 @@ mod tests {
                 "flamegraph should be non-empty when functions were called"
             );
         }
+    }
+
+    #[test]
+    fn test_analyze_instance_storage_candidates_insufficient_steps() {
+        let report = analyze_instance_storage_candidates(&[], 1);
+        assert_eq!(report.status, "insufficient_steps");
+        assert!(report.candidates.is_empty());
+
+        let step0 = vec![ScenarioKeyAccess {
+            step_index: 0,
+            key: "ADMIN_CONFIG".to_string(),
+            key_type: "persistent".to_string(),
+            access_type: "write".to_string(),
+            key_bytes: 64,
+        }];
+        let single_step_report = analyze_instance_storage_candidates(&[step0], 1);
+        assert_eq!(single_step_report.status, "insufficient_steps");
+        assert!(single_step_report.candidates.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_instance_storage_candidates_flags_admin_config_not_counter() {
+        let step0 = vec![
+            ScenarioKeyAccess {
+                step_index: 0,
+                key: "ADMIN_CONFIG".to_string(),
+                key_type: "persistent".to_string(),
+                access_type: "write".to_string(),
+                key_bytes: 64,
+            },
+            ScenarioKeyAccess {
+                step_index: 0,
+                key: "COUNTER".to_string(),
+                key_type: "persistent".to_string(),
+                access_type: "write".to_string(),
+                key_bytes: 32,
+            },
+        ];
+
+        let step1 = vec![
+            ScenarioKeyAccess {
+                step_index: 1,
+                key: "ADMIN_CONFIG".to_string(),
+                key_type: "persistent".to_string(),
+                access_type: "read".to_string(),
+                key_bytes: 64,
+            },
+            ScenarioKeyAccess {
+                step_index: 1,
+                key: "COUNTER".to_string(),
+                key_type: "persistent".to_string(),
+                access_type: "write".to_string(),
+                key_bytes: 32,
+            },
+        ];
+
+        let step2 = vec![
+            ScenarioKeyAccess {
+                step_index: 2,
+                key: "ADMIN_CONFIG".to_string(),
+                key_type: "persistent".to_string(),
+                access_type: "read".to_string(),
+                key_bytes: 64,
+            },
+        ];
+
+        let report = analyze_instance_storage_candidates(&[step0, step1, step2], 1);
+        assert_eq!(report.status, "available");
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].key, "ADMIN_CONFIG");
+        assert_eq!(report.candidates[0].total_reads_after_init, 2);
+        assert_eq!(report.candidates[0].estimated_read_bytes_saved, 128);
+        assert!(report.candidates[0].estimated_rent_savings_stroops > 0);
     }
     #[test]
     fn test_debug_soroban_wasm_counter() {
