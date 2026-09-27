@@ -6,6 +6,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod auth;
 mod benchmarks;
+pub mod branch_coverage;
 mod cache;
 mod call_trace_parser;
 mod comparison;

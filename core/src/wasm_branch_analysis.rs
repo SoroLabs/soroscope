@@ -129,6 +129,9 @@ pub enum BranchCoverageBasis {
     /// it took. This is weaker than instruction-level tracing and is labelled
     /// as such rather than presented as coverage it is not.
     MeasuredProfileDelta,
+    /// Branch ids were observed directly for each run, and coverage is the
+    /// side table in [`crate::branch_coverage`], not an inference from costs.
+    Traced,
 }
 
 impl BranchCoverageBasis {
@@ -137,6 +140,7 @@ impl BranchCoverageBasis {
         match self {
             BranchCoverageBasis::NoBranchesExecuted => "no_branches_executed",
             BranchCoverageBasis::MeasuredProfileDelta => "measured_profile_delta",
+            BranchCoverageBasis::Traced => "traced",
         }
     }
 }
@@ -1069,6 +1073,215 @@ pub fn analyze_wasm_branches(
         uncovered_branches,
         coverage_basis,
         runs_used,
+        run_budget: budget.max_runs,
+        coverage_note,
+    })
+}
+
+/// Analysis with a caller-supplied branch trace.
+///
+/// The plain [`analyze_wasm_branches`] cannot know which branch a run took —
+/// `profile_contract` returns resource counts and nothing about control flow —
+/// so it reports coverage inferred from cost profiles and labels it as such.
+/// This entry point takes a `tracer` that reports the branch ids a run
+/// observed, feeds them to the coverage-guided search in
+/// [`crate::branch_coverage`], and reports `BranchCoverageBasis::Traced` with
+/// `uncovered_branches` taken from the side table.
+///
+/// A tracer that returns an empty slice is treated as "no trace source" and
+/// degrades to the cost-driven search rather than claiming coverage.
+pub fn analyze_wasm_branches_traced(
+    wasm_bytes: Vec<u8>,
+    function_name: String,
+    args: Vec<String>,
+    budget: SearchBudget,
+    tracer: &dyn Fn(&[String]) -> Vec<usize>,
+) -> Result<WasmBranchAnalysisResult, SimulationError> {
+    // ── 1. Static analysis, for the branch id space ──────────────────────────
+    let (total_branch_count, max_nesting_depth, branch_type_breakdown, branches) =
+        match extract_function_body(&wasm_bytes, &function_name) {
+            Some(body) => {
+                let acc = scan_function_body(body);
+                let total = acc.branches.len();
+                let depth = acc.max_depth;
+                let breakdown = acc.breakdown;
+                let branches = acc.branches;
+                (total, depth, breakdown, branches)
+            }
+            None => {
+                tracing::warn!(
+                    function = %function_name,
+                    "Could not locate function body in WASM — static analysis unavailable"
+                );
+                (0, 0, BranchTypeBreakdown::default(), vec![])
+            }
+        };
+
+    let estimated_paths = if total_branch_count == 0 {
+        1
+    } else {
+        (2usize.saturating_pow(total_branch_count.min(6) as u32)).min(64)
+    };
+
+    // ── 2. Baseline ──────────────────────────────────────────────────────────
+    let baseline_resources = profile_contract(
+        wasm_bytes.clone(),
+        function_name.clone(),
+        args.clone(),
+        None,
+        None,
+    )?;
+    let baseline = baseline_resources.clone();
+
+    // ── 3. Coverage-guided search ────────────────────────────────────────────
+    let coverage_budget = crate::branch_coverage::CoverageBudget {
+        max_runs: budget.max_runs,
+        stop_after_empty_rounds: budget.stop_after_empty_rounds,
+        max_rounds: budget.max_rounds,
+    };
+
+    let oracle_wasm = wasm_bytes.clone();
+    let oracle_fn = function_name.clone();
+    // The baseline is already profiled above; handing its measurement to the
+    // search keeps it as a recorded run without spending a second simulation on
+    // it, and without leaving it out of `simulated_paths` entirely.
+    let oracle_baseline = baseline.clone();
+    let oracle_tracer = tracer;
+    let outcome = crate::branch_coverage::search_coverage_guided(
+        &args,
+        &coverage_budget,
+        |candidate: &[String], round: usize| {
+            if round == 0 && candidate == args.as_slice() {
+                return Some(crate::branch_coverage::CoverageRun {
+                    args: candidate.to_vec(),
+                    resources: oracle_baseline.clone(),
+                    hit_branches: oracle_tracer(candidate),
+                    round: 0,
+                });
+            }
+            let profiled = profile_contract(
+                oracle_wasm.clone(),
+                oracle_fn.clone(),
+                candidate.to_vec(),
+                None,
+                None,
+            )
+            .ok()?;
+            let hits = oracle_tracer(candidate);
+            Some(crate::branch_coverage::CoverageRun {
+                args: candidate.to_vec(),
+                resources: profiled,
+                hit_branches: hits,
+                round,
+            })
+        },
+        |best: &[String], round: usize| {
+            // Round 1 explores the original permutation set; later rounds mutate
+            // the best input found so far, which is where an unmeasured path is
+            // most likely to be.
+            if round == 1 {
+                generate_arg_variations(best)
+            } else {
+                mutate_args(best, round)
+            }
+        },
+    );
+
+    // ── 4. Assemble ──────────────────────────────────────────────────────────
+    let mut simulated_paths: Vec<PathResult> = Vec::new();
+    let mut fingerprints: std::collections::HashSet<(u64, u64, u64, u64)> =
+        std::collections::HashSet::new();
+    fingerprints.insert((
+        baseline.cpu_instructions,
+        baseline.ram_bytes,
+        baseline.ledger_read_bytes,
+        baseline.ledger_write_bytes,
+    ));
+
+    for (path_id, run) in outcome.runs.iter().enumerate() {
+        fingerprints.insert((
+            run.resources.cpu_instructions,
+            run.resources.ram_bytes,
+            run.resources.ledger_read_bytes,
+            run.resources.ledger_write_bytes,
+        ));
+        simulated_paths.push(PathResult {
+            path_id,
+            args_used: run.args.clone(),
+            resources: run.resources.clone(),
+            round: run.round,
+        });
+    }
+
+    let distinct_profiles = fingerprints.len();
+    let worst = outcome
+        .worst
+        .as_ref()
+        .map(|r| r.resources.clone())
+        .unwrap_or_else(|| baseline.clone());
+    let best = outcome
+        .best
+        .as_ref()
+        .map(|r| r.resources.clone())
+        .unwrap_or_else(|| baseline.clone());
+
+    let observed_any = outcome.coverage.covered_count() > 0;
+    let uncovered_branches = outcome.coverage.uncovered(&branches);
+    let coverage_basis = if total_branch_count == 0 {
+        BranchCoverageBasis::NoBranchesExecuted
+    } else if observed_any {
+        BranchCoverageBasis::Traced
+    } else {
+        BranchCoverageBasis::MeasuredProfileDelta
+    };
+
+    let coverage_note = if total_branch_count == 0 {
+        "No branch-generating instruction was found in this function body, so there is nothing          to cover."
+            .to_string()
+    } else if !observed_any {
+        "The tracer reported no branch ids, so no branch is credited with coverage: the worst          case below is the most expensive input that was tried, not a proven worst case."
+            .to_string()
+    } else if outcome.capped {
+        format!(
+            "Stopped at the run cap of {} simulation(s) while branch coverage was still              increasing. {} of {} static branch point(s) were observed; {} remain uncovered and              are listed rather than assumed.",
+            budget.max_runs,
+            outcome.coverage.covered_count(),
+            total_branch_count,
+            uncovered_branches.len(),
+        )
+    } else if uncovered_branches.is_empty() {
+        format!(
+            "All {} static branch point(s) were observed across {} simulation(s); the search              stopped because {}.",
+            total_branch_count,
+            outcome.runs_used,
+            outcome.stop_reason.as_str(),
+        )
+    } else {
+        format!(
+            "{} of {} static branch point(s) were observed across {} simulation(s) before the              search {}; the remaining {} are listed as uncovered rather than assumed.",
+            outcome.coverage.covered_count(),
+            total_branch_count,
+            outcome.runs_used,
+            outcome.stop_reason.as_str(),
+            uncovered_branches.len(),
+        )
+    };
+
+    Ok(WasmBranchAnalysisResult {
+        function_name,
+        total_branch_count,
+        max_nesting_depth,
+        branch_type_breakdown,
+        estimated_paths,
+        branches,
+        simulated_paths,
+        baseline_resources: baseline,
+        worst_case_resources: worst,
+        best_case_resources: best,
+        distinct_profiles,
+        uncovered_branches,
+        coverage_basis,
+        runs_used: outcome.runs_used,
         run_budget: budget.max_runs,
         coverage_note,
     })
