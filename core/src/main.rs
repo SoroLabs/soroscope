@@ -9,24 +9,29 @@ mod benchmarks;
 mod cache;
 mod call_trace_parser;
 mod comparison;
+pub mod contract_registry;
 mod errors;
+pub mod failure;
 pub mod fee_analytics;
 pub mod fee_collector;
 pub mod fee_store;
 mod gas_golfing;
 mod grpc;
 mod graphql;
+pub mod host_import_heat;
 pub mod insights;
 mod jobs;
 mod leader_lock;
 mod merkle_tree;
 mod parser;
+pub mod parsed_module;
 mod routing;
 pub mod rpc_provider;
 mod rpc_throttle;
 mod runner;
 mod simulation;
 mod simulation_service;
+pub mod sys_alarms;
 mod task_queue;
 mod trace_propagation;
 mod wasm_branch_analysis;
@@ -34,6 +39,15 @@ mod worker_pool;
 mod webhooks;
 mod webhook_validation;
 mod ws;
+pub mod xdr_decoder;
+
+use tracing_subscriber::EnvFilter;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::compression::CompressionLayer;
+use tower_http::trace::TraceLayer;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use utoipa::{ToSchema, OpenApi};
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::webhook_validation::ValidatedWebhook;
 
@@ -67,23 +81,44 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-// CLI Argument Handling
-use crate::fee_analytics::{FeeAnalyticsEngine, MarketConditions, ModelBreakdown};
-use crate::fee_collector::{FeeCollector, FeeCollectorConfig};
-use crate::fee_store::FeeStore;
-use crate::gas_golfing::{GasGolfingAnalyzer, GasGolfingReport};
-use crate::insights::InsightsEngine;
-use crate::jobs::{JobQueue, JobQueueConfig, JobWorker};
-use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
-use crate::simulation::{SimulationEngine, SimulationMode, SimulationResult};
-use crate::ws::SimulationBus;
-use tower_http::compression::CompressionLayer;
-use tower_http::cors::{Any, CorsLayer};
-use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
-use tower_http::trace::TraceLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use utoipa::{OpenApi, ToSchema};
-use utoipa_swagger_ui::SwaggerUi;
+use clap::Parser;
+
+/// Command-line argument options for SoroScope Core.
+#[derive(Parser, Debug, Clone)]
+#[command(
+    name = "soroscope-core",
+    author = "SoroLabs",
+    version = "0.1.0",
+    about = "SoroScope Core CLI & Simulation Server",
+    long_about = "Soroban smart contract execution, simulation, state tracing, and RPC failover engine."
+)]
+pub struct CliArgs {
+    /// Custom Soroban RPC endpoint URL
+    #[arg(
+        short = 'r',
+        long = "rpc-url",
+        default_value = "https://soroban-testnet.stellar.org",
+        help = "Custom Soroban RPC endpoint URL (defaults to Soroban Testnet)"
+    )]
+    pub rpc_url: String,
+
+    /// Stellar network passphrase
+    #[arg(
+        short = 'n',
+        long = "network-passphrase",
+        default_value = "Test SDF Network ; September 2015",
+        help = "Stellar network passphrase (defaults to Testnet passphrase)"
+    )]
+    pub network_passphrase: String,
+
+    /// Enable verbose XDR logging and debug level output
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        help = "Enable verbose XDR logging and debug level output"
+    )]
+    pub verbose: bool,
+}
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -255,6 +290,7 @@ fn default_max_ledger_age() -> u32 {
 
 fn default_event_bus_capacity() -> usize {
     256
+}
 fn default_allowed_origins() -> String {
     // Empty string means: fall back to allow-all (*).
     // Operators set ALLOWED_ORIGINS=http://localhost:3000,https://app.example.com
@@ -523,23 +559,40 @@ impl AppMetrics {
             &["host"],
         )?;
         let host_memory_usage_percent = prometheus::GaugeVec::new(
+            Opts::new(
                 "host_memory_usage_percent",
                 "Host-wide memory usage percentage (0-100) sampled by the system alarm monitor",
+            ),
+            &["host"],
+        )?;
         let process_memory_bytes = prometheus::GaugeVec::new(
+            Opts::new(
                 "process_memory_bytes",
                 "Resident memory size of the SoroScope process in bytes",
+            ),
             &["process"],
+        )?;
         let indexing_latency_seconds = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "indexing_latency_seconds",
                 "Latency of ledger indexing/collection cycles in seconds",
+            ),
             &["stage"],
+        )?;
         let events_processed_total = IntCounterVec::new(
+            Opts::new(
                 "events_processed_total",
                 "Total number of ledger events successfully processed",
+            ),
+            &["stage"],
+        )?;
         let indexing_errors_total = IntCounterVec::new(
+            Opts::new(
                 "indexing_errors_total",
                 "Total number of indexing cycle failures",
+            ),
+            &["stage"],
+        )?;
         let job_queue_depth = prometheus::GaugeVec::new(
             Opts::new("job_queue_depth", "Current depth of background job queues"),
             &["queue"],
@@ -638,6 +691,7 @@ pub struct TestnetAverages {
     /// Average CPU instructions for typical Soroban transactions
     pub cpu_instructions: u64,
     /// Average RAM bytes for typical Soroban transactions
+    pub ram_bytes: u64,
     pub ledger_read_bytes: u64,
     /// Average ledger write bytes for typical Soroban transactions
     pub ledger_write_bytes: u64,
@@ -1943,18 +1997,7 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-async fn healthz() -> StatusCode {
-    StatusCode::OK
-}
 
-async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
-    let providers_healthy = !state.provider_registry.healthy_providers().await.is_empty();
-    let db_healthy = state.fee_store.get_sample_count().await.is_ok();
-    
-    if providers_healthy && db_healthy {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
 /// `/healthz` — Kubernetes liveness probe.
 ///
 /// Returns 200 OK as long as the process is running. No external dependency
@@ -2021,6 +2064,18 @@ async fn registry_gossip(
 
 #[tokio::main]
 async fn main() {
+    let cli = CliArgs::parse();
+
+    if cli.verbose {
+        env::set_var("RUST_LOG", "debug");
+    }
+    if !cli.rpc_url.is_empty() {
+        env::set_var("SOROBAN_RPC_URL", &cli.rpc_url);
+    }
+    if !cli.network_passphrase.is_empty() {
+        env::set_var("NETWORK_PASSPHRASE", &cli.network_passphrase);
+    }
+
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
@@ -2034,14 +2089,20 @@ async fn main() {
     let log_json = env::var("LOG_FORMAT").map(|v| v.to_lowercase() == "json").unwrap_or(false);
     let filter = EnvFilter::from_default_env();
     if log_json {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
         tracing_subscriber::registry()
             .with(filter)
             .with(tracing_subscriber::fmt::layer().json())
             .init();
     } else {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::registry()
+            .with(filter)
             .with(tracing_subscriber::fmt::layer())
+            .init();
     }
-        .with(build_env_filter(&config.rust_log))
 
     tracing::info!(rust_log = %config.rust_log, "SoroScope Starting...");
     tracing::info!("SoroScope initialized with config: {:?}", config);
@@ -2380,10 +2441,20 @@ async fn main() {
             request_timeout: std::time::Duration::from_secs(30),
         };
 
+        let metrics = Arc::new(AppMetrics::new().expect("Failed to create metrics"));
+        let redis_client = redis::Client::open(config.redis_url.as_str()).expect("Failed to create redis client");
+        let leader_lock = Arc::new(crate::leader_lock::RedisLeaderLock::new(
+            redis_client,
+            "soroscope:leader:fee_collector",
+            std::time::Duration::from_secs(30),
+        ));
+
         let collector = Arc::new(FeeCollector::new(
             Arc::clone(&registry),
             Arc::clone(&fee_store),
             collector_config,
+            metrics,
+            leader_lock,
         ));
 
         let total = end - start + 1;
@@ -2508,9 +2579,6 @@ async fn main() {
         .expect("Failed to initialize job queue");
     // ── WebSocket event bus (#565: configurable bounded channel) ───────
     let simulation_bus = SimulationBus::with_capacity(config.event_bus_capacity);
-
-    // Spawn background cleanup task
-    job_queue.spawn_cleanup_task();
 
     let job_worker = JobWorker::new(
         job_queue.clone(),
@@ -2671,7 +2739,6 @@ async fn main() {
         fee_analytics_engine,
         fee_store,
         metrics: Arc::clone(&app_metrics),
-        metrics,
         simulation_bus,
     });
 
@@ -2720,6 +2787,7 @@ async fn main() {
                 .filter_map(|s| s.trim().parse::<HeaderValue>().ok())
                 .collect();
             CorsLayer::new().allow_origin(origins)
+        }
     };
 
     let protected = Router::new()
@@ -2819,19 +2887,12 @@ async fn main() {
 async fn shutdown_signal(shutdown_tx: tokio::sync::broadcast::Sender<()>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
+            .await
             .expect("failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]
     let terminate = async {
-        .with_graceful_shutdown(shutdown_signal())
-
-    tracing::info!("Server shut down gracefully.");
-
-/// Waits for SIGTERM (Unix) or Ctrl-C (all platforms) and resolves once either
-/// signal is received, allowing axum to finish in-flight requests before exit.
-async fn shutdown_signal() {
-    let sigterm = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler")
             .recv()
@@ -2848,6 +2909,7 @@ async fn shutdown_signal() {
 
     tracing::info!("Shutdown signal received; notifying background workers");
     let _ = shutdown_tx.send(());
+}
 
 /// Await every worker handle, aborting any that hang past a short grace period.
 async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
@@ -2865,15 +2927,11 @@ async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
                     "Background worker did not exit within {:?}; aborted",
                     WORKER_JOIN_TIMEOUT
                 );
-    let sigterm = std::future::pending::<()>();
-
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Received SIGINT (Ctrl-C), shutting down…");
-        _ = sigterm => {
-            tracing::info!("Received SIGTERM, shutting down…");
+            }
         }
     }
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Integration Tests

@@ -242,6 +242,7 @@ const EXPORT_KIND_FUNC: u8 = 0;
 
 // ── Branch opcodes ────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 const OP_NOP: u8 = 0x01;
 const OP_BLOCK: u8 = 0x02;
 const OP_LOOP: u8 = 0x03;
@@ -653,7 +654,7 @@ fn mutate_args(seed: &[String], round: usize) -> Vec<Vec<String>> {
                     candidates.push(candidate);
                 }
             }
-        } else if let Ok(n) = trimmed.parse::<u64>() {
+        } else if let Ok(_n) = trimmed.parse::<u64>() {
             let probes: &[u64] = if round <= 1 { &[0, 1] } else { &[u64::MAX, u64::MAX / 2, 2] };
             for probe in probes {
                 let candidate = probe.to_string();
