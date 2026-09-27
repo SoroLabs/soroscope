@@ -631,12 +631,14 @@ impl EmergencyGuardTrait for DefaultEmergencyGuard {
     }
 
     /// Unpause a specific operation (any single admin can do this)
-    fn unpause(env: &Env, operation: u32) -> Result<(), GuardError> {
+    fn unpause(env: &Env, admin: Address, operation: u32) -> Result<(), GuardError> {
+        admin.require_auth();
         Self::set_pause_state(env, operation, false)
     }
 
     /// Unpause all operations (any single admin can do this)
-    fn unpause_all(env: &Env) -> Result<(), GuardError> {
+    fn unpause_all(env: &Env, admin: Address) -> Result<(), GuardError> {
+        admin.require_auth();
         let pause_state = PauseType::new(0);
         env.storage()
             .instance()
