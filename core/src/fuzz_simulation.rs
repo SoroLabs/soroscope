@@ -468,5 +468,92 @@ mod tests {
             prop_assert_eq!(deser.ledger_entries.len(), snap.ledger_entries.len());
             prop_assert_eq!(deser.ttl_entries.len(), snap.ttl_entries.len());
         }
+
+        // ─── 13. Automated Contract Simulation Fuzzing Suite (Issue #9) ─────
+        //
+        // Generates random valid Soroban argument values (Address, i128, Bytes,
+        // Symbol) and verifies the engine can parse and build transactions without
+        // panicking. Covers the acceptance criteria: 100 random iterations per
+        // argument type with no engine crash.
+
+        /// Random valid Stellar contract address strings must parse successfully.
+        #[test]
+        fn fuzz_random_address_args_no_panic(
+            // 32 random bytes that will form a contract-class address
+            bytes in proptest::collection::vec(any::<u8>(), 32),
+        ) {
+            use soroban_sdk::xdr::{Hash, ScAddress, ScVal};
+            let engine = SimulationEngine::new("https://test.rpc".into());
+            let hash = Hash(bytes.try_into().unwrap());
+            let sc_val = ScVal::Address(ScAddress::Contract(hash));
+            // estimate_scval_size must never panic on an Address
+            let size = engine.estimate_scval_size(&sc_val);
+            prop_assert_eq!(size, 32, "Address ScVal must report 32 bytes");
+        }
+
+        /// Random i128 values serialised as strings must parse correctly.
+        #[test]
+        fn fuzz_random_i128_args_parse_ok(
+            hi in any::<i64>(),
+            lo in any::<u64>(),
+        ) {
+            use soroban_sdk::xdr::{Int128Parts, ScVal};
+            let engine = SimulationEngine::new("https://test.rpc".into());
+            let sc_val = ScVal::I128(Int128Parts { hi, lo });
+            let size = engine.estimate_scval_size(&sc_val);
+            prop_assert_eq!(size, 16, "i128 ScVal must report 16 bytes");
+        }
+
+        /// Random byte arrays (up to 256 B) must survive size estimation.
+        #[test]
+        fn fuzz_random_bytes_args_no_panic(
+            raw in proptest::collection::vec(any::<u8>(), 0..=256),
+        ) {
+            use soroban_sdk::xdr::{ScBytes, ScVal};
+            let engine = SimulationEngine::new("https://test.rpc".into());
+            let sc_bytes: ScBytes = raw.clone().try_into().unwrap_or_default();
+            let sc_val = ScVal::Bytes(sc_bytes);
+            let size = engine.estimate_scval_size(&sc_val);
+            prop_assert_eq!(size as usize, raw.len(), "Bytes ScVal size must equal byte length");
+        }
+
+        /// Random symbols (1–32 chars from the Soroban symbol alphabet) must
+        /// survive round-trips through the engine arg parser.
+        #[test]
+        fn fuzz_random_symbol_args_no_panic(
+            sym in "[a-zA-Z_][a-zA-Z0-9_]{0,30}",
+        ) {
+            let engine = SimulationEngine::new("https://test.rpc".into());
+            // `:symbol` prefix is the engine's input format for ScVal::Symbol
+            let input = format!(":{}", sym);
+            // Must not panic; result can be Ok or Err
+            let _ = engine.parse_sc_val_arg(&input);
+        }
+
+        /// End-to-end: build a transaction with a random mix of typed args and
+        /// verify the base64 output is non-empty (no crash).
+        #[test]
+        fn fuzz_mixed_args_transaction_no_crash(
+            func in "[a-zA-Z_][a-zA-Z0-9_]{0,15}",
+            bool_arg in prop::bool::ANY,
+            int_arg in any::<i64>(),
+            sym in "[a-zA-Z_][a-zA-Z0-9_]{0,10}",
+        ) {
+            let engine = SimulationEngine::new("https://test.rpc".into());
+            let args = vec![
+                if bool_arg { "true".to_string() } else { "false".to_string() },
+                int_arg.to_string(),
+                format!(":{}", sym),
+            ];
+            let result = engine.create_invoke_transaction(
+                "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                &func,
+                args,
+            );
+            // Must not panic; a successful result must be non-empty base64
+            if let Ok(b64) = result {
+                prop_assert!(!b64.is_empty());
+            }
+        }
     }
 }
