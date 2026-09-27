@@ -120,3 +120,53 @@ where
         cpu_cost + ram_cost + ledger_cost
     }
 }
+
+/// Handler for executing simulations on isolated state snapshots with automatic rollback.
+#[derive(Debug, Clone)]
+pub struct IsolatedSimulationSession<S> {
+    snapshot: S,
+}
+
+impl<S: Clone> IsolatedSimulationSession<S> {
+    pub fn new(snapshot: S) -> Self {
+        Self { snapshot }
+    }
+
+    /// Execute simulation closure on a copy of the state snapshot, automatically rolling back (discarding) changes.
+    pub fn execute_with_rollback<F, R>(&self, mut sim_fn: F) -> R
+    where
+        F: FnMut(&mut S) -> R,
+    {
+        let mut isolated_state = self.snapshot.clone();
+        sim_fn(&mut isolated_state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_isolated_simulation_state_rollback() {
+        let mut initial_state = HashMap::new();
+        initial_state.insert("key1".to_string(), "val1".to_string());
+
+        let session = IsolatedSimulationSession::new(initial_state.clone());
+
+        let res1 = session.execute_with_rollback(|state| {
+            state.insert("key1".to_string(), "mutated1".to_string());
+            state.insert("key2".to_string(), "val2".to_string());
+            state.len()
+        });
+        assert_eq!(res1, 2);
+
+        assert_eq!(session.snapshot.get("key1").unwrap(), "val1");
+        assert!(!session.snapshot.contains_key("key2"));
+
+        let res2 = session.execute_with_rollback(|state| {
+            state.get("key1").cloned()
+        });
+        assert_eq!(res2, Some("val1".to_string()));
+    }
+}
