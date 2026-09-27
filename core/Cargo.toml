@@ -56,6 +56,7 @@ clap = { version = "4", features = ["derive"] }
 rsa = "0.9"
 wasm-encoder = { version = "0.240", features = ["wasmparser"] }
 wasmparser = "0.240"
+wasmprinter = "0.240"
 rayon = "1.8"
 # Used by the host resource alarm monitor (issue #592) to sample CPU
 # and RAM utilisation for the local process. Default features include

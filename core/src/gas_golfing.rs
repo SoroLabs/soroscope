@@ -134,7 +134,7 @@ impl GasGolfingAnalyzer {
     /// correctly left alone.
     fn analyze_loop_patterns(&self, module: &crate::parsed_module::ParsedModule) -> Vec<GasGolfingSuggestion> {
         let mut suggestions = Vec::new();
-        let mut flagged = 0usize;
+        let mut _flagged = 0usize;
 
         for function in &module.functions {
             let spans = crate::parsed_module::loop_spans(&function.operators);
@@ -160,7 +160,7 @@ impl GasGolfingAnalyzer {
                     continue;
                 }
 
-                flagged += 1;
+                _flagged += 1;
                 let mut detail = format!(
                     "loop at {} performs per-iteration work: {} host call(s), {} indirect call(s), \
                      {} memory.grow — candidates for loop-invariant code motion",
@@ -267,7 +267,7 @@ impl GasGolfingAnalyzer {
                         if let wasmparser::Operator::I32Const { value } =
                             &function.operators[op_index - 1]
                         {
-                            if *value > 1 && value.is_power_of_two() {
+                            if *value > 1 && (*value as u32).is_power_of_two() {
                                 if mul_const_site.is_none() {
                                     mul_const_site = Some(function.location(op_index - 1));
                                 }

@@ -378,7 +378,7 @@ mod tests {
         wasm.push(export.len() as u8);
         wasm.extend_from_slice(&export);
         // Body: call 0, call 0, call 1, end.
-        let mut body = vec![0x00, 0x10, 0x00, 0x10, 0x00, 0x10, 0x01, 0x0b];
+        let body = vec![0x00, 0x10, 0x00, 0x10, 0x00, 0x10, 0x01, 0x0b];
         let mut section = vec![0x01, body.len() as u8];
         section.extend_from_slice(&body);
         wasm.push(0x0a);
@@ -489,7 +489,7 @@ mod tests {
         wasm.push(export.len() as u8);
         wasm.extend_from_slice(&export);
         // call 0; call_indirect { type 0, table 0 } = 0x11 0x00 0x00; end
-        let mut body = vec![0x00, 0x10, 0x00, 0x11, 0x00, 0x00, 0x0b];
+        let body = vec![0x00, 0x10, 0x00, 0x11, 0x00, 0x00, 0x0b];
         let mut section = vec![0x01, body.len() as u8];
         section.extend_from_slice(&body);
         wasm.push(0x0a);
@@ -519,7 +519,7 @@ mod tests {
         wasm.push(export.len() as u8);
         wasm.extend_from_slice(&export);
         // Just nop, end.
-        let mut body = vec![0x00, 0x01, 0x0b];
+        let body = vec![0x00, 0x01, 0x0b];
         let mut section = vec![0x01, body.len() as u8];
         section.extend_from_slice(&body);
         wasm.push(0x0a);
@@ -591,7 +591,7 @@ mod contract_fixture_tests {
         assert_eq!(
             heaviest.cost_class,
             CostClass::Storage,
-            "storage_heavy must rank a storage import above anything else, got {heapest:?}"
+            "storage_heavy must rank a storage import above anything else, got {heaviest:?}"
         );
     }
 
