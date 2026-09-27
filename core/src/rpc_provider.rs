@@ -454,6 +454,32 @@ impl ProviderRegistry {
         }
     }
 
+    pub async fn report_rate_limit_failure(&self, url: &str) {
+        if let Some(state) = self.find_by_url(url).await {
+            let prev = state.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+            state.local_score.store(
+                adjust_score(
+                    state.local_score.load(Ordering::Relaxed),
+                    -(LOCAL_FAILURE_PENALTY * 2),
+                ),
+                Ordering::Relaxed,
+            );
+            if prev + 1 >= CIRCUIT_BREAKER_THRESHOLD {
+                let mut tripped = state.tripped_at.write().await;
+                if tripped.is_none() {
+                    *tripped = Some(Instant::now());
+                }
+            }
+        }
+    }
+
+    pub async fn select_failover_provider(&self, exclude_url: Option<&str>) -> Option<RpcProvider> {
+        let healthy = self.healthy_providers().await;
+        healthy
+            .into_iter()
+            .find(|p| exclude_url.map_or(true, |ex| p.url != ex))
+    }
+
     pub fn is_retryable_status(status: u16) -> bool {
         status == 429 || status >= 500
     }
@@ -1322,5 +1348,24 @@ mod tests {
             .await
             .expect("gossip task should exit promptly after shutdown")
             .expect("gossip task should not panic");
+    }
+
+    #[tokio::test]
+    async fn test_select_failover_provider_and_rate_limit_penalty() {
+        let registry = ProviderRegistry::new(vec![
+            make_provider("node-1", "http://node1.test"),
+            make_provider("node-2", "http://node2.test"),
+        ]);
+
+        let initial = registry.select_failover_provider(None).await;
+        assert!(initial.is_some());
+
+        let fallback = registry.select_failover_provider(Some("http://node1.test")).await;
+        assert_eq!(fallback.unwrap().url, "http://node2.test");
+
+        registry.report_rate_limit_failure("http://node1.test").await;
+        let reports = registry.provider_reports().await;
+        let n1 = reports.iter().find(|r| r.url == "http://node1.test").unwrap();
+        assert!(n1.local_score < LOCAL_PROVIDER_STARTING_SCORE);
     }
 }
