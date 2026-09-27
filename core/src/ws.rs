@@ -389,6 +389,83 @@ async fn handle_socket(mut socket: WebSocket, job_id: String, state: Arc<crate::
     tracing::info!(job_id = %job_id, "WebSocket client disconnected");
 }
 
+// ── Issue #13: WebSocket Connection & Reconnect Manager ──────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsConfig {
+    pub heartbeat_interval_secs: u64,
+    pub client_timeout_secs: u64,
+    pub buffer_capacity: usize,
+}
+
+impl Default for WsConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_secs: 15,
+            client_timeout_secs: 30,
+            buffer_capacity: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsConnectionStats {
+    pub active_connections: usize,
+    pub total_connections: u64,
+    pub total_reconnects: u64,
+    pub total_messages_buffered: u64,
+}
+
+#[derive(Clone)]
+pub struct WsConnectionManager {
+    config: WsConfig,
+    active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    total_connections: Arc<std::sync::atomic::AtomicU64>,
+    total_reconnects: Arc<std::sync::atomic::AtomicU64>,
+    total_messages_buffered: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl WsConnectionManager {
+    pub fn new(config: WsConfig) -> Self {
+        Self {
+            config,
+            active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            total_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total_reconnects: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total_messages_buffered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    pub fn register_connection(&self, is_reconnect: bool) {
+        self.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if is_reconnect {
+            self.total_reconnects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn unregister_connection(&self) {
+        self.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_buffered_messages(&self, count: u64) {
+        self.total_messages_buffered.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn stats(&self) -> WsConnectionStats {
+        WsConnectionStats {
+            active_connections: self.active_connections.load(std::sync::atomic::Ordering::Relaxed),
+            total_connections: self.total_connections.load(std::sync::atomic::Ordering::Relaxed),
+            total_reconnects: self.total_reconnects.load(std::sync::atomic::Ordering::Relaxed),
+            total_messages_buffered: self.total_messages_buffered.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    pub fn config(&self) -> &WsConfig {
+        &self.config
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -524,6 +601,28 @@ mod tests {
         // Slow consumer receives Lagged error when buffer capacity is exceeded
         let res = rx.recv().await;
         assert!(matches!(res, Err(broadcast::error::RecvError::Lagged(_))));
+    }
+
+    #[test]
+    fn test_ws_connection_manager_lifecycle() {
+        let manager = WsConnectionManager::new(WsConfig::default());
+        assert_eq!(manager.stats().active_connections, 0);
+
+        manager.register_connection(false);
+        assert_eq!(manager.stats().active_connections, 1);
+        assert_eq!(manager.stats().total_connections, 1);
+        assert_eq!(manager.stats().total_reconnects, 0);
+
+        manager.register_connection(true);
+        assert_eq!(manager.stats().active_connections, 2);
+        assert_eq!(manager.stats().total_connections, 2);
+        assert_eq!(manager.stats().total_reconnects, 1);
+
+        manager.record_buffered_messages(5);
+        assert_eq!(manager.stats().total_messages_buffered, 5);
+
+        manager.unregister_connection();
+        assert_eq!(manager.stats().active_connections, 1);
     }
 }
 
