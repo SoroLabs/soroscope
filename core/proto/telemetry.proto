@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package soroscope.telemetry.v1;
+
+message TelemetryMetric {
+  string contract_id = 1;
+  uint64 cpu_instructions = 2;
+  uint64 ram_bytes = 3;
+  uint64 ledger_read_bytes = 4;
+  uint64 ledger_write_bytes = 5;
+  uint64 timestamp = 6;
+}
+
+message StreamTelemetryRequest {
+  string contract_id = 1;
+}
+
+service TelemetryStreamService {
+  rpc StreamTelemetry(StreamTelemetryRequest) returns (stream TelemetryMetric);
+}

@@ -57,9 +57,17 @@ pub mod proto {
     tonic::include_proto!("soroscope.events.v1");
 }
 
+pub mod telemetry_proto {
+    tonic::include_proto!("soroscope.telemetry.v1");
+}
+
 use proto::event_stream_service_server::EventStreamService;
 pub use proto::event_stream_service_server::EventStreamServiceServer;
 use proto::{ContractEvent, StreamContractEventsRequest};
+
+pub use telemetry_proto::telemetry_stream_service_server::TelemetryStreamServiceServer;
+use telemetry_proto::telemetry_stream_service_server::TelemetryStreamService;
+use telemetry_proto::{StreamTelemetryRequest, TelemetryMetric};
 
 // ── Service implementation ────────────────────────────────────────────────────
 
@@ -125,6 +133,63 @@ impl EventStreamService for EventStreamServiceImpl {
                     }
                     Ok(traced_msg) => translate_event(traced_msg.payload, &cf, &etf),
                 }
+            })
+            .map(Ok);
+
+        Ok(Response::new(Box::pin(output)))
+    }
+}
+
+/// gRPC service implementation for live telemetry metric streaming.
+pub struct TelemetryStreamServiceImpl {
+    bus: Arc<SimulationBus>,
+}
+
+impl TelemetryStreamServiceImpl {
+    pub fn new(bus: Arc<SimulationBus>) -> Self {
+        Self { bus }
+    }
+}
+
+type TelemetryStream = Pin<Box<dyn Stream<Item = Result<TelemetryMetric, Status>> + Send + 'static>>;
+
+#[tonic::async_trait]
+impl TelemetryStreamService for TelemetryStreamServiceImpl {
+    type StreamTelemetryStream = TelemetryStream;
+
+    async fn stream_telemetry(
+        &self,
+        request: Request<StreamTelemetryRequest>,
+    ) -> Result<Response<Self::StreamTelemetryStream>, Status> {
+        let params = request.into_inner();
+        let target_contract_id = params.contract_id;
+
+        let receiver = self.bus.subscribe();
+        let bus_stream = BroadcastStream::new(receiver);
+
+        let output = bus_stream
+            .filter_map(move |item| match item {
+                Err(_) => None,
+                Ok(traced_msg) => match traced_msg.payload {
+                    SimulationEvent::Completed { contract_id, result } => {
+                        if target_contract_id.is_empty() || contract_id == target_contract_id {
+                            Some(TelemetryMetric {
+                                contract_id,
+                                cpu_instructions: result.resources.cpu_instructions,
+                                ram_bytes: result.resources.ram_bytes,
+                                ledger_read_bytes: result.resources.ledger_read_bytes,
+                                ledger_write_bytes: result.resources.ledger_write_bytes,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                },
             })
             .map(Ok);
 
