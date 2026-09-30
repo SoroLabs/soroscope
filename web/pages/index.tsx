@@ -19,7 +19,8 @@ import type { ContractFunction, InvocationResult } from '../lib/sorobantypes';
 import { UploadZone } from '../components/upload-zone';
 import { extractErrorDetails, createUserFriendlyMessage } from '../lib/errorHandling';
 import { ErrorBoundary } from '../components/ErrorBoundary';
-import { Toast } from '../components/Toast';
+import { ToastStack, type ToastItem } from '../components/Toast';
+import { dismissToast, enqueueToast } from '../lib/toastQueue.cjs';
 import { ContractInteraction } from "../components/ContractInteraction";
 import { ErrorBoundary } from "../components/ErrorBoundary";
 import { FunctionSidebar } from "../components/FunctionSidebar";
@@ -110,7 +111,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [wasmFile, setWasmFile] = useState<File | null>(null);
   const [wasmData, setWasmData] = useState<string | null>(null);
-  const [toastNotification, setToastNotification] = useState<{ message: string; type: 'error' | 'success' } | null>(null);
+  const [toastNotifications, setToastNotifications] = useState<ToastItem[]>([]);
 
   const [uploadResetKey, setUploadResetKey] = useState(0);
   const mockTransactions = useMemo(() => generateMockTransactions(47), []);
@@ -240,7 +241,11 @@ export default function Home() {
       };
       setCurrentResult(errorResult);
       addToHistory(errorResult);
-      setToastNotification({ message: errorMessage, type: 'error' });
+      setToastNotifications((current) => enqueueToast(current, {
+        id: `${Date.now()}-${Math.random()}`,
+        message: errorMessage,
+        type: 'error',
+      }));
       });
     } finally {
       setLoading(false);
@@ -678,13 +683,10 @@ export default function Home() {
         <TransactionConfetti />
       {/* Wallet Modal */}
       <WalletModal />
-      {toastNotification && (
-        <Toast
-          message={toastNotification.message}
-          type={toastNotification.type}
-          onClose={() => setToastNotification(null)}
-        />
-      )}
+      <ToastStack
+        toasts={toastNotifications}
+        onClose={(id) => setToastNotifications((current) => dismissToast(current, id))}
+      />
     </>
   );
 }
