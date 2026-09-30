@@ -3,8 +3,6 @@ name = "soroscope-core"
 version = "0.1.0"
 edition = "2021"
 
-[workspace]
-
 [lib]
 name = "soroscope_core"
 path = "src/lib.rs"
