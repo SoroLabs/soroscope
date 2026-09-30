@@ -1371,6 +1371,7 @@ async fn analyze_wasm(
         call_graph: None,
         state_snapshot: None,
         protocol_version: payload.protocol_version.unwrap_or(20),
+        fee_calibration: Default::default(),
     };
 
     let report = to_report(&sim_result, &state.insights_engine, None);
@@ -3303,6 +3304,7 @@ mod tests {
             call_graph: None,
             state_snapshot: None,
             protocol_version: 0,
+            fee_calibration: Default::default(),
         };
 
         let insights_engine = InsightsEngine::new();

@@ -102,6 +102,7 @@ mod tests {
                 call_graph: None,
                 state_snapshot: None,
                 protocol_version: 0,
+                fee_calibration: Default::default(),
             })
     }
 

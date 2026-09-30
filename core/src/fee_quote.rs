@@ -87,6 +87,20 @@ impl SorobanFeeConfig {
         })
     }
 
+    /// Return a checked-in table only when its protocol matches the request.
+    pub fn for_protocol(protocol: u32) -> Option<&'static SorobanFeeConfig> {
+        let config = Self::checked_in();
+        (config.protocol == protocol).then_some(config)
+    }
+
+    /// Stable content hash identifying the fee-parameter table used by a quote.
+    pub fn content_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let bytes = serde_json::to_vec(self).expect("fee config serialization is infallible");
+        format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+    }
+
     /// Bytes of temporary entry rent that a single ledger of TTL costs, i.e. the
     /// divisor in the rent formula.
     fn temporary_rent_divisor(&self) -> u128 {
@@ -164,6 +178,61 @@ impl SorobanFeeConfig {
             self.fee_per_write_1kb.max(0) as u128,
             self.data_size_1kb_increment.max(1) as u128,
         ))
+    }
+}
+
+/// Resource-side fee components, all denominated in stroops.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalResourceFee {
+    pub resource_fee: u64,
+    pub rent_fee: u64,
+    pub refundable: u64,
+    pub non_refundable: u64,
+}
+
+/// Local fee calibration attached to a simulation result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeeCalibration {
+    pub cost_parameter_hash: String,
+    pub local_resource_fee_stroops: u64,
+    pub rpc_min_resource_fee_stroops: Option<u64>,
+    pub delta_stroops: Option<i64>,
+    /// Present when the local fee differs from the RPC minimum by more than 1%.
+    pub calibration_error: Option<String>,
+}
+
+impl FeeCalibration {
+    pub fn local(local_fee: u64, config: &SorobanFeeConfig) -> Self {
+        Self {
+            cost_parameter_hash: config.content_hash(),
+            local_resource_fee_stroops: local_fee,
+            ..Default::default()
+        }
+    }
+
+    pub fn compare_rpc(
+        local_fee: u64,
+        rpc_min_resource_fee: Option<u64>,
+        config: &SorobanFeeConfig,
+    ) -> Self {
+        let mut calibration = Self::local(local_fee, config);
+        calibration.rpc_min_resource_fee_stroops = rpc_min_resource_fee;
+        if let Some(rpc_fee) = rpc_min_resource_fee {
+            let delta = local_fee as i128 - rpc_fee as i128;
+            calibration.delta_stroops =
+                Some(delta.clamp(i64::MIN as i128, i64::MAX as i128) as i64);
+            let exceeds_one_percent = if rpc_fee == 0 {
+                local_fee != 0
+            } else {
+                delta.unsigned_abs().saturating_mul(100) > rpc_fee as u128
+            };
+            if exceeds_one_percent {
+                calibration.calibration_error = Some(format!(
+                    "local resource fee differs from RPC minResourceFee by more than 1% (local={local_fee}, rpc={rpc_fee})"
+                ));
+            }
+        }
+        calibration
     }
 }
 
@@ -506,6 +575,36 @@ impl ResourceFeeQuote {
     }
 }
 
+/// Price measured resources and caller-supplied footprint sizes using a fixed
+/// protocol fee table. The resource counters are already metered by the host's
+/// protocol cost parameters; this function converts them to stroops.
+pub fn price_local_resource_fee(
+    resources: &crate::simulation::SorobanResources,
+    footprint: &FeeQuoteInput,
+    durability_split: DurabilitySplit,
+    config: &SorobanFeeConfig,
+) -> LocalResourceFee {
+    let input = FeeQuoteInput {
+        cpu_instructions: resources.cpu_instructions,
+        ledger_read_bytes: resources.ledger_read_bytes,
+        ledger_write_bytes: resources.ledger_write_bytes,
+        transaction_size_bytes: resources.transaction_size_bytes,
+        ..*footprint
+    };
+    let quote = ResourceFeeQuote::estimate(&input, durability_split, config);
+    let rent_fee = quote
+        .breakdown
+        .temporary_rent
+        .saturating_add(quote.breakdown.persistent_rent);
+    let refundable = quote.estimated_refund.unwrap_or(0);
+    LocalResourceFee {
+        resource_fee: quote.gross_resource_fee,
+        rent_fee,
+        refundable,
+        non_refundable: quote.gross_resource_fee.saturating_sub(refundable),
+    }
+}
+
 fn fee_per_increment(resource_value: u128, fee_rate: u128, increment: u128) -> u64 {
     div_ceil(resource_value.saturating_mul(fee_rate), increment.max(1))
 }
@@ -825,6 +924,89 @@ mod tests {
         assert_eq!(quote.breakdown.bandwidth_bytes, 1624);
         assert_eq!(quote.breakdown.temporary_rent, 0);
         assert_eq!(quote.gross_resource_fee, BASE_FEE);
+    }
+
+    #[test]
+    fn local_read_only_call_matches_hand_computed_fee() {
+        let resources = crate::simulation::SorobanResources {
+            cpu_instructions: 100_000,
+            ledger_read_bytes: 1024,
+            ..Default::default()
+        };
+        let input = FeeQuoteInput {
+            read_entries: 1,
+            ..Default::default()
+        };
+        let priced =
+            price_local_resource_fee(&resources, &input, DurabilitySplit::unknown(), config());
+
+        // 250 instructions + 6250 read entry + 1786 read bytes + 4757 history.
+        assert_eq!(priced.resource_fee, 13_043);
+        assert_eq!(priced.rent_fee, 0);
+        assert_eq!(priced.refundable, 0);
+        assert_eq!(priced.non_refundable, 13_043);
+    }
+
+    #[test]
+    fn local_persistent_write_fixture_and_write_rate_protocol_bump() {
+        let resources = crate::simulation::SorobanResources {
+            cpu_instructions: 100_000,
+            ledger_write_bytes: 1024,
+            ..Default::default()
+        };
+        let input = FeeQuoteInput {
+            write_entries: 1,
+            rent_bytes: Some(1024),
+            ..Default::default()
+        };
+        let split = DurabilitySplit::persistent_only(1024);
+        let baseline = price_local_resource_fee(&resources, &input, split, config());
+
+        // 250 CPU + 6250 read entry + 10000 write entry + 12000 write bytes
+        // + 4757 history + 6 persistent rent.
+        assert_eq!(baseline.resource_fee, 33_263);
+        assert_eq!(baseline.rent_fee, 6);
+        assert_eq!(baseline.refundable, 0);
+        assert_eq!(baseline.non_refundable, 33_263);
+
+        let mut bumped = config().clone();
+        bumped.protocol += 1;
+        bumped.fee_per_write_1kb = 13_000;
+        let bumped_write = price_local_resource_fee(&resources, &input, split, &bumped);
+        let read_only = crate::simulation::SorobanResources {
+            ledger_read_bytes: 1024,
+            ..Default::default()
+        };
+        let read_only_input = FeeQuoteInput {
+            read_entries: 1,
+            ..Default::default()
+        };
+        let baseline_read = price_local_resource_fee(
+            &read_only,
+            &read_only_input,
+            DurabilitySplit::unknown(),
+            config(),
+        );
+        let bumped_read = price_local_resource_fee(
+            &read_only,
+            &read_only_input,
+            DurabilitySplit::unknown(),
+            &bumped,
+        );
+        assert_eq!(baseline_read, bumped_read);
+        assert_eq!(bumped_write.resource_fee, 34_264);
+        assert_ne!(config().content_hash(), bumped.content_hash());
+    }
+
+    #[test]
+    fn rpc_fee_delta_over_one_percent_is_a_calibration_error() {
+        let within_tolerance = FeeCalibration::compare_rpc(1_010, Some(1_000), config());
+        assert_eq!(within_tolerance.delta_stroops, Some(10));
+        assert_eq!(within_tolerance.calibration_error, None);
+
+        let outside_tolerance = FeeCalibration::compare_rpc(1_011, Some(1_000), config());
+        assert_eq!(outside_tolerance.delta_stroops, Some(11));
+        assert!(outside_tolerance.calibration_error.is_some());
     }
 
     /// Temporary-only write of 10240 rent bytes.
