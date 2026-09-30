@@ -4,16 +4,25 @@
 
 The EmergencyGuard trait provides a standardized, reusable mechanism for emergency pause and admin management across all contracts in the workspace. It features:
 
-- **Granular Pausing**: Pause specific operations (swaps, deposits, withdrawals, transfers, minting, burning) independently
+- **Standard Pause Modes**: `PauseType` reports `Unpaused`, `PartialPause`, or `FullPause`; `PauseMask` tracks individual operations
 - **Multi-Signature Support**: Built-in support for multi-sig authorization patterns
-- **Role Separation**: Guardians can trigger pauses while admins can resume and manage role assignments
+- **Role Separation**: Guardians can pause while admins can resume and manage role assignments
+- **Auto-Unpause**: Full emergency pauses expire after a quorum-configured delay (one day by default)
 - **Admin Rotation**: Securely rotate admin authority without transferring funds
 - **Efficient Storage**: Uses bitmask for compact pause state storage
 - **Event Logging**: Logs all administrative actions for audit trails
 
 ## Architecture
 
-### PauseType (Bitmask-based)
+### PauseType and PauseMask
+
+`PauseType` reports the circuit breaker's overall mode:
+
+```rust
+pub enum PauseType { Unpaused, PartialPause, FullPause }
+```
+
+Individual operation flags are retained in `PauseMask` for compatibility with contracts that pause only selected operations.
 
 Operations are represented as bit flags for efficient storage:
 
@@ -29,10 +38,12 @@ pub const BURN: u32 = 1 << 5;      // 0x00000020
 ### Storage Structure
 
 ```
-DataKey::PauseState      -> PauseType(u32)      // Bitmask of paused operations
+DataKey::PauseState      -> PauseMask(u32)      // Bitmask of paused operations
 DataKey::Admins          -> Vec<Address>        // List of authorized admins
 DataKey::Guardians       -> Vec<Address>        // List of authorized guardians
 DataKey::SignatureThreshold -> u32              // Required multi-sig threshold
+DataKey::AutoUnpauseDelay -> u64                 // Delay in seconds; defaults to 86400
+DataKey::AutoUnpauseAt    -> u64                 // Expiry timestamp for a full emergency pause
 ```
 
 ### Multi-Signature Support
