@@ -97,6 +97,13 @@ export const useNetwork = () => {
   return context;
 };
 
+/**
+ * Same as `useNetwork` but returns `undefined` outside a `NetworkProvider`.
+ * Use this in reusable components that must render both inside and outside
+ * the app shell (e.g. storybook, isolated tests).
+ */
+export const useOptionalNetwork = () => useContext(NetworkContext);
+
 export const STORAGE_KEY = "soroscope_selected_network";
 
 export const NetworkProvider = ({ children }: { children: React.ReactNode }) => {
