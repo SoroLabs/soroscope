@@ -33,6 +33,7 @@ import { ResultViewer } from "../components/Resultviewer";
 import { ResultViewerSkeleton } from "../components/ResultViewerSkeleton";
 import { FeeEstimationPreview } from "../components/FeeEstimationPreview";
 import { SyntaxHighlighter } from "../components/SyntaxHighlighter";
+import { WasmDisassemblyViewer } from "../components/WasmDisassemblyViewer";
 import { UploadZone } from "../components/upload-zone";
 import { CopyButton } from "../components/CopyButton";
 import { WalletBalanceCard } from "../components/WalletBalanceCard";
@@ -90,7 +91,7 @@ const SchemaVisualizer = dynamic(
   },
 );
 
-const VALID_TABS: NavTab[] = ["explorer", "schema", "history", "transactions"];
+const VALID_TABS: NavTab[] = ["explorer", "schema", "disassembly", "history", "transactions"];
   type TransactionStatus,
 } from "../lib/sorobantypes";
 import { DEFAULT_TRANSACTION_FILTER, type TransactionFilter } from "../lib/transactionFilters";
@@ -302,6 +303,11 @@ export default function Home() {
           pageTitle: 'SoroScope | Transaction History Telemetry',
           seoDescription: 'Monitor real-time Soroban contract events, transaction fees, and telemetry records.',
         };
+      case 'disassembly':
+        return {
+          pageTitle: 'SoroScope | WASM Disassembly Viewer',
+          seoDescription: 'Decode Soroban contract WASM bytecode and cross-highlight opcodes against the Rust source.',
+        };
       case 'history':
         return {
           pageTitle: 'SoroScope | Invocation History Analysis',
@@ -414,6 +420,13 @@ export default function Home() {
               />
             </ErrorBoundary>
           </div>
+
+          {/* Side-by-side Rust/WASM panes need the full content width. */}
+          {tab === 'disassembly' && (
+            <section className="mb-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
+              <WasmDisassemblyViewer wasmFile={wasmFile} />
+            </section>
+          )}
 
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             <div className="space-y-4">
@@ -568,6 +581,8 @@ export default function Home() {
                 )
               ) : tab === 'schema' ? (
                 <SchemaVisualizer report={analysisReport} />
+              ) : tab === 'disassembly' ? (
+                <p className="py-8 text-center text-slate-500">Disassembly is shown above.</p>
               ) : tab === 'transactions' ? (
                 <TransactionHistoryTable transactions={mockTransactions} />
               ) : tab === 'analytics' ? (
