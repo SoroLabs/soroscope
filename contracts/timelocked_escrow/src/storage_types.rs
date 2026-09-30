@@ -8,6 +8,7 @@ pub enum DataKey {
     Config,
     Guardians,
     Approvals,
+    RecoveryApprovals,
     ApprovalEpoch,
 }
 
@@ -22,6 +23,7 @@ pub struct EscrowConfig {
     pub amount: i128,
     pub unlock_ledger: u32,
     pub is_released: bool,
+    pub is_recovered: bool,
     pub is_cancelled: bool,
     pub cancellation_fee_bps: u32,
     pub protocol_vault: Address,
@@ -46,6 +48,17 @@ pub enum Error {
     InvalidGuardianCount = 11,
     DuplicateGuardian = 12,
     CancellationFeeTooHigh = 13,
+    InvalidTimelockExtension = 14,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum EscrowStatus {
+    Initialized,
+    Funded,
+    Released,
+    Recovered,
+    Cancelled,
 }
 
 // ── Event Structs ─────────────────────────────────────────────
@@ -103,4 +116,11 @@ pub struct GuardianRotationEvent {
     pub old_guardians: Vec<Address>,
     pub new_guardians: Vec<Address>,
     pub new_epoch: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct StatusChangeEvent {
+    pub previous_status: EscrowStatus,
+    pub new_status: EscrowStatus,
 }
