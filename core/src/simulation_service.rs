@@ -1,5 +1,6 @@
 #![allow(clippy::type_complexity)]
 
+use crate::comparison::ProtocolSnapshot;
 use crate::errors::AppError;
 use reqwest::Client;
 use rusqlite::{params, Connection};
@@ -17,6 +18,7 @@ pub struct SimulationMetric {
     pub cpu_instructions: u64,
     pub ram_bytes: u64,
     pub ledger_footprint: u64,
+    pub protocol_snapshot: Option<ProtocolSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -25,6 +27,7 @@ pub struct HistoricalAverages {
     pub avg_cpu_instructions: f64,
     pub avg_ram_bytes: f64,
     pub avg_ledger_footprint: f64,
+    pub protocol_snapshot: Option<ProtocolSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,6 +43,7 @@ pub struct DriftDetail {
 pub struct AnalysisResult {
     pub has_historical_baseline: bool,
     pub historical: Option<HistoricalAverages>,
+    pub incomparable: Option<String>,
     pub outliers: Vec<DriftDetail>,
     pub alert_triggered: bool,
 }
@@ -81,6 +85,11 @@ impl SimulationService {
                 cpu_instructions INTEGER NOT NULL,
                 ram_bytes INTEGER NOT NULL,
                 ledger_footprint INTEGER NOT NULL,
+                protocol_version INTEGER,
+                network_passphrase TEXT,
+                cost_params_hash TEXT,
+                ledger_sequence INTEGER,
+                limits_source TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -100,6 +109,30 @@ impl SimulationService {
             ",
         )
         .map_err(|e| AppError::Internal(format!("Failed to create metrics schema: {e}")))?;
+
+        let existing_columns: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(simulation_metrics)")
+                .map_err(|e| AppError::Internal(format!("Failed to inspect metrics schema: {e}")))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| AppError::Internal(format!("Failed to read metrics schema: {e}")))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AppError::Internal(format!("Failed to read metrics schema: {e}")))?
+        };
+
+        for (column, ddl) in [
+            ("protocol_version", "ALTER TABLE simulation_metrics ADD COLUMN protocol_version INTEGER"),
+            ("network_passphrase", "ALTER TABLE simulation_metrics ADD COLUMN network_passphrase TEXT"),
+            ("cost_params_hash", "ALTER TABLE simulation_metrics ADD COLUMN cost_params_hash TEXT"),
+            ("ledger_sequence", "ALTER TABLE simulation_metrics ADD COLUMN ledger_sequence INTEGER"),
+            ("limits_source", "ALTER TABLE simulation_metrics ADD COLUMN limits_source TEXT"),
+        ] {
+            if !existing_columns.iter().any(|c| c == column) {
+                conn.execute(ddl, [])
+                    .map_err(|e| AppError::Internal(format!("Failed to migrate metrics schema: {e}")))?;
+            }
+        }
         Ok(())
     }
 
@@ -109,8 +142,28 @@ impl SimulationService {
     ) -> Result<AnalysisResult, AppError> {
         let baseline =
             self.load_historical_stats(&metric.contract, &metric.method, &metric.code_hash)?;
+
+        let incomparable = baseline.as_ref().and_then(|(historical, _)| {
+            match (
+                historical.protocol_snapshot.as_ref(),
+                metric.protocol_snapshot.as_ref(),
+            ) {
+                (Some(hist), Some(curr)) if hist.cost_params_hash != curr.cost_params_hash => {
+                    Some(format!(
+                        "cost_params_hash mismatch: baseline {} vs current {}",
+                        hist.cost_params_hash, curr.cost_params_hash
+                    ))
+                }
+                _ => None,
+            }
+        });
+
         let outliers = if let Some((ref historical, ref rows)) = baseline {
-            self.detect_outliers(&metric, historical, rows)
+            if incomparable.is_some() {
+                Vec::new()
+            } else {
+                self.detect_outliers(&metric, historical, rows)
+            }
         } else {
             Vec::new()
         };
@@ -126,6 +179,7 @@ impl SimulationService {
         Ok(AnalysisResult {
             has_historical_baseline: baseline.is_some(),
             historical: baseline.as_ref().map(|(historical, _)| historical.clone()),
+            incomparable,
             outliers,
             alert_triggered,
         })
@@ -135,8 +189,11 @@ impl SimulationService {
         let conn = self.connect()?;
         conn.execute(
             "
-            INSERT INTO simulation_metrics (contract, method, code_hash, cpu_instructions, ram_bytes, ledger_footprint)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO simulation_metrics (
+                contract, method, code_hash, cpu_instructions, ram_bytes, ledger_footprint,
+                protocol_version, network_passphrase, cost_params_hash, ledger_sequence, limits_source
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
             params![
                 metric.contract,
@@ -144,7 +201,12 @@ impl SimulationService {
                 metric.code_hash,
                 metric.cpu_instructions as i64,
                 metric.ram_bytes as i64,
-                metric.ledger_footprint as i64
+                metric.ledger_footprint as i64,
+                metric.protocol_snapshot.as_ref().map(|s| s.protocol_version as i64),
+                metric.protocol_snapshot.as_ref().map(|s| s.network_passphrase.clone()),
+                metric.protocol_snapshot.as_ref().map(|s| s.cost_params_hash.clone()),
+                metric.protocol_snapshot.as_ref().map(|s| s.ledger_sequence as i64),
+                metric.protocol_snapshot.as_ref().map(|s| s.limits_source.clone()),
             ],
         )
         .map_err(|e| AppError::Internal(format!("Failed to insert simulation metric: {e}")))?;
@@ -187,9 +249,12 @@ impl SimulationService {
         let mut stmt = conn
             .prepare(
                 "
-                SELECT cpu_instructions, ram_bytes, ledger_footprint
+                SELECT cpu_instructions, ram_bytes, ledger_footprint,
+                       protocol_version, network_passphrase, cost_params_hash,
+                       ledger_sequence, limits_source
                 FROM simulation_metrics
                 WHERE contract = ?1 AND method = ?2 AND code_hash = ?3
+                  AND cost_params_hash IS NOT NULL
                 ",
             )
             .map_err(|e| AppError::Internal(format!("Failed to prepare history query: {e}")))?;
@@ -197,20 +262,39 @@ impl SimulationService {
         let rows = stmt
             .query_map(params![contract, method, code_hash], |row| {
                 Ok((
-                    row.get::<_, i64>(0)? as u64,
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, i64>(2)? as u64,
+                    (
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                    ),
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .map_err(|e| AppError::Internal(format!("Failed to query historical metrics: {e}")))?;
 
-        let data: Result<Vec<_>, _> = rows.collect();
-        let data = data
+        let raw: Result<Vec<_>, _> = rows.collect();
+        let raw = raw
             .map_err(|e| AppError::Internal(format!("Failed to read historical metrics: {e}")))?;
 
-        if data.is_empty() {
+        if raw.is_empty() {
             return Ok(None);
         }
+
+        let snapshot = raw.iter().find_map(|(_, pv, np, cph, ls, lsrc)| {
+            Some(ProtocolSnapshot {
+                protocol_version: (*pv)? as u32,
+                network_passphrase: np.clone()?,
+                cost_params_hash: cph.clone()?,
+                ledger_sequence: (*ls)? as u64,
+                limits_source: lsrc.clone()?,
+            })
+        });
+
+        let data: Vec<(u64, u64, u64)> = raw.into_iter().map(|(row, _, _, _, _, _)| row).collect();
 
         let n = data.len() as f64;
         let cpu_sum: f64 = data.iter().map(|r| r.0 as f64).sum();
@@ -223,6 +307,7 @@ impl SimulationService {
                 avg_cpu_instructions: cpu_sum / n,
                 avg_ram_bytes: ram_sum / n,
                 avg_ledger_footprint: ledger_sum / n,
+                protocol_snapshot: snapshot,
             },
             data,
         )))
@@ -402,6 +487,7 @@ mod tests {
             cpu_instructions: cpu,
             ram_bytes: ram,
             ledger_footprint: ledger,
+            protocol_snapshot: None,
         }
     }
 
@@ -411,6 +497,26 @@ mod tests {
             row.get::<_, i64>(0)
         })
         .expect("count alerts") as usize
+    }
+
+    fn metric_with_snapshot(
+        contract: &str,
+        method: &str,
+        code_hash: &str,
+        cpu: u64,
+        ram: u64,
+        ledger: u64,
+        cost_params_hash: &str,
+    ) -> SimulationMetric {
+        let mut m = metric(contract, method, code_hash, cpu, ram, ledger);
+        m.protocol_snapshot = Some(ProtocolSnapshot {
+            protocol_version: 22,
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            cost_params_hash: cost_params_hash.to_string(),
+            ledger_sequence: 1_000,
+            limits_source: "rpc".to_string(),
+        });
+        m
     }
 
     #[tokio::test]
@@ -449,6 +555,7 @@ mod tests {
         assert!(result.has_historical_baseline);
         assert!(result.alert_triggered);
         assert!(!result.outliers.is_empty());
+        assert!(result.incomparable.is_none());
         assert_eq!(alert_count(&db_path.0), 1);
     }
 
@@ -471,6 +578,7 @@ mod tests {
         assert!(!result.has_historical_baseline);
         assert!(!result.alert_triggered);
         assert!(result.outliers.is_empty());
+        assert!(result.incomparable.is_none());
         assert_eq!(alert_count(&db_path.0), 0);
     }
 
@@ -505,6 +613,88 @@ mod tests {
             .z_score
             .map(|z| z.abs() > DEFAULT_ZSCORE_THRESHOLD)
             .unwrap_or(false));
+        assert!(result.incomparable.is_none());
         assert_eq!(alert_count(&db_path.0), 1);
+    }
+
+    #[tokio::test]
+    async fn different_cost_params_hash_is_incomparable() {
+        let db_path = TempDbPath::new("different_cost_params_hash_is_incomparable");
+        let service =
+            SimulationService::new(&db_path.0, None).expect("initialize simulation service");
+
+        service
+            .record_and_analyze(metric_with_snapshot(
+                "token", "mint", "hash-a", 100, 200, 300, "params-1",
+            ))
+            .await
+            .expect("seed metric should succeed");
+
+        let result = service
+            .record_and_analyze(metric_with_snapshot(
+                "token", "mint", "hash-a", 1_000, 2_000, 3_000, "params-2",
+            ))
+            .await
+            .expect("second metric should succeed");
+
+        assert!(result.has_historical_baseline);
+        assert!(result.incomparable.is_some());
+        assert!(result.outliers.is_empty());
+        assert!(!result.alert_triggered);
+        assert_eq!(alert_count(&db_path.0), 0);
+    }
+
+    #[tokio::test]
+    async fn same_cost_params_hash_still_flags_cpu_regression() {
+        let db_path = TempDbPath::new("same_cost_params_hash_still_flags_cpu_regression");
+        let service =
+            SimulationService::new(&db_path.0, None).expect("initialize simulation service");
+
+        service
+            .record_and_analyze(metric_with_snapshot(
+                "token", "mint", "hash-a", 100, 200, 300, "params-1",
+            ))
+            .await
+            .expect("seed metric should succeed");
+
+        let result = service
+            .record_and_analyze(metric_with_snapshot(
+                "token", "mint", "hash-a", 130, 200, 300, "params-1",
+            ))
+            .await
+            .expect("second metric should succeed");
+
+        assert!(result.has_historical_baseline);
+        assert!(result.incomparable.is_none());
+        assert!(result.alert_triggered);
+        assert!(result
+            .outliers
+            .iter()
+            .any(|d| d.metric == "cpu_instructions" && d.percent_shift > 0.10));
+        assert_eq!(alert_count(&db_path.0), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_rows_without_snapshot_are_excluded_from_baseline() {
+        let db_path = TempDbPath::new("legacy_rows_without_snapshot_are_excluded");
+        let service =
+            SimulationService::new(&db_path.0, None).expect("initialize simulation service");
+
+        service
+            .record_and_analyze(metric("token", "mint", "hash-a", 100, 200, 300))
+            .await
+            .expect("legacy metric should succeed");
+
+        let result = service
+            .record_and_analyze(metric_with_snapshot(
+                "token", "mint", "hash-a", 1_000, 2_000, 3_000, "params-1",
+            ))
+            .await
+            .expect("snapshot metric should succeed");
+
+        assert!(!result.has_historical_baseline);
+        assert!(result.incomparable.is_none());
+        assert!(!result.alert_triggered);
+        assert_eq!(alert_count(&db_path.0), 0);
     }
 }
