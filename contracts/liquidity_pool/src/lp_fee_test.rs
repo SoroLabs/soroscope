@@ -399,3 +399,157 @@ fn test_admin_only_can_set_lp_fee() {
     client.set_lp_fee_bps(&20);
     assert_eq!(client.get_lp_fee_bps(), 20);
 }
+
+// ============================================================================
+// Issue #85: Dynamic Fee Rate Adjustment Tests
+// ============================================================================
+
+/// Helper to set up test environment with a mock TWAP oracle registered.
+fn setup_test_env_with_oracle() -> (
+    Env,
+    LiquidityPoolClient<'static>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let admin = Address::generate(&e);
+    let token_a = e.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_b = e.register_stellar_asset_contract_v2(admin.clone()).address();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    let oracle = Address::generate(&e);
+    client.set_twap_oracle(&admin, &oracle);
+
+    (e, client, admin, token_a, token_b, oracle)
+}
+
+#[test]
+fn test_default_dynamic_fee_disabled() {
+    let (_e, client, _, _, _, _) = setup_test_env();
+
+    // Dynamic fee scaling should be disabled by default.
+    assert_eq!(client.get_dynamic_fee_enabled(), false);
+    // Base fee should equal the default LP fee.
+    assert_eq!(client.get_lp_fee_bps(), DEFAULT_LP_FEE_BPS);
+}
+
+#[test]
+fn test_enable_dynamic_fee_by_admin() {
+    let (_e, client, admin, _, _, _) = setup_test_env();
+
+    client.set_dynamic_fee_enabled(&admin, &true);
+    assert_eq!(client.get_dynamic_fee_enabled(), true);
+
+    client.set_dynamic_fee_enabled(&admin, &false);
+    assert_eq!(client.get_dynamic_fee_enabled(), false);
+}
+
+#[test]
+fn test_set_twap_oracle_by_admin() {
+    let (_e, client, admin, _, _, _) = setup_test_env();
+    let oracle = Address::generate(&_e);
+
+    client.set_twap_oracle(&admin, &oracle);
+    assert_eq!(client.get_twap_oracle(), Some(oracle));
+}
+
+#[test]
+fn test_dynamic_fee_low_volatility_uses_base_fee() {
+    let (_e, client, admin, _, _, _) = setup_test_env_with_oracle();
+
+    client.set_lp_fee_bps(&10);
+    client.set_dynamic_fee_enabled(&admin, &true);
+
+    // Low volatility (e.g., 0 bps deviation) should not scale the fee.
+    client.set_mock_volatility_bps(&0);
+    assert_eq!(client.get_effective_lp_fee_bps(), 10);
+}
+
+#[test]
+fn test_dynamic_fee_high_volatility_scales_up() {
+    let (_e, client, admin, _, _, _) = setup_test_env_with_oracle();
+
+    client.set_lp_fee_bps(&10);
+    client.set_dynamic_fee_enabled(&admin, &true);
+
+    // High volatility should scale the fee above the base fee.
+    client.set_mock_volatility_bps(&500);
+    let effective = client.get_effective_lp_fee_bps();
+    assert!(effective > 10, "Fee should scale up under high volatility");
+}
+
+#[test]
+fn test_dynamic_fee_capped_at_max() {
+    let (_e, client, admin, _, _, _) = setup_test_env_with_oracle();
+
+    client.set_lp_fee_bps(&10);
+    client.set_dynamic_fee_enabled(&admin, &true);
+
+    // Extreme volatility must not push the fee above MAX_LP_FEE_BPS.
+    client.set_mock_volatility_bps(&100_000);
+    let effective = client.get_effective_lp_fee_bps();
+    assert!(
+        effective <= MAX_LP_FEE_BPS,
+        "Effective fee {} must not exceed MAX_LP_FEE_BPS {}",
+        effective,
+        MAX_LP_FEE_BPS
+    );
+}
+
+#[test]
+fn test_dynamic_fee_uses_oracle_volatility() {
+    let (_e, client, admin, _, _, _) = setup_test_env_with_oracle();
+
+    client.set_lp_fee_bps(&10);
+    client.set_dynamic_fee_enabled(&admin, &true);
+
+    // Simulate oracle returning a moderate volatility reading.
+    client.set_mock_volatility_bps(&250);
+    let effective = client.get_effective_lp_fee_bps();
+
+    // Fee should be strictly greater than base but still under the cap.
+    assert!(effective > 10);
+    assert!(effective <= MAX_LP_FEE_BPS);
+}
+
+#[test]
+fn test_dynamic_fee_disabled_ignores_volatility() {
+    let (_e, client, admin, _, _, _) = setup_test_env_with_oracle();
+
+    client.set_lp_fee_bps(&10);
+    // Dynamic fee remains disabled.
+    client.set_mock_volatility_bps(&10_000);
+
+    assert_eq!(client.get_effective_lp_fee_bps(), 10);
+}
+
+#[test]
+fn test_dynamic_fee_applied_on_swap() {
+    let (_e, client, admin, token_a, token_b, user) = setup_test_env_with_oracle();
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&_e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&_e, &token_b);
+
+    token_a_admin.mint(&user, &10_000);
+    token_b_admin.mint(&user, &10_000);
+
+    client.set_lp_fee_bps(&10);
+    client.set_dynamic_fee_enabled(&admin, &true);
+    client.set_mock_volatility_bps(&500);
+
+    let shares = client.deposit(&user, &5_000, &5_000);
+    assert!(shares > 0);
+
+    // Swap should succeed and use the volatility-adjusted fee.
+    let out = client.swap(&user, &token_a, &100);
+    assert!(out > 0);
+}

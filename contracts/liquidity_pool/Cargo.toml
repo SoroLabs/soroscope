@@ -9,8 +9,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 soroban-sdk.workspace = true
 emergency_guard = { path = "../emergency_guard", default-features = false }
+twap_oracle = { path = "../twap_oracle", default-features = false }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 emergency_guard = { path = "../emergency_guard" }
+twap_oracle = { path = "../twap_oracle" }
 proptest = "1.0"
