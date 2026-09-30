@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { useRouter } from "next/router";
 import {
@@ -15,6 +15,7 @@ import {
   Settings,
   Calculator,
   BarChart3,
+  Wifi,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { ConnectButton } from "./ConnectButton";
@@ -40,6 +41,60 @@ export const HEADER_QUICK_LINKS: QuickNavItem[] = [
   { id: "settings", label: "Settings", Icon: Settings, kind: "route", href: "/settings" },
 ];
 
+export type CongestionLevel = "low" | "medium" | "high";
+
+export interface CongestionState {
+  level: CongestionLevel;
+  baseFee: number;
+  recommendedFee: number;
+}
+
+const CONGESTION_STYLES: Record<
+  CongestionLevel,
+  { label: string; dot: string; badge: string; text: string }
+> = {
+  low: {
+    label: "Low",
+    dot: "bg-emerald-400",
+    badge: "border-emerald-500/40 bg-emerald-500/10",
+    text: "text-emerald-300",
+  },
+  medium: {
+    label: "Medium",
+    dot: "bg-amber-400",
+    badge: "border-amber-500/40 bg-amber-500/10",
+    text: "text-amber-300",
+  },
+  high: {
+    label: "High",
+    dot: "bg-red-500",
+    badge: "border-red-500/40 bg-red-500/10",
+    text: "text-red-300",
+  },
+};
+
+export function classifyCongestion(baseFee: number): CongestionLevel {
+  if (baseFee >= 1000) return "high";
+  if (baseFee >= 200) return "medium";
+  return "low";
+}
+
+const FALLBACK_BASE_FEE = 100;
+const CONGESTION_POLL_MS = 15000;
+
+async function fetchLedgerBaseFee(): Promise<number> {
+  const res = await fetch("/api/network/fees", {
+    headers: { accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`Fee endpoint responded ${res.status}`);
+  const data = (await res.json()) as { baseFee?: number; base_fee?: number };
+  const fee = data.baseFee ?? data.base_fee;
+  if (typeof fee !== "number" || !Number.isFinite(fee)) {
+    throw new Error("Malformed fee payload");
+  }
+  return fee;
+}
+
 export function isHeaderQuickLinkActive(item: QuickNavItem, activeTab: NavTab, pathname: string): boolean {
   if (item.kind === "route") return pathname === item.href;
   return activeTab === item.tab;
@@ -62,6 +117,41 @@ export function HeaderNav({ tab, setTab }: HeaderNavProps) {
   const router = useRouter();
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
+
+  const [congestion, setCongestion] = useState<CongestionState>({
+    level: "low",
+    baseFee: FALLBACK_BASE_FEE,
+    recommendedFee: FALLBACK_BASE_FEE,
+  });
+
+  const refreshCongestion = useCallback(async () => {
+    try {
+      const baseFee = await fetchLedgerBaseFee();
+      setCongestion({
+        level: classifyCongestion(baseFee),
+        baseFee,
+        recommendedFee: Math.max(baseFee, Math.ceil(baseFee * 1.5)),
+      });
+    } catch {
+      setCongestion((prev) => ({
+        ...prev,
+        recommendedFee: Math.max(prev.baseFee, Math.ceil(prev.baseFee * 1.5)),
+      }));
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => {
+      if (!cancelled) void refreshCongestion();
+    };
+    tick();
+    const interval = window.setInterval(tick, CONGESTION_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [refreshCongestion]);
 
   useEffect(() => {
     setMounted(true);
@@ -131,6 +221,7 @@ export function HeaderNav({ tab, setTab }: HeaderNavProps) {
               ⌘K
             </kbd>
           </button>
+          <CongestionBadge congestion={congestion} />
           <Link
             href="/settings"
             aria-label="Open settings"
@@ -154,6 +245,7 @@ export function HeaderNav({ tab, setTab }: HeaderNavProps) {
 
         {/* Mobile Hamburger Button (< 640px) */}
         <div className="flex items-center gap-2 sm:hidden">
+          <CongestionBadge congestion={congestion} compact />
           <NetworkSwitcher />
           <ConnectButton />
           <button
@@ -333,5 +425,42 @@ export function HeaderNav({ tab, setTab }: HeaderNavProps) {
         </div>
       )}
     </header>
+  );
+}
+
+interface CongestionBadgeProps {
+  congestion: CongestionState;
+  compact?: boolean;
+}
+
+export function CongestionBadge({ congestion, compact = false }: CongestionBadgeProps) {
+  const style = CONGESTION_STYLES[congestion.level];
+  const tooltip = `Soroban network congestion: ${style.label}. Base fee: ${congestion.baseFee} stroops. Recommended fee: ${congestion.recommendedFee} stroops.`;
+
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      aria-label={tooltip}
+      title={tooltip}
+      data-congestion-level={congestion.level}
+      className={`group relative flex min-h-[44px] items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium ${style.badge} ${style.text}`}
+    >
+      <span className="relative flex h-2 w-2">
+        <span
+          className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-75 ${style.dot}`}
+        />
+        <span className={`relative inline-flex h-2 w-2 rounded-full ${style.dot}`} />
+      </span>
+      <Wifi className="h-4 w-4" aria-hidden="true" />
+      {!compact && (
+        <span className="hidden lg:inline">
+          {style.label} congestion
+        </span>
+      )}
+      <span className="pointer-events-none absolute left-1/2 top-full z-50 mt-2 hidden -translate-x-1/2 whitespace-nowrap rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-[11px] font-normal text-slate-200 shadow-lg group-hover:block group-focus-within:block">
+        {tooltip}
+      </span>
+    </div>
   );
 }
