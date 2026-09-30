@@ -39,7 +39,8 @@ mod tests {
                 ledger_read_bytes: lr,
                 ledger_write_bytes: lw,
                 transaction_size_bytes: tx,
-            })
+                            ..Default::default()
+})
     }
 
     /// Arbitrary `TtlEntryReport`.
@@ -102,6 +103,7 @@ mod tests {
                 call_graph: None,
                 state_snapshot: None,
                 protocol_version: 0,
+                cost_breakdown: None,
             })
     }
 

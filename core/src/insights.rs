@@ -1,4 +1,4 @@
-use crate::simulation::{BytesByDurability, DurabilityByteCounts, SorobanResources};
+use crate::simulation::{BytesByDurability, CostBreakdown, DurabilityByteCounts, SorobanResources};
 use serde::{Deserialize, Serialize};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -347,6 +347,122 @@ impl InsightRule for ConcentratedAmmTickProfileRule {
     }
 }
 
+// ── DominantCostTypeRule ──────────────────────────────────────────────────────
+
+/// Fires when a single Soroban host cost type accounts for more than 40 % of
+/// the total CPU budget attributed by the node's diagnostic events.
+///
+/// The rule is only evaluated when a `CostBreakdown` is present; when no
+/// breakdown was returned the rule produces no output and the simulation is
+/// not failed.
+pub struct DominantCostTypeRule {
+    /// Fraction above which a cost type is considered dominant (default 0.40).
+    pub threshold: f64,
+}
+
+impl Default for DominantCostTypeRule {
+    fn default() -> Self {
+        Self { threshold: 0.40 }
+    }
+}
+
+impl DominantCostTypeRule {
+    /// Return an actionable hint for the supplied cost-type name.
+    fn hint_for(cost_type: &str) -> &'static str {
+        match cost_type {
+            // Pure WASM arithmetic / loops
+            "WasmInsnExec" => {
+                "WASM instruction execution dominates. Hoist repeated computations \
+                 out of loops, replace iterative algorithms with O(1) formulas, or \
+                 move heavy arithmetic off-chain and verify the result on-chain."
+            }
+            // Hash / crypto operations
+            "ComputeSha256Hash"
+            | "ComputeEd25519PubKey"
+            | "VerifyEd25519Sig"
+            | "ComputeKeccak256Hash"
+            | "RecoverEcdsaSecp256k1Key" => {
+                "Cryptographic operations dominate. Cache derived public keys or \
+                 hashes in persistent storage instead of recomputing them on every \
+                 invocation."
+            }
+            // Cross-contract / VM invocation overhead
+            "InvokeVmFunction" | "InvokeHostFunction" => {
+                "Cross-contract call overhead dominates. Batch operations into a \
+                 single invocation, inline simple callee logic into the caller, or \
+                 restructure to reduce the number of sub-invocations."
+            }
+            // Object / value manipulation
+            "VisitObject" | "CloneEvents" => {
+                "Host-object access dominates. Minimise the number of distinct \
+                 host values allocated per invocation; prefer small, flat data \
+                 structures over deeply nested maps or vecs."
+            }
+            // Ledger I/O
+            "ReadLedgerEntry" | "WriteLedgerEntry" => {
+                "Ledger entry I/O dominates. Batch reads and writes, consolidate \
+                 related data under fewer keys, and avoid reading the same entry \
+                 multiple times within a single invocation."
+            }
+            // Memory
+            "VmMemCpy" | "VmMemRead" | "VmMemWrite" => {
+                "Linear-memory operations dominate. Reduce large allocations inside \
+                 the contract; process data in a streaming fashion rather than \
+                 buffering the entire payload."
+            }
+            // Catch-all
+            _ => {
+                "One cost type dominates the budget. Profile which operation \
+                 produces this type and either hoist it out of any loops or \
+                 restructure the algorithm to call it less frequently."
+            }
+        }
+    }
+}
+
+impl InsightRule for DominantCostTypeRule {
+    fn name(&self) -> &str {
+        "dominant_cost_type"
+    }
+
+    fn evaluate(&self, _resources: &SorobanResources) -> Vec<Insight> {
+        // Cannot evaluate without a breakdown — use `evaluate_with_cost_breakdown`.
+        Vec::new()
+    }
+}
+
+impl DominantCostTypeRule {
+    /// Core evaluation logic; called by `InsightsEngine::analyze_with_cost_breakdown`.
+    pub fn evaluate_breakdown(
+        &self,
+        breakdown: &CostBreakdown,
+    ) -> Vec<Insight> {
+        let mut out = Vec::new();
+        if breakdown.total_cpu == 0 {
+            return out;
+        }
+
+        if let Some((cost_type, entry)) = breakdown.dominant_cpu_type() {
+            let fraction = breakdown.cpu_fraction(cost_type);
+            if fraction > self.threshold {
+                let pct = fraction * 100.0;
+                out.push(Insight {
+                    severity: Severity::Warning,
+                    rule: self.name().to_string(),
+                    message: format!(
+                        "Cost type '{}' accounts for {:.1}% of total CPU \
+                         ({} of {} units) — single type dominates budget",
+                        cost_type, pct, entry.cpu_units, breakdown.total_cpu
+                    ),
+                    suggested_fix: Self::hint_for(cost_type).to_string(),
+                });
+            }
+        }
+
+        out
+    }
+}
+
 // ── Engine ────────────────────────────────────────────────────────────────────
 
 /// The insights engine holds a set of rules and evaluates them against resource
@@ -429,6 +545,72 @@ impl InsightsEngine {
         }
     }
 
+    /// Run all rules plus the auth-tree size check.
+    ///
+    /// Fires a `Warning` when the total XDR bytes of authorization entries
+    /// would exceed the transaction size limit.
+    pub fn analyze_with_auth_tree(
+        &self,
+        resources: &SorobanResources,
+        auth_tree: &crate::simulation::AuthTreeReport,
+    ) -> InsightsReport {
+        let mut insights: Vec<Insight> = self
+            .rules
+            .iter()
+            .flat_map(|rule| rule.evaluate(resources))
+            .collect();
+
+        if auth_tree.exceeds_transaction_size_limit {
+            insights.push(Insight {
+                severity: Severity::Warning,
+                rule: "auth_tree_size".to_string(),
+                message: format!(
+                    "Authorization bytes ({}) exceed the transaction size limit ({} bytes). \
+                     Large auth trees inflate transaction fees and may be rejected by some nodes.",
+                    auth_tree.total_xdr_bytes, auth_tree.transaction_size_limit_bytes
+                ),
+                suggested_fix: "Reduce the number of authorization entries or shorten \
+                                 the invocation sub-tree they cover."
+                    .to_string(),
+            });
+        }
+
+        let efficiency_score = Self::compute_efficiency_score(resources, &insights);
+        InsightsReport {
+            efficiency_score,
+            insights,
+        }
+    }
+
+    /// Run all rules plus the dominant cost-type rule, given an optional
+    /// per-cost-type breakdown.
+    ///
+    /// When `cost_breakdown` is `None` the output is identical to `analyze`.
+    /// The dominant-cost-type rule only fires when a breakdown is present and
+    /// one cost type exceeds the configured threshold (default 40 %).
+    pub fn analyze_with_cost_breakdown(
+        &self,
+        resources: &SorobanResources,
+        cost_breakdown: Option<&CostBreakdown>,
+    ) -> InsightsReport {
+        let mut insights: Vec<Insight> = self
+            .rules
+            .iter()
+            .flat_map(|rule| rule.evaluate(resources))
+            .collect();
+
+        if let Some(breakdown) = cost_breakdown {
+            let rule = DominantCostTypeRule::default();
+            insights.extend(rule.evaluate_breakdown(breakdown));
+        }
+
+        let efficiency_score = Self::compute_efficiency_score(resources, &insights);
+        InsightsReport {
+            efficiency_score,
+            insights,
+        }
+    }
+
     /// Weighted efficiency score (0–100).
     ///
     /// Starts at 100 and deducts points for:
@@ -495,7 +677,8 @@ mod tests {
             ledger_read_bytes: 256,
             ledger_write_bytes: 128,
             transaction_size_bytes: 512,
-        }
+                    ..Default::default()
+}
     }
 
     // ── Efficiency score ──────────────────────────────────────────────────
@@ -544,7 +727,8 @@ mod tests {
             ledger_read_bytes: 200 * 1024,
             ledger_write_bytes: 200 * 1024,
             transaction_size_bytes: 1_024,
-        };
+                    ..Default::default()
+};
         let report = engine.analyze(&r);
         assert!(report.efficiency_score <= 100);
     }
@@ -821,5 +1005,138 @@ mod tests {
         assert_eq!(insights[0].severity, Severity::Warning);
         assert_eq!(insights[0].rule, "amm_tick_crossing_profile");
         assert!(insights[0].message.contains("max supported ticks is 4"));
+    }
+
+    // ── DominantCostTypeRule ──────────────────────────────────────────────
+
+    fn make_breakdown(dominant_cpu: u64, total_cpu: u64) -> CostBreakdown {
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            "WasmInsnExec".to_string(),
+            crate::simulation::CostEntry { cpu_units: dominant_cpu, mem_bytes: 0 },
+        );
+        CostBreakdown {
+            entries,
+            remainder_cpu: total_cpu.saturating_sub(dominant_cpu),
+            remainder_mem: 0,
+            total_cpu,
+            total_mem: 0,
+        }
+    }
+
+    #[test]
+    fn dominant_cost_type_fires_above_threshold() {
+        let rule = DominantCostTypeRule::default();
+        // WasmInsnExec = 80 of 100 total = 80% → above 40% threshold
+        let breakdown = make_breakdown(80, 100);
+        let insights = rule.evaluate_breakdown(&breakdown);
+        assert_eq!(insights.len(), 1);
+        assert_eq!(insights[0].severity, Severity::Warning);
+        assert_eq!(insights[0].rule, "dominant_cost_type");
+        assert!(insights[0].message.contains("WasmInsnExec"));
+        assert!(insights[0].message.contains("80.0%"));
+    }
+
+    #[test]
+    fn dominant_cost_type_silent_below_threshold() {
+        let rule = DominantCostTypeRule::default();
+        // WasmInsnExec = 30 of 100 total = 30% → below 40% threshold
+        let breakdown = make_breakdown(30, 100);
+        let insights = rule.evaluate_breakdown(&breakdown);
+        assert!(insights.is_empty());
+    }
+
+    #[test]
+    fn dominant_cost_type_silent_when_no_breakdown() {
+        let engine = InsightsEngine::new();
+        let report = engine.analyze_with_cost_breakdown(&minimal_resources(), None);
+        // No dominant_cost_type insight should appear when breakdown is absent
+        assert!(!report.insights.iter().any(|i| i.rule == "dominant_cost_type"));
+    }
+
+    #[test]
+    fn dominant_cost_type_fires_through_engine() {
+        let engine = InsightsEngine::new();
+        let breakdown = make_breakdown(90, 100); // 90% → well above 40%
+        let report = engine.analyze_with_cost_breakdown(&minimal_resources(), Some(&breakdown));
+        let insight = report
+            .insights
+            .iter()
+            .find(|i| i.rule == "dominant_cost_type")
+            .expect("dominant_cost_type insight should be present");
+        assert_eq!(insight.severity, Severity::Warning);
+        assert!(insight.suggested_fix.contains("WASM instruction"));
+    }
+
+    #[test]
+    fn dominant_cost_type_hint_keyed_off_type() {
+        let rule = DominantCostTypeRule::default();
+        // InvokeVmFunction = 95 of 100 → cross-contract hint
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            "InvokeVmFunction".to_string(),
+            crate::simulation::CostEntry { cpu_units: 95, mem_bytes: 0 },
+        );
+        let breakdown = CostBreakdown {
+            entries,
+            remainder_cpu: 5,
+            remainder_mem: 0,
+            total_cpu: 100,
+            total_mem: 0,
+        };
+        let insights = rule.evaluate_breakdown(&breakdown);
+        assert_eq!(insights.len(), 1);
+        assert!(
+            insights[0].suggested_fix.contains("sub-invocation"),
+            "expected cross-contract hint, got: {}",
+            insights[0].suggested_fix
+        );
+    }
+
+    #[test]
+    fn dominant_cost_type_percentages_sum_to_100() {
+        use crate::simulation::CostEntry;
+        // Three types, verify remainder accounting
+        let mut entries = std::collections::HashMap::new();
+        entries.insert("WasmInsnExec".to_string(), CostEntry { cpu_units: 60, mem_bytes: 10 });
+        entries.insert("VisitObject".to_string(), CostEntry { cpu_units: 30, mem_bytes: 5 });
+        let breakdown = CostBreakdown {
+            entries,
+            remainder_cpu: 10,
+            remainder_mem: 2,
+            total_cpu: 100,
+            total_mem: 17,
+        };
+        assert!(breakdown.is_consistent());
+        // Fractions: WasmInsnExec=60%, VisitObject=30%, remainder=10% → sums to 100%
+        let wasm_frac = breakdown.cpu_fraction("WasmInsnExec");
+        let visit_frac = breakdown.cpu_fraction("VisitObject");
+        let remainder_frac =
+            breakdown.remainder_cpu as f64 / breakdown.total_cpu as f64;
+        let total = (wasm_frac + visit_frac + remainder_frac) * 100.0;
+        assert!((total - 100.0).abs() < 0.001, "fractions sum to {}", total);
+    }
+
+    #[test]
+    fn cost_breakdown_is_consistent_rejects_bad_remainder() {
+        use crate::simulation::CostEntry;
+        let mut entries = std::collections::HashMap::new();
+        entries.insert("WasmInsnExec".to_string(), CostEntry { cpu_units: 80, mem_bytes: 0 });
+        // remainder_cpu is wrong (should be 20 for total 100, but we set 0)
+        let bad = CostBreakdown {
+            entries,
+            remainder_cpu: 0,
+            remainder_mem: 0,
+            total_cpu: 100,
+            total_mem: 0,
+        };
+        assert!(!bad.is_consistent());
+    }
+
+    #[test]
+    fn cost_breakdown_with_zero_total_cpu_returns_zero_fraction() {
+        let breakdown = CostBreakdown::default();
+        assert_eq!(breakdown.cpu_fraction("WasmInsnExec"), 0.0);
+        assert_eq!(breakdown.dominant_cpu_type(), None);
     }
 }

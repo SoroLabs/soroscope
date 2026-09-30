@@ -153,6 +153,7 @@ impl LocalRunner {
             call_graph: None,
             state_snapshot: None,
             protocol_version: 0,
+            cost_breakdown: None,
         })
     }
 }
@@ -310,7 +311,8 @@ mod tests {
             ledger_read_bytes: 2_048,
             ledger_write_bytes: 1_024,
             transaction_size_bytes: 512,
-        };
+                    ..Default::default()
+};
         // Same shape as SimulationEngine::calculate_cost:
         // 100_000/10_000 + 8_192/1_024 + (2_048+1_024)/1_024 = 10 + 8 + 3 = 21.
         assert_eq!(super::estimate_cost_stroops(&resources), 21);

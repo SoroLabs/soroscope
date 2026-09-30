@@ -76,7 +76,8 @@ where
                 ledger_read_bytes,
                 ledger_write_bytes,
                 transaction_size_bytes: rpc_result.transaction_data.len() as u64,
-                }, bytes_by_durability)
+                                ..Default::default()
+}, bytes_by_durability)
             } else {
                 (SorobanResources::default(), BytesByDurability::default())
             };
@@ -96,6 +97,8 @@ where
             call_graph: None,
             state_snapshot: None,
             protocol_version: 0,
+            cost_breakdown: None,
+            ..Default::default()
         })
     }
 

@@ -1371,6 +1371,8 @@ async fn analyze_wasm(
         call_graph: None,
         state_snapshot: None,
         protocol_version: payload.protocol_version.unwrap_or(20),
+        cost_breakdown: None,
+        ..Default::default()
     };
 
     let report = to_report(&sim_result, &state.insights_engine, None);
@@ -3292,7 +3294,8 @@ mod tests {
                 ledger_read_bytes: 512,
                 ledger_write_bytes: 256,
                 transaction_size_bytes: 1024,
-            },
+                            ..Default::default()
+},
             auth_tree: Default::default(),
             transaction_hash: None,
             latest_ledger: 12345,
@@ -3303,6 +3306,7 @@ mod tests {
             call_graph: None,
             state_snapshot: None,
             protocol_version: 0,
+            cost_breakdown: None,
         };
 
         let insights_engine = InsightsEngine::new();
