@@ -26,6 +26,8 @@ pub enum Error {
     LoopOpsTooLarge = 4,
     /// One of the combined-benchmark arguments exceeded its sub-cap.
     CombinedInputTooLarge = 5,
+    /// The declared footprint did not match the keys the host touched.
+    FootprintMismatch = 6,
 }
 
 // Hard caps. These sit below the point where a benchmark would exhaust the
@@ -64,6 +66,82 @@ pub struct CpuHeavyContract;
 
 #[contractimpl]
 impl CpuHeavyContract {
+    /// Compares the declared footprint against the keys the host actually
+    /// touched during local execution.
+    ///
+    /// Returns a [`FootprintDiff`] describing:
+    /// - `missing_reads`: keys the host read but were not declared read-only.
+    /// - `missing_writes`: keys the host wrote but were not declared read-write.
+    /// - `undeclared_but_touched`: keys touched that were not declared at all.
+    /// - `declared_but_untouched`: keys declared that the host never accessed.
+    ///
+    /// For RPC-only simulations, where the host trace is unavailable, the
+    /// declared set is returned and `touched_trace` is set to
+    /// `TouchedTrace::Unavailable` instead of pretending the declared set was
+    /// touched.
+    pub fn diff_footprint(
+        env: Env,
+        declared_read_only: Vec<LedgerKey>,
+        declared_read_write: Vec<LedgerKey>,
+    ) -> Result<FootprintDiff, Error> {
+        let touched = match env.host_trace() {
+            Some(trace) => trace,
+            None => {
+                return Ok(FootprintDiff {
+                    missing_reads: Vec::new(&env),
+                    missing_writes: Vec::new(&env),
+                    undeclared_but_touched: Vec::new(&env),
+                    declared_but_untouched: declared_read_only
+                        .iter()
+                        .chain(declared_read_write.iter())
+                        .collect(),
+                    touched_trace: TouchedTrace::Unavailable,
+                });
+            }
+        };
+
+        let mut missing_reads = Vec::new(&env);
+        let mut missing_writes = Vec::new(&env);
+        let mut undeclared_but_touched = Vec::new(&env);
+        let mut declared_but_untouched = Vec::new(&env);
+
+        for access in touched.iter() {
+            let declared = declared_read_only.contains(&access.key)
+                || declared_read_write.contains(&access.key);
+            if !declared {
+                undeclared_but_touched.push_back(access.key.clone());
+            }
+            match access.kind {
+                AccessKind::Read => {
+                    if !declared_read_only.contains(&access.key)
+                        && !declared_read_write.contains(&access.key)
+                    {
+                        missing_reads.push_back(access.key.clone());
+                    }
+                }
+                AccessKind::Write => {
+                    if !declared_read_write.contains(&access.key) {
+                        missing_writes.push_back(access.key.clone());
+                    }
+                }
+            }
+        }
+
+        for key in declared_read_only.iter().chain(declared_read_write.iter()) {
+            if !touched.iter().any(|a| a.key == key) {
+                declared_but_untouched.push_back(key.clone());
+            }
+        }
+
+        Ok(FootprintDiff {
+            missing_reads,
+            missing_writes,
+            undeclared_but_touched,
+            declared_but_untouched,
+            touched_trace: TouchedTrace::Available,
+        })
+    }
+
     /// Iterative Fibonacci, wrapping on `u64` overflow.
     ///
     /// Returns [`Error::FibonacciInputTooLarge`] if `n` exceeds [`MAX_FIB`].
@@ -186,4 +264,82 @@ impl CpuHeavyContract {
 
         Ok(results)
     }
+}
+
+/// A single ledger access recorded by the host during local execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LedgerAccess {
+    /// The ledger key that was accessed.
+    pub key: LedgerKey,
+    /// Whether the access was a read or a write.
+    pub kind: AccessKind,
+    /// The durability of the accessed entry.
+    pub durability: Durability,
+}
+
+/// The kind of ledger access performed by the host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccessKind {
+    /// The host read the entry.
+    Read,
+    /// The host wrote the entry.
+    Write,
+}
+
+/// The durability of a ledger entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Durability {
+    /// A temporary entry.
+    Temporary,
+    /// A persistent entry.
+    Persistent,
+}
+
+/// A ledger key, covering contract data, contract instance, and contract code.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LedgerKey {
+    /// A `ContractData` entry.
+    ContractData {
+        /// The contract address.
+        contract: soroban_sdk::Address,
+        /// The storage key.
+        key: soroban_sdk::Val,
+        /// The durability of the entry.
+        durability: Durability,
+    },
+    /// A `ContractInstance` entry.
+    ContractInstance {
+        /// The contract address.
+        contract: soroban_sdk::Address,
+    },
+    /// A `ContractCode` entry.
+    ContractCode {
+        /// The hash of the contract code.
+        hash: soroban_sdk::BytesN<32>,
+    },
+}
+
+/// Whether the host trace was available for the diff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TouchedTrace {
+    /// The host trace was available and used.
+    Available,
+    /// The host trace was unavailable (e.g. RPC-only simulation).
+    Unavailable,
+}
+
+/// The result of diffing the declared footprint against the keys the host
+/// actually touched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FootprintDiff {
+    /// Keys the host read but were not declared read-only.
+    pub missing_reads: Vec<LedgerKey>,
+    /// Keys the host wrote but were not declared read-write.
+    pub missing_writes: Vec<LedgerKey>,
+    /// Keys touched that were not declared at all.
+    pub undeclared_but_touched: Vec<LedgerKey>,
+    /// Keys declared that the host never accessed.
+    pub declared_but_untouched: Vec<LedgerKey>,
+    /// Whether the host trace was available.
+    pub touched_trace: TouchedTrace,
 }
