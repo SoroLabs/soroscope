@@ -200,7 +200,7 @@ export function SyntaxHighlighter({
 
   return (
     <div
-      className={`rounded-xl border border-slate-800 bg-slate-950 overflow-hidden ${className}`}
+      role="region" aria-label={`${languageLabel} code`} className={`rounded-xl border border-slate-800 bg-slate-950 overflow-hidden ${className}`}
     >
       {/* Header bar */}
       <div className="flex items-center justify-between border-b border-slate-800 bg-slate-900/80 px-4 py-2">
@@ -234,7 +234,7 @@ export function SyntaxHighlighter({
               return (
                 <tr
                   key={lineIndex}
-                  className="group hover:bg-slate-900/50 transition-colors"
+                  aria-label={`Line ${lineNumber}`} className="group hover:bg-slate-900/50 transition-colors"
                 >
                   {showLineNumbers && (
                     <td className="select-none border-r border-slate-800/60 px-3 py-0 text-right text-[11px] text-slate-600 group-hover:text-slate-500 w-12 align-top">
@@ -270,4 +270,3 @@ export function SyntaxHighlighter({
     </div>
   );
 }
-
