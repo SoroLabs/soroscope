@@ -1489,11 +1489,11 @@ impl EmergencyGuardTrait for LiquidityPool {
     fn set_pause_state(env: &Env, operation: u32, paused: bool) -> Result<(), GuardError> {
         DefaultEmergencyGuard::set_pause_state(env, operation, paused)
     }
-    fn unpause(env: &Env, operation: u32) -> Result<(), GuardError> {
-        DefaultEmergencyGuard::unpause(env, operation)
+    fn unpause(env: &Env, admin: Address, operation: u32) -> Result<(), GuardError> {
+        DefaultEmergencyGuard::unpause(env, admin, operation)
     }
-    fn unpause_all(env: &Env) -> Result<(), GuardError> {
-        DefaultEmergencyGuard::unpause_all(env)
+    fn unpause_all(env: &Env, admin: Address) -> Result<(), GuardError> {
+        DefaultEmergencyGuard::unpause_all(env, admin)
     }
     fn emergency_pause_all(env: &Env, approvers: Vec<Address>) -> Result<(), GuardError> {
         DefaultEmergencyGuard::emergency_pause_all(env, approvers)
