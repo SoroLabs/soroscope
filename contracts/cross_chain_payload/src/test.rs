@@ -7,10 +7,10 @@ use crate::verification::{VerificationResult, VerificationStatus};
 use crate::*;
 use crate::{ChainInfo, CrossChainError, CrossChainPayload, PayloadMetadata};
 use soroban_sdk::{Bytes, BytesN, Env, String, Symbol, Vec};
+use std::vec;
 
 #[test]
 fn test_chain_info_creation() {
-    let bridge_contract = BytesN::from_array(&[0u8; 32]);
     let e = Env::default();
 
     let bridge_contract = BytesN::from_array(&e, &[0u8; 32]);
@@ -31,7 +31,6 @@ fn test_chain_info_creation() {
 
 #[test]
 fn test_bridge_endpoint_creation() {
-    let bridge_contract = BytesN::from_array(&[0u8; 32]);
     let e = Env::default();
     let bridge_contract = BytesN::from_array(&e, &[0u8; 32]);
 
@@ -67,9 +66,6 @@ fn test_bridge_endpoint_creation() {
 
 #[test]
 fn test_cross_chain_payload_creation() {
-    let payload_id = BytesN::from_array(&[1u8; 32]);
-    let nonce = BytesN::from_array(&[2u8; 32]);
-    let payload_hash = BytesN::from_array(&[3u8; 32]);
     let e = Env::default();
     let payload_id = BytesN::from_array(&e, &[1u8; 32]);
     let nonce = BytesN::from_array(&e, &[2u8; 32]);
@@ -83,9 +79,6 @@ fn test_cross_chain_payload_creation() {
         nonce,
     };
 
-    let sender = Bytes::new(&soroban_sdk::Env::default());
-    let recipient = Bytes::new(&soroban_sdk::Env::default());
-    let data = Bytes::new(&soroban_sdk::Env::default());
     let sender = Bytes::new(&e);
     let recipient = Bytes::new(&e);
     let data = Bytes::new(&e);
@@ -110,8 +103,6 @@ fn test_cross_chain_payload_creation() {
 
 #[test]
 fn test_payload_batch_creation() {
-    let batch_id = BytesN::from_array(&[4u8; 32]);
-    let merkle_root = BytesN::from_array(&[5u8; 32]);
     let e = Env::default();
     let batch_id = BytesN::from_array(&e, &[4u8; 32]);
     let merkle_root = BytesN::from_array(&e, &[5u8; 32]);
@@ -131,7 +122,6 @@ fn test_payload_batch_creation() {
 
 #[test]
 fn test_verification_result_creation() {
-    let error_msg = String::from_small_str("test error");
     let e = Env::default();
     let error_msg = String::from_str(&e, "test error");
 
@@ -203,9 +193,6 @@ fn test_payload_route_creation() {
 
 #[test]
 fn test_encoded_payload_creation() {
-    let encoded_data = Bytes::new(&soroban_sdk::Env::default());
-    let encoding_scheme = String::from_small_str("borsh");
-    let compression_type = String::from_small_str("gzip");
     let e = Env::default();
     let encoded_data = Bytes::new(&e);
     let encoding_scheme = String::from_str(&e, "borsh");
@@ -225,7 +212,6 @@ fn test_encoded_payload_creation() {
 
 #[test]
 fn test_recovery_key_creation() {
-    let compressed_key = BytesN::from_array(&[6u8; 33]);
     let e = Env::default();
     let compressed_key = BytesN::from_array(&e, &[6u8; 33]);
 
@@ -240,4 +226,60 @@ fn test_recovery_key_creation() {
 
     assert!(key.is_active);
     assert_eq!(key.chain_id, 1);
+}
+
+fn canonical_payload(nonce: u64) -> std::vec::Vec<u8> {
+    let mut encoded = std::vec![1];
+    encoded.extend_from_slice(&1u32.to_be_bytes());
+    encoded.extend_from_slice(&2u32.to_be_bytes());
+    encoded.extend_from_slice(&nonce.to_be_bytes());
+    encoded.extend_from_slice(&1_700_000_000u64.to_be_bytes());
+    encoded.extend_from_slice(&3u32.to_be_bytes());
+    encoded.extend_from_slice(b"src");
+    encoded.extend_from_slice(&3u32.to_be_bytes());
+    encoded.extend_from_slice(b"dst");
+    encoded.extend_from_slice(&2u32.to_be_bytes());
+    encoded.extend_from_slice(b"ok");
+    encoded
+}
+
+#[test]
+fn test_parse_payload_reads_origin_sender_and_payload_fields() {
+    let env = Env::default();
+    let encoded = Bytes::from_slice(&env, &canonical_payload(42));
+
+    let parsed = parse_payload(&encoded).unwrap();
+
+    assert_eq!(parsed.version, 1);
+    assert_eq!(parsed.source_chain_id, 1);
+    assert_eq!(parsed.destination_chain_id, 2);
+    assert_eq!(parsed.nonce, 42);
+    assert_eq!(parsed.timestamp, 1_700_000_000);
+    assert_eq!(parsed.sender, Bytes::from_slice(&env, b"src"));
+    assert_eq!(parsed.recipient, Bytes::from_slice(&env, b"dst"));
+    assert_eq!(parsed.data, Bytes::from_slice(&env, b"ok"));
+}
+
+#[test]
+fn test_parse_payload_rejects_zero_nonce() {
+    let env = Env::default();
+    let encoded = Bytes::from_slice(&env, &canonical_payload(0));
+
+    assert_eq!(parse_payload(&encoded), Err(CrossChainError::InvalidNonce));
+}
+
+#[test]
+fn test_parse_payload_rejects_malformed_and_oversized_input() {
+    let env = Env::default();
+    let truncated = Bytes::from_slice(&env, &[1, 0, 0]);
+    let oversized = Bytes::from_slice(&env, &vec![0; MAX_PAYLOAD_SIZE as usize + 1]);
+
+    assert_eq!(
+        parse_payload(&truncated),
+        Err(CrossChainError::MalformedPayload)
+    );
+    assert_eq!(
+        parse_payload(&oversized),
+        Err(CrossChainError::MalformedPayload)
+    );
 }

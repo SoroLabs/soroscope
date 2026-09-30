@@ -61,6 +61,8 @@ pub enum CrossChainError {
     StorageError = 27,
     /// Unauthorized operation
     Unauthorized = 28,
+    /// Payload nonce is invalid (zero or otherwise outside the accepted range)
+    InvalidNonce = 29,
     /// Generic error
     Unknown = 255,
 }
@@ -97,6 +99,7 @@ impl CrossChainError {
             Self::LiquidityError => 26,
             Self::StorageError => 27,
             Self::Unauthorized => 28,
+            Self::InvalidNonce => 29,
             Self::Unknown => 255,
         }
     }
