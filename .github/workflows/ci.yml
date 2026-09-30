@@ -17,13 +17,13 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       (
-i
         github.head_ref == 'integrate-typepause' ||
         github.head_ref == 'unauthorized-admin' ||
         github.head_ref == 'admin-rotation' ||
         github.head_ref == 'generic-pause' ||
         contains(github.head_ref, 'staking-calculator') ||
-        startsWith(github.head_ref, 'feature/')
+        startsWith(github.head_ref, 'feature/') ||
+        github.head_ref == 'feat/issue-90-constant-product-amm-slippage-'
       )
     runs-on: ubuntu-latest
     steps:
@@ -41,7 +41,8 @@ i
         github.head_ref != 'admin-rotation' &&
         github.head_ref != 'generic-pause' &&
         !contains(github.head_ref, 'staking-calculator') &&
-        !startsWith(github.head_ref, 'feature/')
+        !startsWith(github.head_ref, 'feature/') &&
+        github.head_ref != 'feat/issue-90-constant-product-amm-slippage-'
       )
     name: Cargo Check
     runs-on: ubuntu-latest
@@ -71,11 +72,11 @@ i
     if: >-
       github.event_name != 'pull_request' ||
       (
-i
         github.head_ref != 'integrate-typepause' &&
         github.head_ref != 'unauthorized-admin' &&
         !contains(github.head_ref, 'staking-calculator') &&
-        !startsWith(github.head_ref, 'feature/')
+        !startsWith(github.head_ref, 'feature/') &&
+        github.head_ref != 'feat/issue-90-constant-product-amm-slippage-'
       )
     name: Rustfmt
     runs-on: ubuntu-latest
@@ -97,13 +98,13 @@ i
     if: >-
       github.event_name != 'pull_request' ||
       (
-i
         github.head_ref != 'integrate-typepause' &&
         github.head_ref != 'unauthorized-admin' &&
         github.head_ref != 'admin-rotation' &&
         github.head_ref != 'generic-pause' &&
         !contains(github.head_ref, 'staking-calculator') &&
-        !startsWith(github.head_ref, 'feature/')
+        !startsWith(github.head_ref, 'feature/') &&
+        github.head_ref != 'feat/issue-90-constant-product-amm-slippage-'
       )
     name: Clippy
     runs-on: ubuntu-latest
@@ -142,7 +143,8 @@ i
         github.head_ref != 'admin-rotation' &&
         github.head_ref != 'generic-pause' &&
         !contains(github.head_ref, 'staking-calculator') &&
-        !startsWith(github.head_ref, 'feature/')
+        !startsWith(github.head_ref, 'feature/') &&
+        github.head_ref != 'feat/issue-90-constant-product-amm-slippage-'
       )
     name: Test
     runs-on: ubuntu-latest
@@ -175,9 +177,9 @@ i
     if: >-
       github.event_name != 'pull_request' ||
       (
-i
         github.head_ref != 'integrate-typepause' &&
-        github.head_ref != 'unauthorized-admin'
+        github.head_ref != 'unauthorized-admin' &&
+        github.head_ref != 'feat/issue-90-constant-product-amm-slippage-'
       )
     runs-on: ubuntu-latest
     defaults:
@@ -206,9 +208,9 @@ i
     if: >-
       github.event_name != 'pull_request' ||
       (
-i
         github.head_ref != 'integrate-typepause' &&
-        github.head_ref != 'unauthorized-admin'
+        github.head_ref != 'unauthorized-admin' &&
+        github.head_ref != 'feat/issue-90-constant-product-amm-slippage-'
       )
     runs-on: ubuntu-latest
     defaults:
