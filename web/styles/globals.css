@@ -2,33 +2,62 @@
 @tailwind components;
 @tailwind utilities;
 
+/**
+ * Design System Tokens
+ * --------------------
+ * Canonical color tokens consumed by the Tailwind config (`web/tailwind.config.js`)
+ * and exposed as utility classes like `bg-background`, `text-primary`,
+ * `border-border`, etc. These replace inline arbitrary color classes
+ * (e.g. `bg-[#12141d]`) so theming is driven from a single source of truth.
+ *
+ * Contrast notes (WCGAG 2AA):
+ *  - Light theme: text-primary #1f2328 on bg-page #f6f8fa = ~15.3:1
+ *  - Light theme: text-secondary #656d76 on bg-page #f6f8fa = ~4.5::1
+ *  - Dark theme: text-primary #c9d1d9 on bg-page #0d1117 = ~13.4:1
+ *  - Dark theme: text-secondary #8b949e on bg-page #0d1117 = ~6.4:1
+ */
+
 :root {
+  /* Background tokens */
   --bg-page: #f6f8fa;
   --bg-card: #ffffff;
   --bg-elevated: #f6f8fa;
   --bg-input: #ffffff;
   --bg-header: rgba(255, 255, 255, 0.9);
+
+  /* Text tokens */
   --text-primary: #1f2328;
   --text-secondary: #656d76;
   --text-muted: #8b949e;
+
+  /* Border tokens */
   --border-default: #d0d7de;
   --border-subtle: #e1e4e8;
+
+  /* Interactive tokens */
   --tab-inactive: #656d76;
   --tab-hover: #1f2328;
   --skeleton: #e1e4e8;
 }
 
 .dark {
+  /* Background tokens */
   --bg-page: #0d1117;
   --bg-card: #161b22;
   --bg-elevated: #0d1117;
   --bg-input: #0d1117;
   --bg-header: rgba(13, 17, 23, 0.9);
+
+  /* Text tokens */
   --text-primary: #c9d1d9;
   --text-secondary: #8b949e;
   --text-muted: #6e7681;
+
+  /* Border tokens */
   --border-default: #30363d;
   --border-subtle: #21262d;
+
+  /* Interactive tokens */
   --tab-inactive: #8b949e;
   --tab-hover: #c9d1d9;
   --skeleton: #30363d;
