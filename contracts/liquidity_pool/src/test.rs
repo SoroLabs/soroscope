@@ -2401,3 +2401,235 @@ fn test_amount_in_quote_round_trips_against_amount_out() {
         "round trip under-charged: {quoted_in} for {quoted_out} out"
     );
 }
+
+// ── Realized-slippage metric (issue #862) ────────────────────────────────────
+
+/// Every `("slippage", user)` metric emitted so far, decoded, in emission order.
+fn slippage_metrics(e: &Env) -> Vec<(Address, SlippageMetricEvent)> {
+    let slippage_topic = Symbol::new(e, "slippage");
+    e.events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| {
+            if topics.len() != 2 {
+                return false;
+            }
+            let topic: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(e);
+            topic.is_ok() && topic.unwrap() == slippage_topic
+        })
+        .map(|(_, topics, data)| {
+            let user: Address = topics.get(1).unwrap().try_into_val(e).unwrap();
+            let metric: SlippageMetricEvent = data.try_into_val(e).unwrap();
+            (user, metric)
+        })
+        .collect()
+}
+
+#[test]
+fn test_swap_exact_in_emits_slippage_metric() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // 100 A in against 1000/1000 reserves buys 100 B at spot; the 30 bps fee and
+    // the price impact deliver 90 instead.
+    let received = client.swap_exact_in(&trader, &false, &100, &90);
+    assert_eq!(received, 90);
+
+    let metrics = slippage_metrics(&e);
+    assert_eq!(metrics.len(), 1, "exactly one metric per settled swap");
+
+    let (topic_user, metric) = &metrics[0];
+    assert_eq!(topic_user, &trader, "metric is keyed by the swapping user");
+    assert_eq!(metric.user, trader);
+    assert!(!metric.buy_a);
+    assert_eq!(metric.amount_in, 100);
+    assert_eq!(metric.amount_out, received);
+    assert_eq!(
+        metric.limit_amount, 90,
+        "the caller's own floor is recorded"
+    );
+    assert_eq!(metric.spot_amount_out, 100);
+    assert_eq!(metric.slippage_bps, 1_000, "10 of 100 units, i.e. 1000 bps");
+}
+
+#[test]
+fn test_swap_emits_slippage_metric_with_in_max_limit() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // Exact-output swap: `in_max` is the guard this direction carries.
+    let paid = client.swap(&trader, &false, &100, &150);
+
+    let metrics = slippage_metrics(&e);
+    assert_eq!(metrics.len(), 1);
+    let metric = &metrics[0].1;
+    assert_eq!(metric.amount_out, 100);
+    assert_eq!(metric.amount_in, paid);
+    assert_eq!(metric.limit_amount, 150);
+    // Balanced reserves: spot returns `paid` of token B for `paid` of token A, so
+    // the shortfall is what paying above spot for 100 B cost.
+    assert_eq!(metric.spot_amount_out, paid);
+    assert_eq!(metric.slippage_bps, (paid - 100) * 10_000 / paid);
+    assert!(metric.slippage_bps > 0);
+}
+
+#[test]
+fn test_rejected_swap_emits_no_slippage_metric() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // Nothing settled, so there is nothing to report.
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &100, &91),
+        Err(Ok(Error::SlippageExceeded))
+    );
+    assert_eq!(slippage_metrics(&e).len(), 0);
+    assert_eq!(client.get_reserves(), (1000, 1000));
+}
+
+#[test]
+fn test_slippage_metric_buy_a_direction() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // B in, A out: the metric follows the direction that actually executed.
+    let received = client.swap_exact_in(&trader, &true, &100, &0);
+
+    let metrics = slippage_metrics(&e);
+    assert_eq!(metrics.len(), 1);
+    assert!(metrics[0].1.buy_a);
+    assert_eq!(metrics[0].1.amount_out, received);
+    assert_eq!(metrics[0].1.spot_amount_out, 100);
+    assert_eq!(metrics[0].1.slippage_bps, 1_000);
+}
+
+#[test]
+fn test_slippage_metric_captures_price_impact_beyond_the_fee() {
+    // A dust trade against a deep pool pays barely more than the fee...
+    let shallow_env = Env::default();
+    shallow_env.mock_all_auths();
+    let (shallow_client, shallow_trader, _other, _token_a, _token_b) =
+        slippage_fixture(&shallow_env, 1_000_000, 1_000_000);
+    shallow_client.swap_exact_in(&shallow_trader, &false, &1_000, &0);
+    let shallow_metrics = slippage_metrics(&shallow_env);
+    assert_eq!(shallow_metrics.len(), 1);
+    let shallow_bps = shallow_metrics[0].1.slippage_bps;
+
+    // ...while a trade worth half the reserve moves the price hard.
+    let deep_env = Env::default();
+    deep_env.mock_all_auths();
+    let (deep_client, deep_trader, _other, _token_a, _token_b) =
+        slippage_fixture(&deep_env, 1_000_000, 1_000_000);
+    deep_client.swap_exact_in(&deep_trader, &false, &500_000, &0);
+    let deep_metrics = slippage_metrics(&deep_env);
+    assert_eq!(deep_metrics.len(), 1);
+    let deep_bps = deep_metrics[0].1.slippage_bps;
+
+    assert!(
+        shallow_bps >= DEFAULT_BASE_FEE_BPS,
+        "the fee alone is already {} bps, got {}",
+        DEFAULT_BASE_FEE_BPS,
+        shallow_bps
+    );
+    assert!(
+        deep_bps > shallow_bps + DEFAULT_BASE_FEE_BPS,
+        "price impact should dominate the fee: {} vs {}",
+        deep_bps,
+        shallow_bps
+    );
+}
+
+#[test]
+fn test_inspect_swap_matches_the_executed_fill() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    let report = client.inspect_swap(&false, &100, &90);
+    assert!(!report.buy_a);
+    assert_eq!(report.amount_in, 100);
+    assert_eq!(report.amount_out, 90);
+    assert_eq!(report.spot_amount_out, 100);
+    assert_eq!(report.slippage_bps, 1_000);
+    assert_eq!(report.min_amount_out, 90);
+    assert_eq!(
+        report.tolerance_bps, 1_000,
+        "the floor tolerates 10 of 100 units"
+    );
+    assert!(report.within_tolerance);
+
+    // Inspecting is read-only.
+    assert_eq!(client.get_reserves(), (1000, 1000));
+
+    // And it predicts the fill, including the metric that fill will emit.
+    let received = client.swap_exact_in(&trader, &false, &100, &90);
+    assert_eq!(received, report.amount_out);
+    let metrics = slippage_metrics(&e);
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].1.amount_out, report.amount_out);
+    assert_eq!(metrics[0].1.spot_amount_out, report.spot_amount_out);
+    assert_eq!(metrics[0].1.slippage_bps, report.slippage_bps);
+}
+
+#[test]
+fn test_inspect_swap_reports_missed_floor_without_reverting() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // One unit above the quote: reported, so the caller can resize instead of
+    // learning about the shortfall from a revert.
+    let report = client.inspect_swap(&false, &100, &91);
+    assert_eq!(report.amount_out, 90);
+    assert_eq!(report.min_amount_out, 91);
+    assert!(!report.within_tolerance);
+    assert_eq!(report.tolerance_bps, 900);
+
+    // ...which is exactly what the swap does with that floor.
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &100, &91),
+        Err(Ok(Error::SlippageExceeded))
+    );
+    assert_eq!(client.get_reserves(), (1000, 1000));
+    assert_eq!(slippage_metrics(&e).len(), 0);
+}
+
+#[test]
+fn test_inspect_swap_tolerates_any_floor_when_floor_is_zero() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    let report = client.inspect_swap(&false, &100, &0);
+    assert_eq!(
+        report.tolerance_bps, 10_000,
+        "no floor tolerates everything"
+    );
+    assert!(report.within_tolerance);
+    assert_eq!(report.amount_out, 90);
+}
+
+#[test]
+fn test_inspect_swap_rejects_invalid_amounts() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    assert_eq!(
+        client.try_inspect_swap(&false, &0, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        client.try_inspect_swap(&false, &-100, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // A negative floor would silently disable the check, so reject it.
+    assert_eq!(
+        client.try_inspect_swap(&false, &100, &-1),
+        Err(Ok(Error::InvalidAmount))
+    );
+}

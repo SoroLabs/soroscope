@@ -124,6 +124,46 @@ pub struct JitPenaltyEvent {
     pub penalty_b: i128,
 }
 
+/// Slippage one fill realized, measured against the fee-free spot quote of the
+/// reserves that fill executed against.
+///
+/// `spot_amount_out` is what `amount_in` would have bought if the trade had not
+/// moved the price and no fee had been charged, so `amount_out` can never beat
+/// it. The shortfall is the pool fee plus price impact, reported in basis points
+/// so dashboards can chart realized slippage per swap without replaying pool
+/// state. `limit_amount` records the caller's own guard (`min_amount_out` for
+/// `swap_exact_in`, `in_max` for `swap`) so the metric can be compared with the
+/// protection that was actually requested.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlippageMetricEvent {
+    pub user: Address,
+    pub buy_a: bool,
+    pub amount_in: i128,
+    pub amount_out: i128,
+    pub spot_amount_out: i128,
+    pub slippage_bps: i128,
+    pub limit_amount: i128,
+}
+
+/// Result of `inspect_swap`: what an exact-input swap would do against the
+/// current reserves, without moving them.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlippageReport {
+    pub buy_a: bool,
+    pub amount_in: i128,
+    pub amount_out: i128,
+    pub spot_amount_out: i128,
+    pub slippage_bps: i128,
+    pub min_amount_out: i128,
+    /// Slippage the floor tolerates, in basis points of `spot_amount_out`;
+    /// `10_000` when `min_amount_out` is zero, i.e. no floor at all.
+    pub tolerance_bps: i128,
+    /// Whether the fill would clear `min_amount_out` instead of reverting.
+    pub within_tolerance: bool,
+}
+
 // Constants
 
 pub const MAX_FEE_BPS: i128 = 100;
@@ -344,6 +384,54 @@ fn amount_in_for_out(
         quotient + 1
     })
 }
+
+/// Output `amount_in` buys at the pre-trade spot price: `reserve_out` per
+/// `reserve_in`, with the curve and the fee both ignored.
+fn spot_amount_out(amount_in: i128, reserve_in: i128, reserve_out: i128) -> i128 {
+    if amount_in <= 0 || reserve_in <= 0 || reserve_out <= 0 {
+        return 0;
+    }
+    amount_in.saturating_mul(reserve_out) / reserve_in
+}
+
+/// Slippage a fill realized against the spot quote it executed against, in
+/// basis points.
+///
+/// Returns `(spot_amount_out, slippage_bps)`. Constant product can never beat
+/// spot, so the difference is the fee plus price impact; it is reported as `0`
+/// for dust input, where there is no spot quote to measure against. The
+/// arithmetic saturates instead of panicking because the metric is pure
+/// reporting and must not be able to fail a swap that already settled.
+fn realized_slippage_bps(
+    amount_in: i128,
+    amount_out: i128,
+    reserve_in: i128,
+    reserve_out: i128,
+) -> (i128, i128) {
+    let spot = spot_amount_out(amount_in, reserve_in, reserve_out);
+    if spot <= 0 || amount_out >= spot {
+        return (spot, 0);
+    }
+    (
+        spot,
+        spot.saturating_sub(amount_out).saturating_mul(10_000) / spot,
+    )
+}
+
+/// Slippage an output floor tolerates, in basis points of the spot quote.
+///
+/// A zero floor is no floor at all, so it tolerates everything; a floor at or
+/// above spot can never be met.
+fn tolerated_slippage_bps(min_amount_out: i128, spot_amount_out: i128) -> i128 {
+    if min_amount_out <= 0 {
+        return 10_000;
+    }
+    if spot_amount_out <= 0 || min_amount_out >= spot_amount_out {
+        return 0;
+    }
+    (spot_amount_out - min_amount_out).saturating_mul(10_000) / spot_amount_out
+}
+
 /// Point `DataKey::Admin` (and `PoolState::admin`) at `replacement` when
 /// `departing` is the current primary admin. No-op otherwise.
 fn reassign_primary_admin_if(e: &Env, departing: &Address, replacement: Option<Address>) {
@@ -987,7 +1075,7 @@ impl LiquidityPool {
         if amount_in > in_max {
             return Err(Error::SlippageExceeded);
         }
-        Self::settle_swap(&e, to, pool, buy_a, sides, amount_in, out);
+        Self::settle_swap(&e, to, pool, buy_a, sides, amount_in, out, in_max);
         Ok(amount_in)
     }
 
@@ -1013,8 +1101,45 @@ impl LiquidityPool {
         if amount_out < min_amount_out {
             return Err(Error::SlippageExceeded);
         }
-        Self::settle_swap(&e, to, pool, buy_a, sides, amount_in, amount_out);
+        Self::settle_swap(&e, to, pool, buy_a, sides, amount_in, amount_out, min_amount_out);
         Ok(amount_out)
+    }
+
+    /// Read-only companion to `swap_exact_in`: reports the output the pool would
+    /// deliver right now, the slippage that fill would realize against the spot
+    /// quote, and whether it clears `min_amount_out`.
+    ///
+    /// A floor the fill would miss is reported as `within_tolerance = false`
+    /// rather than as an error, so a caller can size the trade instead of
+    /// discovering the shortfall by reverting. Nothing is written to storage and
+    /// no authorisation is required. A reported `amount_out` of zero means the
+    /// trade is too small to buy a single unit, which `swap_exact_in` answers
+    /// with `Error::InsufficientLiquidity`.
+    pub fn inspect_swap(
+        e: Env,
+        buy_a: bool,
+        amount_in: i128,
+        min_amount_out: i128,
+    ) -> Result<SlippageReport, Error> {
+        if amount_in <= 0 || min_amount_out < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let pool = load_pool(&e)?;
+        let sides = swap_sides(&pool, buy_a);
+        let amount_out =
+            amount_out_for_in(amount_in, sides.reserve_in, sides.reserve_out, pool.fee_bps)?;
+        let (spot_amount_out, slippage_bps) =
+            realized_slippage_bps(amount_in, amount_out, sides.reserve_in, sides.reserve_out);
+        Ok(SlippageReport {
+            buy_a,
+            amount_in,
+            amount_out,
+            spot_amount_out,
+            slippage_bps,
+            min_amount_out,
+            tolerance_bps: tolerated_slippage_bps(min_amount_out, spot_amount_out),
+            within_tolerance: amount_out >= min_amount_out,
+        })
     }
 
     pub fn get_amount_out(e: Env, buy_a: bool, amount_in: i128) -> Result<i128, Error> {
@@ -1053,6 +1178,7 @@ impl LiquidityPool {
         sides: SwapSides,
         amount_in: i128,
         amount_out: i128,
+        limit_amount: i128,
     ) {
         soroban_sdk::token::Client::new(e, &sides.token_in).transfer(
             &to,
@@ -1072,14 +1198,34 @@ impl LiquidityPool {
             pool.reserve_b -= amount_out;
         }
         save_pool(e, &pool);
+        // Measured against the reserves the fill executed against, which are the
+        // pre-swap reserves `pool` still holds here.
+        let (spot_amount_out, slippage_bps) = realized_slippage_bps(
+            amount_in,
+            amount_out,
+            sides.reserve_in,
+            sides.reserve_out,
+        );
         e.events().publish(
             (Symbol::new(e, "swap"), to.clone()),
             SwapEvent {
-                user: to,
-                token_in: sides.token_in,
-                token_out: sides.token_out,
+                user: to.clone(),
+                token_in: sides.token_in.clone(),
+                token_out: sides.token_out.clone(),
                 amount_in,
                 amount_out,
+            },
+        );
+        e.events().publish(
+            (Symbol::new(e, "slippage"), to.clone()),
+            SlippageMetricEvent {
+                user: to,
+                buy_a,
+                amount_in,
+                amount_out,
+                spot_amount_out,
+                slippage_bps,
+                limit_amount,
             },
         );
     }
