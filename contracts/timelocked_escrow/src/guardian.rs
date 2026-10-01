@@ -55,6 +55,19 @@ pub fn write_approvals(e: &Env, bitmap: u32) {
     e.storage().instance().set(&DataKey::Approvals, &bitmap);
 }
 
+pub fn read_recovery_approvals(e: &Env) -> u32 {
+    e.storage()
+        .instance()
+        .get(&DataKey::RecoveryApprovals)
+        .unwrap_or(0u32)
+}
+
+pub fn write_recovery_approvals(e: &Env, bitmap: u32) {
+    e.storage()
+        .instance()
+        .set(&DataKey::RecoveryApprovals, &bitmap);
+}
+
 pub fn read_epoch(e: &Env) -> u32 {
     e.storage()
         .instance()

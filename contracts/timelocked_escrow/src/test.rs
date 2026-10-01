@@ -669,3 +669,50 @@ fn test_release_after_mutual_cancel_fails() {
     advance_ledger(&e, LOCK_LEDGERS + 1);
     client.release();
 }
+
+#[test]
+fn test_guardian_quorum_recovers_escrow_to_depositor() {
+    let (e, client, token_addr, depositor, beneficiary, guardians, _) = setup();
+    let token_client = token::Client::new(&e, &token_addr);
+    let initial_depositor_balance = token_client.balance(&depositor);
+
+    client.deposit(&DEPOSIT_AMOUNT);
+    advance_ledger(&e, LOCK_LEDGERS + 1);
+    client.approve(&guardians.get(0).unwrap());
+    client.approve(&guardians.get(1).unwrap());
+    client.approve(&guardians.get(2).unwrap());
+
+    // Release votes do not authorize the separate recovery transfer.
+    assert!(client.try_recover().is_err());
+    assert_eq!(token_client.balance(&beneficiary), 0);
+
+    client.approve_recovery(&guardians.get(0).unwrap());
+    client.approve_recovery(&guardians.get(1).unwrap());
+    assert!(client.try_recover().is_err());
+
+    client.approve_recovery(&guardians.get(2).unwrap());
+    client.recover();
+
+    let config = client.get_config();
+    assert!(config.is_recovered);
+    assert_eq!(config.amount, 0);
+    assert_eq!(token_client.balance(&depositor), initial_depositor_balance);
+    assert_eq!(token_client.balance(&beneficiary), 0);
+}
+
+#[test]
+fn test_timelock_extension_by_depositor() {
+    let (_e, client, _, _, _, _, _) = setup();
+    let extended_unlock = LOCK_LEDGERS + 500;
+
+    client.extend_timelock(&extended_unlock);
+
+    assert_eq!(client.get_config().unlock_ledger, extended_unlock);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_timelock_cannot_be_shortened() {
+    let (_e, client, _, _, _, _, _) = setup();
+    client.extend_timelock(&(LOCK_LEDGERS - 1));
+}

@@ -1,12 +1,12 @@
 use crate::escrow::{has_config, read_config, require_active, require_funded, write_config};
 use crate::guardian::{
     approval_count, guardian_index, has_quorum, read_approvals, read_epoch, read_guardians,
-    set_approval, validate_guardians, write_approvals, write_epoch, write_guardians,
-    REQUIRED_APPROVALS,
+    read_recovery_approvals, set_approval, validate_guardians, write_approvals, write_epoch,
+    write_guardians, write_recovery_approvals, REQUIRED_APPROVALS,
 };
 use crate::storage_types::{
-    ApprovalEvent, CancelEvent, DepositEvent, Error, EscrowConfig, GuardianRotationEvent,
-    MutualCancelEvent, ReleaseEvent,
+    ApprovalEvent, CancelEvent, DepositEvent, Error, EscrowConfig, EscrowStatus,
+    GuardianRotationEvent, MutualCancelEvent, ReleaseEvent, StatusChangeEvent,
 };
 use soroban_sdk::{contract, contractimpl, token, Address, Env, Symbol, Vec};
 
@@ -44,6 +44,7 @@ impl TimelockEscrow {
             amount: 0,
             unlock_ledger: e.ledger().sequence().saturating_add(lock_ledgers),
             is_released: false,
+            is_recovered: false,
             is_cancelled: false,
             cancellation_fee_bps,
             protocol_vault,
@@ -52,6 +53,7 @@ impl TimelockEscrow {
         write_config(&e, &config);
         write_guardians(&e, &guardians);
         write_approvals(&e, 0u32);
+        write_recovery_approvals(&e, 0u32);
         write_epoch(&e, 0u32);
 
         e.storage().instance().extend_ttl(100, 100);
@@ -76,6 +78,8 @@ impl TimelockEscrow {
 
         config.amount = amount;
         write_config(&e, &config);
+
+        publish_status_change(&e, EscrowStatus::Initialized, EscrowStatus::Funded);
 
         e.events().publish(
             (Symbol::new(&e, "deposit"), config.depositor.clone()),
@@ -121,6 +125,32 @@ impl TimelockEscrow {
         Ok(count)
     }
 
+    /// Guardian explicitly approves returning the escrow to the depositor.
+    pub fn approve_recovery(e: Env, guardian: Address) -> Result<u32, Error> {
+        let config = read_config(&e)?;
+        require_active(&config)?;
+        require_funded(&config)?;
+
+        guardian.require_auth();
+        let guardians = read_guardians(&e);
+        let idx = guardian_index(&guardians, &guardian)?;
+        let bitmap = read_recovery_approvals(&e);
+        let new_bitmap = set_approval(bitmap, idx)?;
+        write_recovery_approvals(&e, new_bitmap);
+
+        let count = approval_count(new_bitmap);
+        e.events().publish(
+            (Symbol::new(&e, "recovery_approval"), guardian.clone()),
+            ApprovalEvent {
+                guardian,
+                guardian_index: idx,
+                approval_count: count,
+            },
+        );
+        e.storage().instance().extend_ttl(100, 100);
+        Ok(count)
+    }
+
     /// Releases funds to the beneficiary. Permissionless — anyone can trigger
     /// once the timelock has expired and quorum (3-of-5) is reached.
     pub fn release(e: Env) -> Result<(), Error> {
@@ -147,6 +177,7 @@ impl TimelockEscrow {
         config.amount = 0;
         config.is_released = true;
         write_config(&e, &config);
+        publish_status_change(&e, EscrowStatus::Funded, EscrowStatus::Released);
 
         e.events().publish(
             (Symbol::new(&e, "release"), config.beneficiary.clone()),
@@ -158,6 +189,49 @@ impl TimelockEscrow {
             },
         );
 
+        e.storage().instance().extend_ttl(100, 100);
+        Ok(())
+    }
+
+    /// Returns escrowed funds to the original depositor after expiry when the
+    /// configured guardian quorum has approved. Anyone may trigger the transfer.
+    pub fn recover(e: Env) -> Result<(), Error> {
+        let mut config = read_config(&e)?;
+        require_active(&config)?;
+        require_funded(&config)?;
+
+        if e.ledger().sequence() < config.unlock_ledger {
+            return Err(Error::TimelockNotExpired);
+        }
+        let bitmap = read_recovery_approvals(&e);
+        if !has_quorum(bitmap) {
+            return Err(Error::InsufficientApprovals);
+        }
+
+        token::Client::new(&e, &config.token).transfer(
+            &e.current_contract_address(),
+            &config.depositor,
+            &config.amount,
+        );
+
+        config.amount = 0;
+        config.is_recovered = true;
+        write_config(&e, &config);
+        publish_status_change(&e, EscrowStatus::Funded, EscrowStatus::Recovered);
+        e.storage().instance().extend_ttl(100, 100);
+        Ok(())
+    }
+
+    /// The original depositor may extend the lock, but cannot shorten it.
+    pub fn extend_timelock(e: Env, new_unlock_ledger: u32) -> Result<(), Error> {
+        let mut config = read_config(&e)?;
+        require_active(&config)?;
+        config.depositor.require_auth();
+        if new_unlock_ledger <= config.unlock_ledger {
+            return Err(Error::InvalidTimelockExtension);
+        }
+        config.unlock_ledger = new_unlock_ledger;
+        write_config(&e, &config);
         e.storage().instance().extend_ttl(100, 100);
         Ok(())
     }
@@ -198,6 +272,7 @@ impl TimelockEscrow {
         config.amount = 0;
         config.is_cancelled = true;
         write_config(&e, &config);
+        publish_status_change(&e, EscrowStatus::Funded, EscrowStatus::Cancelled);
 
         e.events().publish(
             (Symbol::new(&e, "cancel"), config.depositor.clone()),
@@ -246,6 +321,7 @@ impl TimelockEscrow {
         config.amount = 0;
         config.is_cancelled = true;
         write_config(&e, &config);
+        publish_status_change(&e, EscrowStatus::Funded, EscrowStatus::Cancelled);
 
         e.events().publish(
             (
@@ -301,6 +377,7 @@ impl TimelockEscrow {
         let old_guardians = current_guardians;
         write_guardians(&e, &new_guardians);
         write_approvals(&e, 0u32);
+        write_recovery_approvals(&e, 0u32);
         let new_epoch = read_epoch(&e) + 1;
         write_epoch(&e, new_epoch);
 
@@ -335,10 +412,15 @@ impl TimelockEscrow {
         approval_count(read_approvals(&e))
     }
 
+    pub fn get_recovery_approval_count(e: Env) -> u32 {
+        approval_count(read_recovery_approvals(&e))
+    }
+
     pub fn is_releasable(e: Env) -> bool {
         match read_config(&e) {
             Ok(config) => {
                 !config.is_released
+                    && !config.is_recovered
                     && !config.is_cancelled
                     && config.amount > 0
                     && e.ledger().sequence() >= config.unlock_ledger
@@ -347,4 +429,14 @@ impl TimelockEscrow {
             Err(_) => false,
         }
     }
+}
+
+fn publish_status_change(e: &Env, previous_status: EscrowStatus, new_status: EscrowStatus) {
+    e.events().publish(
+        (Symbol::new(e, "status_change"),),
+        StatusChangeEvent {
+            previous_status,
+            new_status,
+        },
+    );
 }

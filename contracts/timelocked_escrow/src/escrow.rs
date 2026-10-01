@@ -17,7 +17,7 @@ pub fn write_config(e: &Env, config: &EscrowConfig) {
 }
 
 pub fn require_active(config: &EscrowConfig) -> Result<(), Error> {
-    if config.is_released || config.is_cancelled {
+    if config.is_released || config.is_recovered || config.is_cancelled {
         return Err(Error::AlreadyFinalized);
     }
     Ok(())
