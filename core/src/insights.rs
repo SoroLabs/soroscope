@@ -1,4 +1,7 @@
-use crate::simulation::{BytesByDurability, CostBreakdown, DurabilityByteCounts, SorobanResources};
+use crate::simulation::{
+    first_dimension_at_or_above, BytesByDurability, CostBreakdown, DurabilityByteCounts,
+    LimitHeadroom, SorobanResources,
+};
 use serde::{Deserialize, Serialize};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -347,6 +350,83 @@ impl InsightRule for ConcentratedAmmTickProfileRule {
     }
 }
 
+/// Severity thresholds for limit-headroom insights (#991).
+///
+/// Critical at ≥90% of any dimension; Warning at ≥75%. The message names the
+/// first failing dimension in fixed order: CPU, memory, read entries, write
+/// entries, transaction size.
+pub struct LimitHeadroomRule;
+
+/// Build headroom insights from a precomputed `LimitHeadroom` report.
+///
+/// Used both by `LimitHeadroomRule` (when headroom is present on resources)
+/// and by `to_report`, which always has headroom available even if the rule
+/// itself has nothing to read from `SorobanResources`.
+pub fn insights_from_headroom(headroom: &LimitHeadroom, rule_name: &str) -> Vec<Insight> {
+    let mut out = Vec::new();
+
+    if let Some(dimension) = first_dimension_at_or_above(headroom, 90) {
+        let used = match dimension {
+            "cpu_instructions" => headroom.cpu_instructions.percent_used,
+            "memory_bytes" => headroom.memory_bytes.percent_used,
+            "read_entries" => headroom.read_entries.percent_used,
+            "write_entries" => headroom.write_entries.percent_used,
+            _ => headroom.transaction_size_bytes.percent_used,
+        };
+        out.push(Insight {
+            severity: Severity::Critical,
+            rule: rule_name.to_string(),
+            message: format!(
+                "Resource usage is critical on {dimension}: {used}% of the network limit \
+                 (source: {:?})",
+                headroom.limits_source
+            ),
+            suggested_fix: format!(
+                "Reduce {dimension} usage below 75% of the limit, or split the work across \
+                 multiple transactions."
+            ),
+        });
+        return out;
+    }
+
+    if let Some(dimension) = first_dimension_at_or_above(headroom, 75) {
+        let used = match dimension {
+            "cpu_instructions" => headroom.cpu_instructions.percent_used,
+            "memory_bytes" => headroom.memory_bytes.percent_used,
+            "read_entries" => headroom.read_entries.percent_used,
+            "write_entries" => headroom.write_entries.percent_used,
+            _ => headroom.transaction_size_bytes.percent_used,
+        };
+        out.push(Insight {
+            severity: Severity::Warning,
+            rule: rule_name.to_string(),
+            message: format!(
+                "Resource usage is elevated on {dimension}: {used}% of the network limit \
+                 (source: {:?})",
+                headroom.limits_source
+            ),
+            suggested_fix: format!(
+                "Consider trimming {dimension} before it reaches the 90% critical threshold."
+            ),
+        });
+    }
+
+    out
+}
+
+impl InsightRule for LimitHeadroomRule {
+    fn name(&self) -> &str {
+        "limit_headroom"
+    }
+
+    /// `SorobanResources` does not carry entry counts; the rule is a no-op
+    /// here and headroom insights are attached in `to_report` from the
+    /// precomputed `LimitHeadroom` on `SimulationResult`.
+    fn evaluate(&self, _r: &SorobanResources) -> Vec<Insight> {
+        Vec::new()
+    }
+}
+
 // ── DominantCostTypeRule ──────────────────────────────────────────────────────
 
 /// Fires when a single Soroban host cost type accounts for more than 40 % of
@@ -487,6 +567,7 @@ impl InsightsEngine {
                 Box::new(FootprintBloatRule),
                 Box::new(MemoryPressureRule),
                 Box::new(ConcentratedAmmTickProfileRule),
+                Box::new(LimitHeadroomRule),
             ],
         }
     }
@@ -1022,6 +1103,69 @@ mod tests {
             total_cpu,
             total_mem: 0,
         }
+    }
+
+    // ── #991: limit headroom insights ─────────────────────────────────────
+
+    fn headroom_fixture(write_used_pct: u32) -> crate::simulation::LimitHeadroom {
+        let write_used = if write_used_pct >= 100 { 21 } else { (write_used_pct * 20) / 100 };
+        crate::simulation::compute_limit_headroom(
+            &SorobanResources::default(),
+            Some((30, write_used)),
+            &crate::simulation::NetworkLimits {
+                max_write_entries: 20,
+                ..Default::default()
+            },
+            crate::simulation::LimitsSource::Builtin,
+        )
+    }
+
+    #[test]
+    fn limit_headroom_critical_at_90_percent_names_write_entries() {
+        // 18/20 = 90%
+        let headroom = headroom_fixture(90);
+        assert_eq!(headroom.write_entries.percent_used, 90);
+        let insights = insights_from_headroom(&headroom, "limit_headroom");
+        assert_eq!(insights.len(), 1);
+        assert_eq!(insights[0].severity, Severity::Critical);
+        assert_eq!(insights[0].rule, "limit_headroom");
+        assert!(insights[0].message.contains("write_entries"));
+        assert!(insights[0].message.contains("90%"));
+    }
+
+    #[test]
+    fn limit_headroom_warning_at_75_percent_and_silent_below() {
+        // 15/20 = 75% → Warning
+        let warning = headroom_fixture(75);
+        let insights = insights_from_headroom(&warning, "limit_headroom");
+        assert_eq!(insights.len(), 1);
+        assert_eq!(insights[0].severity, Severity::Warning);
+        assert!(insights[0].message.contains("write_entries"));
+
+        // 10/20 = 50% → no insight
+        let quiet = headroom_fixture(50);
+        assert!(insights_from_headroom(&quiet, "limit_headroom").is_empty());
+    }
+
+    #[test]
+    fn limit_headroom_critical_beats_warning_even_if_later_dimension_is_worse() {
+        // CPU at 95% (Critical) and write_entries at 80% (would be Warning).
+        // The rule must report CPU first, not the later dimension.
+        let limits = crate::simulation::NetworkLimits::default();
+        let resources = SorobanResources {
+            cpu_instructions: 95_000_000,
+            ..Default::default()
+        };
+        let headroom = crate::simulation::compute_limit_headroom(
+            &resources,
+            Some((30, 16)), // 16/20 = 80%
+            &limits,
+            crate::simulation::LimitsSource::Builtin,
+        );
+        let insights = insights_from_headroom(&headroom, "limit_headroom");
+        assert_eq!(insights.len(), 1);
+        assert_eq!(insights[0].severity, Severity::Critical);
+        assert!(insights[0].message.contains("cpu_instructions"));
     }
 
     #[test]

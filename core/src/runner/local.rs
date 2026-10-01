@@ -155,8 +155,9 @@ impl LocalRunner {
             transaction_data: String::new(),
             call_graph: None,
             state_snapshot: None,
-            protocol_version: protocol_version.unwrap_or(22),
-            fee_calibration: crate::fee_quote::FeeCalibration::local(cost_stroops, fee_config),
+            protocol_version: 0,
+            cost_breakdown: None,
+            limit_headroom: None,
         })
     }
 }

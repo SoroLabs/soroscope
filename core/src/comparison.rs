@@ -185,7 +185,7 @@ pub async fn run_comparison(
 
             let current = current_result?;
             let base = base_result?;
-            (current.resources, base.resources, current.protocol_snapshot, base.protocol_snapshot)
+            (current.resources, base.resources, current.protocol_version, base.protocol_version)
         }
         CompareMode::LocalVsDeployed {
             current_wasm,
@@ -216,7 +216,7 @@ pub async fn run_comparison(
 
             let current = current_result?;
             let base = base_result?;
-            (current.resources, base.resources, current.protocol_snapshot, base.protocol_snapshot)
+            (current.resources, base.resources, current.protocol_version, base.protocol_version)
         }
     };
 
