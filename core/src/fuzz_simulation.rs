@@ -119,7 +119,7 @@ mod tests {
                 call_graph: None,
                 state_snapshot: None,
                 protocol_version: 0,
-                cost_breakdown: None,
+                fee_calibration: Default::default(),
             })
     }
 

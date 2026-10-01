@@ -136,12 +136,15 @@ impl LocalRunner {
         // failure is localised here instead of arriving with no location.
         .map_err(|err| err.with_invocation(Some(contract_id), Some(called_function.as_str())))?;
 
+        let cost_stroops = estimate_cost_stroops(&resources);
+        let fee_config = crate::fee_quote::SorobanFeeConfig::checked_in();
+
         Ok(SimulationResult {
             bytes_by_durability: crate::simulation::BytesByDurability::from_aggregates_as_other(
                 resources.ledger_read_bytes,
                 resources.ledger_write_bytes,
             ),
-            cost_stroops: estimate_cost_stroops(&resources),
+            cost_stroops,
             rent_bytes: None,
             resources,
             auth_tree: Default::default(),
@@ -152,8 +155,8 @@ impl LocalRunner {
             transaction_data: String::new(),
             call_graph: None,
             state_snapshot: None,
-            protocol_version: 0,
-            cost_breakdown: None,
+            protocol_version: protocol_version.unwrap_or(22),
+            fee_calibration: crate::fee_quote::FeeCalibration::local(cost_stroops, fee_config),
         })
     }
 }

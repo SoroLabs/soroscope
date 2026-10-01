@@ -864,8 +864,7 @@ mod tests {
                     latest_ledger: 42,
                 }),
                 protocol_version: 22,
-                cost_breakdown: None,
-                ..Default::default()
+                fee_calibration: Default::default(),
             },
             sac: resolved.report(SacBalanceSource::Injected),
         };
