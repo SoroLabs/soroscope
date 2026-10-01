@@ -1,8 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, xdr::ToXdr, AddressPayload, Address, Bytes, BytesN, Env, String, Symbol};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,11 +34,23 @@ impl TypedDataAuth {
         signature: BytesN<64>,
         signer: Address,
     ) {
+        // Compute the EIP‑712 domain separator and struct hash, then the full message hash
         let domain_hash = Self::domain_separator_hash(&env, &domain);
         let struct_hash = Self::struct_hash(&env, &transfer);
-        let _message_hash = Self::message_hash(&env, &domain_hash, &struct_hash);
-        let _signature = signature;
+        let message_hash = Self::message_hash(&env, &domain_hash, &struct_hash);
 
+        // Extract the Ed25519 public key from the signer address (requires `hazmat` feature)
+        let public_key = match signer.to_payload() {
+            Some(soroban_sdk::AddressPayload::AccountIdPublicKeyEd25519(pk)) => pk,
+            _ => panic!("Signer address does not contain an Ed25519 public key"),
+        };
+
+        // Verify the signature against the computed message hash
+        if !env.crypto().ed25519_verify(&public_key, &message_hash.into(), &signature) {
+            panic!("Signature verification failed");
+        }
+
+        // Require auth for the signer (ensures transaction includes proper auth)
         signer.require_auth();
 
         // Log the successful authorization (optional)
