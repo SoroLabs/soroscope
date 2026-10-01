@@ -10,7 +10,7 @@ const isProd = process.env.NODE_ENV === "production";
  * `https:` connect-src are required to avoid breaking those flows. The CSP
  * still hardens the app: it blocks third-party script origins, `object`/`embed`
  * payloads, clickjacking (`frame-ancestors`) and form POST targets, and is
- * combined with `X-Frame-Options` / `X-Content-Type-Options` below.
+ * combined with `X-Frame-Options` / `X-Content-Type-Options` under.
  */
 function buildContentSecurityPolicy() {
   const directives = [
@@ -69,6 +69,15 @@ const securityHeaders = [
 const nextConfig = {
   reactStrictMode: true,
   transpilePackages: ["@creit.tech/stellar-wallets-kit"],
+  experimental: {
+    optimizePackageImports: [
+      "lucide-react",
+      "framer-motion",
+      "recharts",
+      "mermaid",
+      "reactflow",
+    ],
+  },
   webpack: (config, { isServer }) => {
     if (!isServer) {
       config.resolve.fallback = {
