@@ -3,7 +3,7 @@ import Image from "next/image";
 
 import { useWallet } from "../context/WalletContext";
 import { motion, AnimatePresence } from "framer-motion";
-import { Wallet, Check, AlertCircle } from "lucide-react";
+import { Wallet, Check, AlertCircle, X } from "lucide-react";
 import React from "react";
 import UserIcon from "./userIcon";
 
@@ -45,8 +45,13 @@ export function WalletModal() {
           <div
             className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm"
             onClick={closeModal}
+            aria-hidden="true"
           />
           <motion.div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="wallet-dialog-title"
+            aria-describedby="wallet-dialog-description"
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.95 }}
@@ -56,12 +61,23 @@ export function WalletModal() {
             <div className="flex flex-col items-center">
               <div className="text-center mb-6">
                 <h2 className="text-2xl font-medium text-white">
+                  <span id="wallet-dialog-title">
                   Connect Wallet
+                  </span>
                 </h2>
-                <p className="mt-2 text-[#92A5A8] text-sm">
+                <p id="wallet-dialog-description" className="mt-2 text-[#92A5A8] text-sm">
                   Connect your wallet to get started with SoroScope
                 </p>
               </div>
+
+              <button
+                type="button"
+                onClick={closeModal}
+                aria-label="Close wallet connection dialog"
+                className="absolute right-4 top-4 rounded-lg p-2 text-slate-300 hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+              >
+                <X aria-hidden="true" className="h-5 w-5" />
+              </button>
 
               {error && (
                 <div className="w-full mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-center gap-2">
@@ -78,6 +94,7 @@ export function WalletModal() {
 
                   return (
                     <button
+                      type="button"
                       key={wallet.id}
                       onClick={() => setActiveSelection(wallet.id)}
                       className={`flex items-center gap-4 w-full p-4 rounded-xl transition-all border ${isSelected
@@ -120,6 +137,7 @@ export function WalletModal() {
               </div>
 
               <button
+                type="button"
                 onClick={handleConnectClick}
                 disabled={!activeSelection || isConnecting}
                 className={`w-full py-3 rounded-xl font-medium transition-all flex items-center justify-center gap-2 ${activeSelection && !isConnecting

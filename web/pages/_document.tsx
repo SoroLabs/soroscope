@@ -21,7 +21,7 @@ const themeInitializer = `
 
 export default function Document() {
   return (
-    <Html>
+    <Html lang="en">
       <Head>
         <meta name="color-scheme" content="dark light" />
         <script dangerouslySetInnerHTML={{ __html: themeInitializer }} />

@@ -138,6 +138,9 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
           const hasError = !!errors[input.name];
           const complex = isComplexType(input.type);
           const useJson = complex && jsonMode[input.name];
+          const inputId = `contract-input-${encodeURIComponent(input.name)}`;
+          const descriptionId = input.description ? `${inputId}-description` : undefined;
+          const errorId = hasError ? `${inputId}-error` : undefined;
 
           return (
           <div
@@ -149,6 +152,7 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
             }}
           >
             <label
+              htmlFor={inputId}
               style={{
                 fontSize: '14px',
                 fontWeight: '500',
@@ -167,6 +171,7 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
             </label>
             {input.description && (
               <p
+                id={descriptionId}
                 style={{
                   fontSize: '12px',
                   color: 'var(--text-secondary)',
@@ -197,50 +202,65 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
             )}
             {useJson ? (
               <textarea
+                id={inputId}
                 placeholder={`Enter ${input.type} as JSON`}
                 value={fieldValue(input.name)}
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
+                aria-invalid={hasError || undefined}
+                aria-describedby={[descriptionId, errorId].filter(Boolean).join(' ') || undefined}
                 rows={4}
                 style={{ ...inputStyle(hasError), fontFamily: 'monospace', resize: 'vertical' }}
               />
             ) : input.type === 'address' ? (
               <input
+                id={inputId}
                 type="text"
                 placeholder="Enter Stellar address (G...)"
                 value={fieldValue(input.name)}
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
+                aria-invalid={hasError || undefined}
+                aria-describedby={[descriptionId, errorId].filter(Boolean).join(' ') || undefined}
                 style={{ ...inputStyle(hasError), fontFamily: 'monospace' }}
               />
             ) : isNumericType(input.type) ? (
               <input
+                id={inputId}
                 type="text"
                 placeholder={`Enter ${input.type} value`}
                 value={fieldValue(input.name)}
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
+                aria-invalid={hasError || undefined}
+                aria-describedby={[descriptionId, errorId].filter(Boolean).join(' ') || undefined}
                 style={inputStyle(hasError)}
               />
             ) : input.type === 'string' || input.type === 'symbol' ? (
               <input
+                id={inputId}
                 type="text"
                 placeholder={`Enter ${input.type}`}
                 value={fieldValue(input.name)}
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
+                aria-invalid={hasError || undefined}
+                aria-describedby={[descriptionId, errorId].filter(Boolean).join(' ') || undefined}
                 style={inputStyle(hasError)}
               />
             ) : input.type === 'bool' ? (
               <select
+                id={inputId}
                 value={formData[input.name] === undefined ? '' : String(formData[input.name])}
                 onChange={(e) => handleChange(input.name, e.target.value === 'true')}
                 required={!input.optional}
                 disabled={loading}
+                aria-invalid={hasError || undefined}
+                aria-describedby={[descriptionId, errorId].filter(Boolean).join(' ') || undefined}
                 style={inputStyle(hasError)}
               >
                 <option value="">Select value</option>
@@ -249,17 +269,20 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
               </select>
             ) : (
               <input
+                id={inputId}
                 type="text"
                 placeholder="Enter value"
                 value={fieldValue(input.name)}
                 onChange={(e) => handleChange(input.name, e.target.value)}
                 required={!input.optional}
                 disabled={loading}
+                aria-invalid={hasError || undefined}
+                aria-describedby={[descriptionId, errorId].filter(Boolean).join(' ') || undefined}
                 style={inputStyle(hasError)}
               />
             )}
             {hasError && (
-              <p style={{ color: '#f85149', fontSize: '12px', margin: '2px 0 0 0' }}>
+              <p id={errorId} role="alert" style={{ color: '#f85149', fontSize: '12px', margin: '2px 0 0 0' }}>
                 {errors[input.name]}
               </p>
             )}
