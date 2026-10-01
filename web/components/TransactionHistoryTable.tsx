@@ -420,7 +420,7 @@ export function TransactionHistoryTable({
                     <td className="px-4 py-3 font-mono text-xs text-[#c9d1d9]">
                       <div className="flex items-center gap-2">
                         <span className="truncate">{tx.hash}</span>
-                        <CopyButton value={tx.hash} />
+                        <CopyButton text={tx.hash} />
                       </div>
                     </td>
                     <td className="px-4 py-3 text-xs text-[#c9d1d9]">{tx.functionName}</td>

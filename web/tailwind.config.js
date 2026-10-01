@@ -52,6 +52,33 @@ module.exports = {
         "s-2xl": "1rem 0 0 1rem",
         "e-2xl": "0 1rem 1rem 0",
       },
+      keyframes: {
+        "copy-fade-in": {
+          from: { opacity: "0" },
+          to: { opacity: "1" },
+        },
+        "copy-badge-pop": {
+          "0%": { transform: "scale(0.92)" },
+          "60%": { transform: "scale(1.04)" },
+          "100%": { transform: "scale(1)" },
+        },
+        "copy-check-pop": {
+          "0%": { transform: "scale(0.4) rotate(-20deg)" },
+          "60%": { transform: "scale(1.25) rotate(6deg)" },
+          "100%": { transform: "scale(1) rotate(0deg)" },
+        },
+        "copy-shake": {
+          "0%, 100%": { transform: "translateX(0)" },
+          "25%": { transform: "translateX(-3px)" },
+          "75%": { transform: "translateX(3px)" },
+        },
+      },
+      animation: {
+        "copy-fade-in": "copy-fade-in 150ms ease-out",
+        "copy-badge-pop": "copy-badge-pop 200ms ease-out",
+        "copy-check-pop": "copy-check-pop 300ms ease-out",
+        "copy-shake": "copy-shake 250ms ease-in-out",
+      },
     },
   },
   plugins: [],
