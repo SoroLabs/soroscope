@@ -6,7 +6,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use soroban_sdk::xdr::{
-    AccountId, DiagnosticEvent, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization,
+    AccountId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization,
     HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerEntry, LedgerKey,
     LedgerKeyContractCode, LedgerKeyContractData, Limits, Memo, MuxedAccount, Operation,
     OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScMapEntry, ScSymbol, ScVal,
@@ -1569,11 +1569,29 @@ pub struct CallNode {
     pub contract_id: String,
     pub function: String,
     pub children: Vec<CallNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_instructions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_read_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_write_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_cpu_instructions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_ram_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_ledger_read_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_ledger_write_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallGraph {
     pub root: CallNode,
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -1660,9 +1678,13 @@ impl CallGraph {
 
     fn append_mermaid_nodes(&self, node: &CallNode, mermaid: &mut String, id_gen: &mut usize) {
         let current_id = *id_gen;
+        let cpu_label = node
+            .exclusive_cpu_instructions
+            .map(|cpu| format!("\\nCPU (exclusive): {cpu}"))
+            .unwrap_or_default();
         mermaid.push_str(&format!(
-            "    n{current_id}[\"{}:{}\"]\n",
-            node.contract_id, node.function
+            "    n{current_id}[\"{}:{}{cpu_label}\"]\n",
+            node.contract_id, node.function,
         ));
 
         for child in &node.children {
@@ -3716,69 +3738,11 @@ impl SimulationEngine {
     }
 
     fn extract_call_graph(&self, events: &[String]) -> Option<CallGraph> {
-        let mut stack: Vec<CallNode> = Vec::new();
-        let mut root: Option<CallNode> = None;
-
-        for event_b64 in events {
-            let bytes = match BASE64.decode(event_b64) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-
-            let diag_event = match DiagnosticEvent::from_xdr(&bytes, Limits::none()) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            if !diag_event.in_successful_contract_call {
-                continue;
-            }
-
-            let contract_id = match &diag_event.event.contract_id {
-                Some(Hash(h)) => Strkey::Contract(StrkeyContract(*h)).to_string(),
-                None => "Host".to_string(),
-            };
-
-            let (topics, _data) = match &diag_event.event.body {
-                soroban_sdk::xdr::ContractEventBody::V0(v0) => (&v0.topics, &v0.data),
-            };
-
-            if topics.is_empty() {
-                continue;
-            }
-
-            let topic0 = match &topics[0] {
-                ScVal::Symbol(s) => s.to_string(),
-                _ => continue,
-            };
-
-            if topic0 == "fn_call" && topics.len() >= 3 {
-                // Topic 1: Contract Address (ignored since we use event.contract_id)
-                // Topic 2: Function Name
-                let function = match &topics[2] {
-                    ScVal::Symbol(s) => s.to_string(),
-                    _ => "unknown".to_string(),
-                };
-
-                let node = CallNode {
-                    contract_id: contract_id.clone(),
-                    function,
-                    children: Vec::new(),
-                };
-
-                stack.push(node);
-            } else if topic0 == "fn_return" {
-                if let Some(finished_node) = stack.pop() {
-                    if let Some(parent) = stack.last_mut() {
-                        parent.children.push(finished_node);
-                    } else {
-                        root = Some(finished_node);
-                    }
-                }
-            }
-        }
-
-        root.map(|r| CallGraph { root: r })
+        let parsed = crate::call_trace_parser::parse_call_trace_with_cap(events, 0)?;
+        Some(CallGraph {
+            root: convert_call_node(parsed.root),
+            incomplete: parsed.incomplete,
+        })
     }
 
     pub(crate) fn extract_touched_ledger_keys(&self, transaction_data: &str) -> Vec<String> {
