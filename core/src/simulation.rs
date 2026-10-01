@@ -246,6 +246,8 @@ pub struct SorobanResources {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq, Default)]
 pub struct DurabilityByteCounts {
+    #[serde(default)]
+    pub entries: u64,
     pub code: u64,
     pub instance: u64,
     pub persistent: u64,
@@ -263,6 +265,7 @@ impl DurabilityByteCounts {
     }
 
     pub(crate) fn add(&mut self, kind: LedgerKeyKind, bytes: u64) {
+        self.entries = self.entries.saturating_add(1);
         let bucket = match kind {
             LedgerKeyKind::Code => &mut self.code,
             LedgerKeyKind::Instance => &mut self.instance,
@@ -288,9 +291,11 @@ impl BytesByDurability {
     pub fn from_aggregates_as_other(ledger_read_bytes: u64, ledger_write_bytes: u64) -> Self {
         Self {
             read: DurabilityByteCounts {
+                entries: 0,
                 other: ledger_read_bytes,
             },
             write: DurabilityByteCounts {
+                entries: 0,
                 other: ledger_write_bytes,
             },
         }
@@ -542,15 +547,18 @@ pub struct UpgradeProfile {
 
 /// Match the local fee formula used by simulation results.
 pub fn estimate_resource_fee_stroops(resources: &SorobanResources) -> u64 {
-    let cpu_cost = resources.cpu_instructions / 10_000;
-    let ram_cost = resources.ram_bytes / 1_024;
-    let ledger_bytes = resources
-        .ledger_read_bytes
-        .saturating_add(resources.ledger_write_bytes);
-    let ledger_cost = ledger_bytes / 1_024;
-    cpu_cost
-        .saturating_add(ram_cost)
-        .saturating_add(ledger_cost)
+    let config = crate::fee_quote::SorobanFeeConfig::checked_in();
+    let footprint = crate::fee_quote::FeeQuoteInput {
+        transaction_size_bytes: 0,
+        ..crate::fee_quote::FeeQuoteInput::from_soroban_resources(resources, None)
+    };
+    crate::fee_quote::price_local_resource_fee(
+        resources,
+        &footprint,
+        crate::fee_quote::DurabilitySplit::unknown(),
+        config,
+    )
+    .resource_fee
 }
 
 /// Result of a batched simulation snapshot ledger hydration operation.
@@ -1540,13 +1548,8 @@ pub struct SimulationResult {
     pub auth_tree: AuthTreeReport,
     /// Protocol version used for this simulation
     pub protocol_version: u32,
-    /// Per-cost-type breakdown of the host budget for this invocation.
-    ///
-    /// Present only when the node returned budget diagnostic events.  Absent
-    /// for pre-protocol-20 nodes and for RPC responses that contain no budget
-    /// events.  Never causes a simulation to fail when missing.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub cost_breakdown: Option<CostBreakdown>,
+    #[serde(default)]
+    pub fee_calibration: crate::fee_quote::FeeCalibration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2167,6 +2170,8 @@ pub struct SimulationRpcResult {
     transaction_data: String,
     #[serde(default)]
     latest_ledger: u64,
+    #[serde(default)]
+    min_resource_fee: Option<serde_json::Value>,
     #[serde(default)]
     cost: Option<ResourceCost>,
     #[serde(default)]
@@ -4134,7 +4139,48 @@ impl SimulationEngine {
             SorobanResources::default()
         };
 
-        let cost_stroops = self.calculate_cost(&resources);
+        let fee_config = crate::fee_quote::SorobanFeeConfig::checked_in();
+        let mut footprint = crate::fee_quote::FeeQuoteInput::from_soroban_resources(
+            &resources,
+            rent_bytes,
+        );
+        footprint.read_entries = bytes_by_durability.read.entries;
+        footprint.write_entries = bytes_by_durability.write.entries;
+        let durability_split = if bytes_by_durability.write.other == 0
+            && bytes_by_durability.write.code == 0
+            && bytes_by_durability.write.instance == 0
+        {
+            crate::fee_quote::DurabilitySplit::mixed(
+                bytes_by_durability.write.temporary,
+                bytes_by_durability.write.persistent,
+            )
+        } else {
+            crate::fee_quote::DurabilitySplit::unknown()
+        };
+        let priced_fee = crate::fee_quote::price_local_resource_fee(
+            &resources,
+            &footprint,
+            durability_split,
+            fee_config,
+        );
+        let cost_stroops = priced_fee.resource_fee;
+        let rpc_min_resource_fee = rpc_result
+            .min_resource_fee
+            .as_ref()
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .or_else(|| value.as_u64())
+            });
+        let fee_calibration = crate::fee_quote::FeeCalibration::compare_rpc(
+            cost_stroops,
+            rpc_min_resource_fee,
+            fee_config,
+        );
+        if let Some(error) = &fee_calibration.calibration_error {
+            tracing::error!(%error, "Local resource fee failed RPC calibration");
+        }
         Ok(SimulationResult {
             resources,
             bytes_by_durability,
@@ -4148,8 +4194,7 @@ impl SimulationEngine {
             call_graph: None,
             state_snapshot: None,
             protocol_version: 0, // RPC version unknown here, will be updated if possible
-            cost_breakdown: None,
-            ..Default::default()
+            fee_calibration,
         })
     }
 
@@ -5544,7 +5589,7 @@ mod tests {
             call_graph: None,
             state_snapshot: None,
             protocol_version: 0,
-            cost_breakdown: None,
+            fee_calibration: Default::default(),
         };
         let second = SimulationResult {
             latest_ledger: 2000,
@@ -5581,7 +5626,7 @@ mod tests {
             call_graph: None,
             state_snapshot: None,
             protocol_version: 0,
-            cost_breakdown: None,
+            fee_calibration: Default::default(),
         };
         let mut second = first.clone();
         second.resources.cpu_instructions = 101;
@@ -6030,7 +6075,7 @@ mod tests {
                 call_graph: None,
                 state_snapshot: None,
                 protocol_version: 0,
-                cost_breakdown: None,
+                fee_calibration: Default::default(),
             }
         }
 
