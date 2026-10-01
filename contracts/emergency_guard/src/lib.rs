@@ -31,6 +31,13 @@ impl PauseType {
     pub const STAKE: u32 = 1 << 7;
     /// Pause borrow / flash loan operations
     pub const BORROW: u32 = 1 << 8;
+    /// Pause reward claims.
+    ///
+    /// Reward-bearing contracts (`liquidity_pool`, `staking_rewards`) gate
+    /// `claim_rewards` on this bit, so it belongs to the guard's operation set
+    /// instead of being re-invented per contract. The next free bit after
+    /// `BORROW`, so adding it leaves every existing bucket untouched.
+    pub const CLAIM_REWARDS: u32 = 1 << 9;
 
     pub fn new(value: u32) -> PauseMask {
         PauseMask(value)

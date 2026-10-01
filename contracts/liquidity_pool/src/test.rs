@@ -2466,266 +2466,234 @@ fn test_amount_in_quote_round_trips_against_amount_out() {
     );
 }
 
-// ===== Dynamic Fee Rate Adjustment (Issue #85) =====
+// ── Realized-slippage metric (issue #862) ────────────────────────────────────
 
-/// Configure a pool with the given base fee and volatility parameters, then
-/// return the client, oracle client, and oracle address.
-fn dynamic_fee_fixture<'a>(
-    e: &'a Env,
-    base_fee_bps: u32,
-    max_fee_bps: u32,
-    volatility_scale_bps: u32,
-) -> (LiquidityPoolClient<'a>, MockOracleClient<'a>, Address) {
-    let contract_id = e.register(LiquidityPool, ());
-    let client = LiquidityPoolClient::new(e, &contract_id);
+/// Every `("slippage", user)` metric emitted so far, decoded, in emission order.
+fn slippage_metrics(e: &Env) -> Vec<(Address, SlippageMetricEvent)> {
+    let slippage_topic = Symbol::new(e, "slippage");
+    e.events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| {
+            if topics.len() != 2 {
+                return false;
+            }
+            let topic: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(e);
+            topic.is_ok() && topic.unwrap() == slippage_topic
+        })
+        .map(|(_, topics, data)| {
+            let user: Address = topics.get(1).unwrap().try_into_val(e).unwrap();
+            let metric: SlippageMetricEvent = data.try_into_val(e).unwrap();
+            (user, metric)
+        })
+        .collect()
+}
 
-    let admin = Address::generate(e);
-    let token_a = e
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let token_b = e
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
+#[test]
+fn test_swap_exact_in_emits_slippage_metric() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
 
-    e.cost_estimate().budget().reset_unlimited();
-    client.initialize(&admin, &token_a, &token_b);
+    // 100 A in against 1000/1000 reserves buys 100 B at spot; the 30 bps fee and
+    // the price impact deliver 90 instead.
+    let received = client.swap_exact_in(&trader, &false, &100, &90);
+    assert_eq!(received, 90);
 
-    let oracle_id = e.register(MockOracle, ());
-    let oracle = MockOracleClient::new(e, &oracle_id);
-    oracle.set_twap(&100_000_000);
-    oracle.set_timestamp(&1_000);
+    let metrics = slippage_metrics(&e);
+    assert_eq!(metrics.len(), 1, "exactly one metric per settled swap");
 
-    client.configure_volatility_oracle(
-        &oracle_id,
-        &base_fee_bps,
-        &max_fee_bps,
-        &volatility_scale_bps,
+    let (topic_user, metric) = &metrics[0];
+    assert_eq!(topic_user, &trader, "metric is keyed by the swapping user");
+    assert_eq!(metric.user, trader);
+    assert!(!metric.buy_a);
+    assert_eq!(metric.amount_in, 100);
+    assert_eq!(metric.amount_out, received);
+    assert_eq!(
+        metric.limit_amount, 90,
+        "the caller's own floor is recorded"
     );
-
-    (client, oracle, oracle_id)
+    assert_eq!(metric.spot_amount_out, 100);
+    assert_eq!(metric.slippage_bps, 1_000, "10 of 100 units, i.e. 1000 bps");
 }
 
 #[test]
-fn test_dynamic_fee_defaults_to_base_fee() {
+fn test_swap_emits_slippage_metric_with_in_max_limit() {
     let e = Env::default();
     e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
 
-    let (client, _oracle, _oracle_id) = dynamic_fee_fixture(&e, 30, 500, 10_000);
+    // Exact-output swap: `in_max` is the guard this direction carries.
+    let paid = client.swap(&trader, &false, &100, &150);
 
-    // No volatility observed yet: the effective fee equals the base fee.
-    assert_eq!(client.get_effective_fee(), 30);
-    assert_eq!(client.get_fee(), 30);
+    let metrics = slippage_metrics(&e);
+    assert_eq!(metrics.len(), 1);
+    let metric = &metrics[0].1;
+    assert_eq!(metric.amount_out, 100);
+    assert_eq!(metric.amount_in, paid);
+    assert_eq!(metric.limit_amount, 150);
+    // Balanced reserves: spot returns `paid` of token B for `paid` of token A, so
+    // the shortfall is what paying above spot for 100 B cost.
+    assert_eq!(metric.spot_amount_out, paid);
+    assert_eq!(metric.slippage_bps, (paid - 100) * 10_000 / paid);
+    assert!(metric.slippage_bps > 0);
 }
 
 #[test]
-fn test_dynamic_fee_scales_with_volatility() {
+fn test_rejected_swap_emits_no_slippage_metric() {
     let e = Env::default();
     e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
 
-    let (client, oracle, _oracle_id) = dynamic_fee_fixture(&e, 30, 500, 10_000);
-
-    // Seed the baseline TWAP.
-    client.update_dynamic_fee();
-    assert_eq!(client.get_effective_fee(), 30);
-
-    // 5% TWAP move => 500 bps volatility. With a 10_000 bps scale, the fee
-    // should rise proportionally: 30 + 500 * 30 / 10_000 = 31 bps.
-    oracle.set_twap(&105_000_000);
-    oracle.set_timestamp(&2_000);
-    client.update_dynamic_fee();
-    assert_eq!(client.get_last_volatility_bps(), 500);
-    assert_eq!(client.get_effective_fee(), 31);
-
-    // 20% TWAP move => 2000 bps volatility => 30 + 2000 * 30 / 10_000 = 36 bps.
-    oracle.set_twap(&120_000_000);
-    oracle.set_timestamp(&3_000);
-    client.update_dynamic_fee();
-    assert_eq!(client.get_last_volatility_bps(), 2000);
-    assert_eq!(client.get_effective_fee(), 36);
+    // Nothing settled, so there is nothing to report.
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &100, &91),
+        Err(Ok(Error::SlippageExceeded))
+    );
+    assert_eq!(slippage_metrics(&e).len(), 0);
+    assert_eq!(client.get_reserves(), (1000, 1000));
 }
 
 #[test]
-fn test_dynamic_fee_capped_at_max() {
+fn test_slippage_metric_buy_a_direction() {
     let e = Env::default();
     e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
 
-    let (client, oracle, _oracle_id) = dynamic_fee_fixture(&e, 30, 100, 10_000);
+    // B in, A out: the metric follows the direction that actually executed.
+    let received = client.swap_exact_in(&trader, &true, &100, &0);
 
-    client.update_dynamic_fee();
-
-    // A 100% TWAP move would push the scaled fee far past the cap.
-    oracle.set_twap(&200_000_000);
-    oracle.set_timestamp(&2_000);
-    client.update_dynamic_fee();
-
-    assert_eq!(client.get_last_volatility_bps(), 10_000);
-    // Must be clamped to max_fee_bps, never above.
-    assert_eq!(client.get_effective_fee(), 100);
+    let metrics = slippage_metrics(&e);
+    assert_eq!(metrics.len(), 1);
+    assert!(metrics[0].1.buy_a);
+    assert_eq!(metrics[0].1.amount_out, received);
+    assert_eq!(metrics[0].1.spot_amount_out, 100);
+    assert_eq!(metrics[0].1.slippage_bps, 1_000);
 }
 
 #[test]
-fn test_dynamic_fee_respects_admin_max_fee() {
-    let e = Env::default();
-    e.mock_all_auths();
+fn test_slippage_metric_captures_price_impact_beyond_the_fee() {
+    // A dust trade against a deep pool pays barely more than the fee...
+    let shallow_env = Env::default();
+    shallow_env.mock_all_auths();
+    let (shallow_client, shallow_trader, _other, _token_a, _token_b) =
+        slippage_fixture(&shallow_env, 1_000_000, 1_000_000);
+    shallow_client.swap_exact_in(&shallow_trader, &false, &1_000, &0);
+    let shallow_metrics = slippage_metrics(&shallow_env);
+    assert_eq!(shallow_metrics.len(), 1);
+    let shallow_bps = shallow_metrics[0].1.slippage_bps;
 
-    let (client, oracle, _oracle_id) = dynamic_fee_fixture(&e, 30, 500, 10_000);
+    // ...while a trade worth half the reserve moves the price hard.
+    let deep_env = Env::default();
+    deep_env.mock_all_auths();
+    let (deep_client, deep_trader, _other, _token_a, _token_b) =
+        slippage_fixture(&deep_env, 1_000_000, 1_000_000);
+    deep_client.swap_exact_in(&deep_trader, &false, &500_000, &0);
+    let deep_metrics = slippage_metrics(&deep_env);
+    assert_eq!(deep_metrics.len(), 1);
+    let deep_bps = deep_metrics[0].1.slippage_bps;
 
-    client.update_dynamic_fee();
-    oracle.set_twap(&150_000_000);
-    oracle.set_timestamp(&2_000);
-    client.update_dynamic_fee();
-
-    // Even with high volatility, the effective fee must never exceed the
-    // contract-wide MAX_FEE_BPS ceiling.
-    assert!(client.get_effective_fee() <= MAX_FEE_BPS);
-}
-
-#[test]
-fn test_dynamic_fee_swap_uses_effective_fee() {
-    let e = Env::default();
-    e.mock_all_auths();
-
-    let contract_id = e.register(LiquidityPool, ());
-    let client = LiquidityPoolClient::new(&e, &contract_id);
-
-    let admin = Address::generate(&e);
-    let token_a = e
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let token_b = e
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
-    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
-
-    let lp = Address::generate(&e);
-    let trader = Address::generate(&e);
-
-    e.cost_estimate().budget().reset_unlimited();
-    client.initialize(&admin, &token_a, &token_b);
-
-    token_a_admin.mint(&lp, &1_000_000);
-    token_b_admin.mint(&lp, &1_000_000);
-    client.deposit(&lp, &1_000_000, &1_000_000);
-
-    token_a_admin.mint(&trader, &10_000);
-    token_b_admin.mint(&trader, &10_000);
-
-    let oracle_id = e.register(MockOracle, ());
-    let oracle = MockOracleClient::new(&e, &oracle_id);
-    oracle.set_twap(&100_000_000);
-    oracle.set_timestamp(&1_000);
-    client.configure_volatility_oracle(&oracle_id, &30, &500, &10_000);
-    client.update_dynamic_fee();
-
-    let low_vol_out = client.get_amount_out(&false, &10_000);
-
-    // Spike volatility and refresh the fee.
-    oracle.set_twap(&150_000_000);
-    oracle.set_timestamp(&2_000);
-    client.update_dynamic_fee();
-    assert!(client.get_effective_fee() > 30);
-
-    let high_vol_out = client.get_amount_out(&false, &10_000);
     assert!(
-        high_vol_out < low_vol_out,
-        "higher volatility fee should reduce output: {high_vol_out} vs {low_vol_out}"
+        shallow_bps >= DEFAULT_BASE_FEE_BPS,
+        "the fee alone is already {} bps, got {}",
+        DEFAULT_BASE_FEE_BPS,
+        shallow_bps
+    );
+    assert!(
+        deep_bps > shallow_bps + DEFAULT_BASE_FEE_BPS,
+        "price impact should dominate the fee: {} vs {}",
+        deep_bps,
+        shallow_bps
     );
 }
 
 #[test]
-fn test_dynamic_fee_requires_oracle_config() {
+fn test_inspect_swap_matches_the_executed_fill() {
     let e = Env::default();
     e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
 
-    let contract_id = e.register(LiquidityPool, ());
-    let client = LiquidityPoolClient::new(&e, &contract_id);
-
-    let admin = Address::generate(&e);
-    let token_a = e
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let token_b = e
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-
-    client.initialize(&admin, &token_a, &token_b);
-
-    // Without configuration, updating must fail rather than silently no-op.
+    let report = client.inspect_swap(&false, &100, &90);
+    assert!(!report.buy_a);
+    assert_eq!(report.amount_in, 100);
+    assert_eq!(report.amount_out, 90);
+    assert_eq!(report.spot_amount_out, 100);
+    assert_eq!(report.slippage_bps, 1_000);
+    assert_eq!(report.min_amount_out, 90);
     assert_eq!(
-        client.try_update_dynamic_fee(),
-        Err(Ok(Error::OracleNotConfigured))
+        report.tolerance_bps, 1_000,
+        "the floor tolerates 10 of 100 units"
     );
+    assert!(report.within_tolerance);
+
+    // Inspecting is read-only.
+    assert_eq!(client.get_reserves(), (1000, 1000));
+
+    // And it predicts the fill, including the metric that fill will emit.
+    let received = client.swap_exact_in(&trader, &false, &100, &90);
+    assert_eq!(received, report.amount_out);
+    let metrics = slippage_metrics(&e);
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].1.amount_out, report.amount_out);
+    assert_eq!(metrics[0].1.spot_amount_out, report.spot_amount_out);
+    assert_eq!(metrics[0].1.slippage_bps, report.slippage_bps);
 }
 
 #[test]
-fn test_dynamic_fee_rejects_invalid_config() {
+fn test_inspect_swap_reports_missed_floor_without_reverting() {
     let e = Env::default();
     e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
 
-    let contract_id = e.register(LiquidityPool, ());
-    let client = LiquidityPoolClient::new(&e, &contract_id);
+    // One unit above the quote: reported, so the caller can resize instead of
+    // learning about the shortfall from a revert.
+    let report = client.inspect_swap(&false, &100, &91);
+    assert_eq!(report.amount_out, 90);
+    assert_eq!(report.min_amount_out, 91);
+    assert!(!report.within_tolerance);
+    assert_eq!(report.tolerance_bps, 900);
 
-    let admin = Address::generate(&e);
-    let token_a = e
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let token_b = e
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    client.initialize(&admin, &token_a, &token_b);
-
-    let oracle_id = e.register(MockOracle, ());
-
-    // base > max is invalid.
+    // ...which is exactly what the swap does with that floor.
     assert_eq!(
-        client.try_configure_volatility_oracle(&oracle_id, &500, &100, &10_000),
-        Err(Ok(Error::InvalidFee))
+        client.try_swap_exact_in(&trader, &false, &100, &91),
+        Err(Ok(Error::SlippageExceeded))
     );
-    // max above the contract ceiling is invalid.
-    assert_eq!(
-        client.try_configure_volatility_oracle(&oracle_id, &30, &(MAX_FEE_BPS + 1), &10_000),
-        Err(Ok(Error::InvalidFee))
-    );
-    // zero scale would divide by zero.
-    assert_eq!(
-        client.try_configure_volatility_oracle(&oracle_id, &30, &500, &0),
-        Err(Ok(Error::InvalidFee))
-    );
+    assert_eq!(client.get_reserves(), (1000, 1000));
+    assert_eq!(slippage_metrics(&e).len(), 0);
 }
 
 #[test]
-fn test_dynamic_fee_falls_back_when_oracle_stale() {
+fn test_inspect_swap_tolerates_any_floor_when_floor_is_zero() {
     let e = Env::default();
     e.mock_all_auths();
+    let (client, _trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
 
-    let (client, oracle, _oracle_id) = dynamic_fee_fixture(&e, 30, 500, 10_000);
-
-    client.update_dynamic_fee();
-    oracle.set_twap(&150_000_000);
-    oracle.set_timestamp(&2_000);
-    client.update_dynamic_fee();
-    assert!(client.get_effective_fee() > 30);
-
-    // Advance the ledger far past the staleness window; the fee must revert to
-    // the base fee rather than trusting a stale oracle reading.
-    let mut info = e.ledger().get();
-    info.sequence_number = 1_000_000;
-    e.ledger().set(info);
-
-    assert_eq!(client.get_effective_fee(), 30);
+    let report = client.inspect_swap(&false, &100, &0);
+    assert_eq!(
+        report.tolerance_bps, 10_000,
+        "no floor tolerates everything"
+    );
+    assert!(report.within_tolerance);
+    assert_eq!(report.amount_out, 90);
 }
 
 #[test]
-fn test_dynamic_fee_volatility_config_round_trip() {
+fn test_inspect_swap_rejects_invalid_amounts() {
     let e = Env::default();
     e.mock_all_auths();
+    let (client, _trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
 
-    let (client, _oracle, oracle_id) = dynamic_fee_fixture(&e, 25, 250, 5_000);
-
-    let cfg: VolatilityConfig = client.get_volatility_config();
-    assert_eq!(cfg.oracle, oracle_id);
-    assert_eq!(cfg.base_fee_bps, 25);
-    assert_eq!(cfg.max_fee_bps, 250);
-    assert_eq!(cfg.volatility_scale_bps, 5_000);
+    assert_eq!(
+        client.try_inspect_swap(&false, &0, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        client.try_inspect_swap(&false, &-100, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // A negative floor would silently disable the check, so reject it.
+    assert_eq!(
+        client.try_inspect_swap(&false, &100, &-1),
+        Err(Ok(Error::InvalidAmount))
+    );
 }
