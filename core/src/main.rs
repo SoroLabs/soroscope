@@ -674,6 +674,8 @@ pub struct ResourceReport {
     #[schema(example = 1000)]
     pub cost_stroops: u64,
     pub auth_tree: crate::simulation::AuthTreeReport,
+    /// Usage-vs-limit headroom for CPU, memory, entry counts and tx size.
+    pub limit_headroom: Option<crate::simulation::LimitHeadroom>,
     /// Report showing which data was injected vs live
     pub state_dependency: Option<Vec<StateDependencyReport>>,
     /// TTL status for touched ledger entries and extension suggestions.
@@ -985,10 +987,31 @@ fn to_report(
         &crate::simulation::extract_written_contract_data_keys(&result.transaction_data),
         crate::simulation::NetworkLimits::default().max_entry_size_bytes,
     );
+
+    // #991: compute (or reuse) limit headroom and fold its insights into the
+    // report. Entry counts come from the footprint, not byte sizes.
+    let limit_headroom = result.limit_headroom.clone().or_else(|| {
+        let footprint_counts = crate::simulation::extract_footprint_entry_counts(&result.transaction_data);
+        Some(crate::simulation::compute_limit_headroom(
+            &result.resources,
+            Some(footprint_counts),
+            &crate::simulation::NetworkLimits::default(),
+            crate::simulation::LimitsSource::Builtin,
+        ))
+    });
+    let headroom_insights = limit_headroom
+        .as_ref()
+        .map(|h| crate::insights::insights_from_headroom(h, "limit_headroom"))
+        .unwrap_or_default();
+
     let insights_report = insights_engine.analyze_with_durability_and_additional_insights(
         &result.resources,
         &bytes_by_durability,
-        entry_size_analysis.insights(),
+        {
+            let mut combined = entry_size_analysis.insights();
+            combined.extend(headroom_insights);
+            combined
+        },
     );
 
     ResourceReport {
@@ -1000,6 +1023,7 @@ fn to_report(
         bytes_by_durability,
         cost_stroops: result.cost_stroops,
         auth_tree: result.auth_tree.clone(),
+        limit_headroom,
         state_dependency: result.state_dependency.as_ref().map(|deps| {
             deps.iter()
                 .map(|d| StateDependencyReport {
@@ -3305,7 +3329,8 @@ mod tests {
             call_graph: None,
             state_snapshot: None,
             protocol_version: 0,
-            fee_calibration: Default::default(),
+            cost_breakdown: None,
+            limit_headroom: None,
         };
 
         let insights_engine = InsightsEngine::new();

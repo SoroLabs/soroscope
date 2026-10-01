@@ -43,7 +43,6 @@ pub mod webhook_validation;
 pub mod webhooks;
 pub mod worker_pool;
 pub mod ws;
-pub mod xdr_decoder;
 
 pub use errors::AppError;
 pub use logging::{build_env_filter, init_logging, structured_logging_middleware, LogFormat};
