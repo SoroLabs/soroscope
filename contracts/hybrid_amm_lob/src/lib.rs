@@ -386,7 +386,8 @@ impl HybridAmmLob {
     }
 
     /// Burn LP shares and withdraw proportional reserves.
-    pub fn withdraw(e: Env, to: Address, shares: i128) -> Result<(i128, i128), Error> {
+    pub fn withdraw(e: Env, to: Address, shares: i128) -> Result<(i128, i128)
+, Error> {
         if shares <= 0 {
             return Err(Error::InvalidAmount);
         }

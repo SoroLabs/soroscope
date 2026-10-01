@@ -3,6 +3,33 @@
 A Soroban contract that routes a swap through a limit order book first and falls
 back to a constant-product AMM for whatever the book cannot fill.
 
+## Orderbook matching engine
+
+The matching engine combines the limit orderbook queue with the AMM pool and
+routes each swap to the best available price source while preserving price
+priority.
+
+### Routing
+
+1. **Book first.** The engine walks the book in price priority, consuming the
+   best-priced resting orders that are within the configured price band. Orders
+   are matched in strict price order, so a taker always receives the best
+   available price before moving to the next level.
+2. **AMM fallback.** Whatever the book cannot fill is priced against the
+   constant-product pool reserves. The pool is the residual venue, not the
+   primary one, so book liquidity is always exhausted at a better price before
+   the AMM is touched.
+3. **Best-price selection.** At each step the engine compares the next resting
+   order's price against the pool's spot price and executes against whichever
+   offers the taker the better price, subject to the safeguards below.
+
+### Price priority execution
+
+Resting orders are kept sorted by price, so the engine can stop as soon as it
+reaches an order that is out of band or worse than the pool. This guarantees
+that no worse-priced order is ever filled while a better-priced one remains,
+and that the AMM leg only ever prices the unfilled remainder.
+
 `swap` is **exact-output**: the caller names the output amount they want and the
 maximum input they will pay (`in_max`).
 
