@@ -15,17 +15,18 @@ import {
   Settings,
   Calculator,
   BarChart3,
-  Wifi,
+  Binary,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { ConnectButton } from "./ConnectButton";
 import { NetworkSwitcher } from "./NetworkSwitcher";
 
-export type NavTab = "explorer" | "history" | "transactions" | "schema";
+export type NavTab = "explorer" | "history" | "transactions" | "schema" | "disassembly";
 
 const NAV_TABS: { id: NavTab; label: string; Icon: typeof Layers }[] = [
   { id: "explorer", label: "Result", Icon: Layers },
   { id: "schema", label: "Schema", Icon: Network },
+  { id: "disassembly", label: "Disassembly", Icon: Binary },
   { id: "history", label: "History", Icon: History },
   { id: "transactions", label: "Transactions", Icon: List },
 ];
