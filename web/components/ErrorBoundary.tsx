@@ -35,6 +35,28 @@ export function isRpcNetworkError(error: Error | null): boolean {
   );
 }
 
+/**
+ * Builds a plain-text diagnostics report for the current error state.
+ */
+export function buildDiagnosticsReport(
+  error: Error,
+  errorInfo: React.ErrorInfo | null,
+): string {
+  const lines = [
+    `Error: ${error.name || 'Error'}`,
+    `Message: ${error.message || '(no message)'}`,
+    '',
+    'Stack Trace:',
+    error.stack || '(no stack trace available)',
+  ];
+
+  if (errorInfo?.componentStack) {
+    lines.push('', 'Component Stack:', errorInfo.componentStack);
+  }
+
+  return lines.join('\n');
+}
+
 export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
   state: ErrorBoundaryState = {
     error: null,
@@ -57,6 +79,23 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
 
   toggleDetails = () => {
     this.setState((prevState) => ({ showDetails: !prevState.showDetails }));
+  };
+
+  copyDiagnostics = async () => {
+    const { error, errorInfo } = this.state;
+    if (!error) return;
+
+    const report = buildDiagnosticsReport(error, errorInfo);
+
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(report);
+      } else if (typeof window !== 'undefined') {
+        window.prompt('Copy diagnostics:', report);
+      }
+    } catch (copyError) {
+      console.error('Failed to copy diagnostics:', copyError);
+    }
   };
 
   render() {
@@ -134,10 +173,17 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
                   </button>
                   <button
                     type="button"
+                    onClick={this.copyDiagnostics}
+                    className="rounded-lg border border-amber-700/80 bg-amber-900/40 px-4 py-2.5 text-sm font-semibold text-amber-50 transition-colors hover:bg-amber-800/60 focus:outline-none focus:ring-2 focus:ring-amber-500/50"
+                  >
+                    Copy Diagnostics
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => window.location.reload()}
                     className="rounded-lg border border-slate-700 bg-slate-800/80 px-4 py-2.5 text-sm font-semibold text-slate-100 transition-colors hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500/50"
                   >
-                    Reload dashboard
+                    Reload Application
                   </button>
                 </div>
               </div>
