@@ -1,4 +1,5 @@
 use super::*;
+use crate::volatility::VolatilityConfig;
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Events, Ledger},
@@ -16,6 +17,8 @@ struct MockOracle;
 #[derive(Clone)]
 enum OracleDataKey {
     Price,
+    Twap,
+    Timestamp,
 }
 
 #[contractimpl]
@@ -29,6 +32,28 @@ impl MockOracle {
             .instance()
             .get(&OracleDataKey::Price)
             .unwrap_or(100_000_000i128)
+    }
+
+    pub fn set_twap(e: Env, twap: i128) {
+        e.storage().instance().set(&OracleDataKey::Twap, &twap);
+    }
+
+    pub fn get_twap(e: Env) -> i128 {
+        e.storage()
+            .instance()
+            .get(&OracleDataKey::Twap)
+            .unwrap_or(100_000_000i128)
+    }
+
+    pub fn set_timestamp(e: Env, ts: u64) {
+        e.storage().instance().set(&OracleDataKey::Timestamp, &ts);
+    }
+
+    pub fn get_timestamp(e: Env) -> u64 {
+        e.storage()
+            .instance()
+            .get(&OracleDataKey::Timestamp)
+            .unwrap_or(0u64)
     }
 }
 
@@ -2400,4 +2425,268 @@ fn test_amount_in_quote_round_trips_against_amount_out() {
         quoted_in >= 100,
         "round trip under-charged: {quoted_in} for {quoted_out} out"
     );
+}
+
+// ===== Dynamic Fee Rate Adjustment (Issue #85) =====
+
+/// Configure a pool with the given base fee and volatility parameters, then
+/// return the client, oracle client, and oracle address.
+fn dynamic_fee_fixture<'a>(
+    e: &'a Env,
+    base_fee_bps: u32,
+    max_fee_bps: u32,
+    volatility_scale_bps: u32,
+) -> (LiquidityPoolClient<'a>, MockOracleClient<'a>, Address) {
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(e, &contract_id);
+
+    let admin = Address::generate(e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    e.cost_estimate().budget().reset_unlimited();
+    client.initialize(&admin, &token_a, &token_b);
+
+    let oracle_id = e.register(MockOracle, ());
+    let oracle = MockOracleClient::new(e, &oracle_id);
+    oracle.set_twap(&100_000_000);
+    oracle.set_timestamp(&1_000);
+
+    client.configure_volatility_oracle(
+        &oracle_id,
+        &base_fee_bps,
+        &max_fee_bps,
+        &volatility_scale_bps,
+    );
+
+    (client, oracle, oracle_id)
+}
+
+#[test]
+fn test_dynamic_fee_defaults_to_base_fee() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (client, _oracle, _oracle_id) = dynamic_fee_fixture(&e, 30, 500, 10_000);
+
+    // No volatility observed yet: the effective fee equals the base fee.
+    assert_eq!(client.get_effective_fee(), 30);
+    assert_eq!(client.get_fee(), 30);
+}
+
+#[test]
+fn test_dynamic_fee_scales_with_volatility() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (client, oracle, _oracle_id) = dynamic_fee_fixture(&e, 30, 500, 10_000);
+
+    // Seed the baseline TWAP.
+    client.update_dynamic_fee();
+    assert_eq!(client.get_effective_fee(), 30);
+
+    // 5% TWAP move => 500 bps volatility. With a 10_000 bps scale, the fee
+    // should rise proportionally: 30 + 500 * 30 / 10_000 = 31 bps.
+    oracle.set_twap(&105_000_000);
+    oracle.set_timestamp(&2_000);
+    client.update_dynamic_fee();
+    assert_eq!(client.get_last_volatility_bps(), 500);
+    assert_eq!(client.get_effective_fee(), 31);
+
+    // 20% TWAP move => 2000 bps volatility => 30 + 2000 * 30 / 10_000 = 36 bps.
+    oracle.set_twap(&120_000_000);
+    oracle.set_timestamp(&3_000);
+    client.update_dynamic_fee();
+    assert_eq!(client.get_last_volatility_bps(), 2000);
+    assert_eq!(client.get_effective_fee(), 36);
+}
+
+#[test]
+fn test_dynamic_fee_capped_at_max() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (client, oracle, _oracle_id) = dynamic_fee_fixture(&e, 30, 100, 10_000);
+
+    client.update_dynamic_fee();
+
+    // A 100% TWAP move would push the scaled fee far past the cap.
+    oracle.set_twap(&200_000_000);
+    oracle.set_timestamp(&2_000);
+    client.update_dynamic_fee();
+
+    assert_eq!(client.get_last_volatility_bps(), 10_000);
+    // Must be clamped to max_fee_bps, never above.
+    assert_eq!(client.get_effective_fee(), 100);
+}
+
+#[test]
+fn test_dynamic_fee_respects_admin_max_fee() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (client, oracle, _oracle_id) = dynamic_fee_fixture(&e, 30, 500, 10_000);
+
+    client.update_dynamic_fee();
+    oracle.set_twap(&150_000_000);
+    oracle.set_timestamp(&2_000);
+    client.update_dynamic_fee();
+
+    // Even with high volatility, the effective fee must never exceed the
+    // contract-wide MAX_FEE_BPS ceiling.
+    assert!(client.get_effective_fee() <= MAX_FEE_BPS);
+}
+
+#[test]
+fn test_dynamic_fee_swap_uses_effective_fee() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    let lp = Address::generate(&e);
+    let trader = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+    client.initialize(&admin, &token_a, &token_b);
+
+    token_a_admin.mint(&lp, &1_000_000);
+    token_b_admin.mint(&lp, &1_000_000);
+    client.deposit(&lp, &1_000_000, &1_000_000);
+
+    token_a_admin.mint(&trader, &10_000);
+    token_b_admin.mint(&trader, &10_000);
+
+    let oracle_id = e.register(MockOracle, ());
+    let oracle = MockOracleClient::new(&e, &oracle_id);
+    oracle.set_twap(&100_000_000);
+    oracle.set_timestamp(&1_000);
+    client.configure_volatility_oracle(&oracle_id, &30, &500, &10_000);
+    client.update_dynamic_fee();
+
+    let low_vol_out = client.get_amount_out(&false, &10_000);
+
+    // Spike volatility and refresh the fee.
+    oracle.set_twap(&150_000_000);
+    oracle.set_timestamp(&2_000);
+    client.update_dynamic_fee();
+    assert!(client.get_effective_fee() > 30);
+
+    let high_vol_out = client.get_amount_out(&false, &10_000);
+    assert!(
+        high_vol_out < low_vol_out,
+        "higher volatility fee should reduce output: {high_vol_out} vs {low_vol_out}"
+    );
+}
+
+#[test]
+fn test_dynamic_fee_requires_oracle_config() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    // Without configuration, updating must fail rather than silently no-op.
+    assert_eq!(
+        client.try_update_dynamic_fee(),
+        Err(Ok(Error::OracleNotConfigured))
+    );
+}
+
+#[test]
+fn test_dynamic_fee_rejects_invalid_config() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    client.initialize(&admin, &token_a, &token_b);
+
+    let oracle_id = e.register(MockOracle, ());
+
+    // base > max is invalid.
+    assert_eq!(
+        client.try_configure_volatility_oracle(&oracle_id, &500, &100, &10_000),
+        Err(Ok(Error::InvalidFee))
+    );
+    // max above the contract ceiling is invalid.
+    assert_eq!(
+        client.try_configure_volatility_oracle(&oracle_id, &30, &(MAX_FEE_BPS + 1), &10_000),
+        Err(Ok(Error::InvalidFee))
+    );
+    // zero scale would divide by zero.
+    assert_eq!(
+        client.try_configure_volatility_oracle(&oracle_id, &30, &500, &0),
+        Err(Ok(Error::InvalidFee))
+    );
+}
+
+#[test]
+fn test_dynamic_fee_falls_back_when_oracle_stale() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (client, oracle, _oracle_id) = dynamic_fee_fixture(&e, 30, 500, 10_000);
+
+    client.update_dynamic_fee();
+    oracle.set_twap(&150_000_000);
+    oracle.set_timestamp(&2_000);
+    client.update_dynamic_fee();
+    assert!(client.get_effective_fee() > 30);
+
+    // Advance the ledger far past the staleness window; the fee must revert to
+    // the base fee rather than trusting a stale oracle reading.
+    let mut info = e.ledger().get();
+    info.sequence_number = 1_000_000;
+    e.ledger().set(info);
+
+    assert_eq!(client.get_effective_fee(), 30);
+}
+
+#[test]
+fn test_dynamic_fee_volatility_config_round_trip() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (client, _oracle, oracle_id) = dynamic_fee_fixture(&e, 25, 250, 5_000);
+
+    let cfg: VolatilityConfig = client.get_volatility_config();
+    assert_eq!(cfg.oracle, oracle_id);
+    assert_eq!(cfg.base_fee_bps, 25);
+    assert_eq!(cfg.max_fee_bps, 250);
+    assert_eq!(cfg.volatility_scale_bps, 5_000);
 }

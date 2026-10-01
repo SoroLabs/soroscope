@@ -376,6 +376,19 @@ fn target_fee_from_volatility(base_fee_bps: i128, volatility_bps: i128) -> i128 
     }
 }
 
+/// Effective swap fee given the pool's base fee and the last observed
+/// volatility. Falls back to the pool's stored `fee_bps` when no oracle
+/// volatility has been recorded yet, so behaviour is unchanged pre-oracle.
+fn effective_fee_bps(e: &Env, pool: &PoolState) -> i128 {
+    let volatility_bps = e
+        .storage()
+        .instance()
+        .get::<_, OracleConfig>(&DataKey::Oracle)
+        .map(|cfg| cfg.last_volatility_bps)
+        .unwrap_or(0);
+    target_fee_from_volatility(pool.base_fee_bps, volatility_bps)
+}
+
 // pause_op aliases (kept for backwards compat with tests)
 
 pub mod pause_op {
@@ -983,7 +996,8 @@ impl LiquidityPool {
 
         let pool = load_pool(&e)?;
         let sides = swap_sides(&pool, buy_a);
-        let amount_in = amount_in_for_out(out, sides.reserve_in, sides.reserve_out, pool.fee_bps)?;
+        let fee_bps = effective_fee_bps(&e, &pool);
+        let amount_in = amount_in_for_out(out, sides.reserve_in, sides.reserve_out, fee_bps)?;
         if amount_in > in_max {
             return Err(Error::SlippageExceeded);
         }
@@ -1005,8 +1019,9 @@ impl LiquidityPool {
         to.require_auth();
         let pool = load_pool(&e)?;
         let sides = swap_sides(&pool, buy_a);
+        let fee_bps = effective_fee_bps(&e, &pool);
         let amount_out =
-            amount_out_for_in(amount_in, sides.reserve_in, sides.reserve_out, pool.fee_bps)?;
+            amount_out_for_in(amount_in, sides.reserve_in, sides.reserve_out, fee_bps)?;
         if amount_out <= 0 || amount_out >= sides.reserve_out {
             return Err(Error::InsufficientLiquidity);
         }
@@ -1023,7 +1038,8 @@ impl LiquidityPool {
         }
         let pool = load_pool(&e)?;
         let sides = swap_sides(&pool, buy_a);
-        amount_out_for_in(amount_in, sides.reserve_in, sides.reserve_out, pool.fee_bps)
+        let fee_bps = effective_fee_bps(&e, &pool);
+        amount_out_for_in(amount_in, sides.reserve_in, sides.reserve_out, fee_bps)
     }
 
     pub fn get_amount_in(e: Env, buy_a: bool, amount_out: i128) -> Result<i128, Error> {
@@ -1032,11 +1048,12 @@ impl LiquidityPool {
         }
         let pool = load_pool(&e)?;
         let sides = swap_sides(&pool, buy_a);
+        let fee_bps = effective_fee_bps(&e, &pool);
         amount_in_for_out(
             amount_out,
             sides.reserve_in,
             sides.reserve_out,
-            pool.fee_bps,
+            fee_bps,
         )
     }
 
