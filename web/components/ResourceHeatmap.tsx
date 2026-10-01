@@ -1,5 +1,5 @@
 // Issue #814: Canvas heatmap renderer & matrix visualization
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Cpu, Database, HardDrive, Zap, Activity, Info, Sliders, Grid, AlertTriangle } from 'lucide-react';
 import { cn } from '../lib/utils';
 import type { CallGraph, CallNode } from '../lib/sorobantypes';
@@ -181,6 +181,20 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
   const animationFrameRef = useRef<number | null>(null);
   const hoveredCellRef = useRef<string | null>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
+  const touchGestureRef = useRef<{
+    startX: number;
+    startY: number;
+    lastX: number;
+    lastY: number;
+    moved: boolean;
+    pinched: boolean;
+    startDistance: number;
+    startScale: number;
+    startOffsetX: number;
+    startOffsetY: number;
+    startCenterX: number;
+    startCenterY: number;
+  } | null>(null);
 
   const requestRedraw = useCallback(() => {
     if (animationFrameRef.current !== null) {
@@ -339,6 +353,122 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
     }
     requestRedraw();
   }, [requestRedraw]);
+
+  const findCellAt = useCallback((clientX: number, clientY: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const { scale, offsetX, offsetY } = transformRef.current;
+    const canvasX = (clientX - rect.left - offsetX) / scale;
+    const canvasY = (clientY - rect.top - offsetY) / scale;
+    const totalCellSize = CELL_SIZE + GAP;
+    return matrixCells.find((cell) => {
+      const x = PADDING + cell.col * totalCellSize;
+      const y = PADDING + cell.row * totalCellSize;
+      return canvasX >= x && canvasX < x + CELL_SIZE && canvasY >= y && canvasY < y + CELL_SIZE;
+    }) ?? null;
+  }, [matrixCells]);
+
+  const handleTouchStart = useCallback((e: React.TouchEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+    const touches = Array.from(e.touches);
+    if (touches.length === 0) return;
+    const first = touches[0];
+    const second = touches[1];
+    const centerX = second ? (first.clientX + second.clientX) / 2 : first.clientX;
+    const centerY = second ? (first.clientY + second.clientY) / 2 : first.clientY;
+    const distance = second ? Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY) : 0;
+    const transform = transformRef.current;
+    touchGestureRef.current = {
+      startX: first.clientX,
+      startY: first.clientY,
+      lastX: first.clientX,
+      lastY: first.clientY,
+      moved: false,
+      pinched: touches.length > 1,
+      startDistance: distance,
+      startScale: transform.scale,
+      startOffsetX: transform.offsetX,
+      startOffsetY: transform.offsetY,
+      startCenterX: centerX,
+      startCenterY: centerY,
+    };
+    isPanning.current = false;
+    setTooltip(null);
+  }, []);
+
+  const handleTouchMove = useCallback((e: React.TouchEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+    const gesture = touchGestureRef.current;
+    const touches = Array.from(e.touches);
+    if (!gesture || touches.length === 0) return;
+    const first = touches[0];
+    const second = touches[1];
+    if (Math.hypot(first.clientX - gesture.startX, first.clientY - gesture.startY) > 8) {
+      gesture.moved = true;
+    }
+
+    if (second) {
+      gesture.pinched = true;
+      const distance = Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY);
+      const centerX = (first.clientX + second.clientX) / 2;
+      const centerY = (first.clientY + second.clientY) / 2;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const startLocalX = gesture.startCenterX - rect.left;
+      const startLocalY = gesture.startCenterY - rect.top;
+      const currentLocalX = centerX - rect.left;
+      const currentLocalY = centerY - rect.top;
+      const scale = Math.min(10, Math.max(0.5, gesture.startScale * distance / Math.max(gesture.startDistance, 1)));
+      const ratio = scale / gesture.startScale;
+      transformRef.current = {
+        scale,
+        offsetX: currentLocalX - (startLocalX - gesture.startOffsetX) * ratio,
+        offsetY: currentLocalY - (startLocalY - gesture.startOffsetY) * ratio,
+      };
+      requestRedraw();
+      return;
+    }
+
+    if (!gesture.pinched) {
+      transformRef.current.offsetX += first.clientX - gesture.lastX;
+      transformRef.current.offsetY += first.clientY - gesture.lastY;
+      requestRedraw();
+    }
+    gesture.lastX = first.clientX;
+    gesture.lastY = first.clientY;
+  }, [requestRedraw]);
+
+  const handleTouchEnd = useCallback((e: React.TouchEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+    const gesture = touchGestureRef.current;
+    if (e.touches.length === 0) {
+      if (gesture && !gesture.moved && !gesture.pinched && e.changedTouches.length > 0) {
+        const touch = e.changedTouches[0];
+        const cell = findCellAt(touch.clientX, touch.clientY);
+        if (cell) {
+          hoveredCellRef.current = cell.id;
+          setHoveredCell(cell.id);
+          setTooltip({ x: touch.clientX, y: touch.clientY, cell });
+          requestRedraw();
+        } else {
+          hoveredCellRef.current = null;
+          setHoveredCell(null);
+          setTooltip(null);
+        }
+      }
+      touchGestureRef.current = null;
+    } else if (e.touches.length === 1 && gesture) {
+      // A finger lifted from a pinch should not become a fresh pan or tap.
+      gesture.lastX = e.touches[0].clientX;
+      gesture.lastY = e.touches[0].clientY;
+    }
+  }, [findCellAt, requestRedraw]);
+
+  const handleTouchCancel = useCallback(() => {
+    touchGestureRef.current = null;
+  }, []);
 
   return (
     <div className="w-full bg-slate-900/90 backdrop-blur-2xl border border-slate-800 rounded-xl shadow-2xl p-6 relative overflow-hidden font-sans select-none">
@@ -665,12 +795,16 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                 width={NATURAL_WIDTH}
                 height={NATURAL_HEIGHT}
                 className="rounded-xl border border-slate-800/70 shadow-inner cursor-crosshair"
-                style={{ width: NATURAL_WIDTH, height: NATURAL_HEIGHT }}
+                style={{ width: NATURAL_WIDTH, height: NATURAL_HEIGHT, touchAction: 'none' }}
                 onWheel={handleWheel}
                 onMouseDown={handleMouseDown}
                 onMouseMove={handleMouseMove}
                 onMouseUp={handleMouseUp}
                 onMouseLeave={handleMouseLeave}
+                onTouchStart={handleTouchStart}
+                onTouchMove={handleTouchMove}
+                onTouchEnd={handleTouchEnd}
+                onTouchCancel={handleTouchCancel}
               />
               {tooltip && (
                 <div
