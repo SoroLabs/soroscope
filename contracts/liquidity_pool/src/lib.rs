@@ -508,6 +508,12 @@ impl LiquidityPool {
     pub fn emergency_pause(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
         EmergencyGuard::emergency_pause(e, approvers).map_err(map_guard_err)
     }
+    /// Let one authorized guard admin stop new deposits and swaps while
+    /// preserving LP exits during an emergency.
+    pub fn emergency_pause_by_guardian(e: Env, guardian: Address) -> Result<(), Error> {
+        EmergencyGuard::set_pause(e, guardian, PauseType::SWAP | PauseType::DEPOSIT, true)
+            .map_err(map_guard_err)
+    }
     pub fn resume(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
         EmergencyGuard::resume(e, approvers).map_err(map_guard_err)
     }

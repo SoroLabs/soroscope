@@ -2372,6 +2372,45 @@ fn test_swap_exact_in_respects_swap_pause() {
 }
 
 #[test]
+fn test_guardian_emergency_pause_blocks_swaps_and_deposits_but_allows_withdrawals() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+    let guardian = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(guardian.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(guardian.clone())
+        .address();
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+    let user = Address::generate(&e);
+
+    client.initialize(&guardian, &token_a, &token_b);
+    token_a_admin.mint(&user, &2_000);
+    token_b_admin.mint(&user, &2_000);
+    let shares = client.deposit(&user, &1_000, &1_000);
+
+    client.emergency_pause_by_guardian(&guardian);
+
+    assert!(client.guard_is_paused(&PauseType::SWAP));
+    assert!(client.guard_is_paused(&PauseType::DEPOSIT));
+    assert!(!client.guard_is_paused(&PauseType::WITHDRAW));
+    assert_eq!(
+        client.try_swap(&user, &false, &50, &100),
+        Err(Ok(Error::Paused))
+    );
+    assert_eq!(
+        client.try_deposit(&user, &100, &100),
+        Err(Ok(Error::Paused))
+    );
+    assert_eq!(client.withdraw(&user, &shares), (1_000, 1_000));
+}
+
+#[test]
 fn test_swap_exact_in_preserves_constant_product() {
     let e = Env::default();
     e.mock_all_auths();
