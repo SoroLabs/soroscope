@@ -55,7 +55,11 @@ export function ConnectButton() {
     return (
       <div className="relative" ref={dropdownRef}>
         <button
+          type="button"
           onClick={() => setDropdownOpen(!dropdownOpen)}
+          aria-expanded={dropdownOpen}
+          aria-controls={dropdownOpen ? "wallet-actions-menu" : undefined}
+          aria-label={`Wallet ${formatAddress(address)} actions`}
           className="flex items-center gap-3 px-6 py-3 rounded-s-2xl bg-[#0F1621] border border-[#1e293b] hover:border-[#33C5E0]/50 transition-all group pointer-events-auto"
         >
           <div className="w-2 h-2 rounded-full bg-[#33C5E0] shadow-[0_0_8px_#33C5E0]" />
@@ -74,6 +78,9 @@ export function ConnectButton() {
         <AnimatePresence>
           {dropdownOpen && (
             <motion.div
+              id="wallet-actions-menu"
+              role="group"
+              aria-label="Wallet actions"
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 10 }}
@@ -81,6 +88,7 @@ export function ConnectButton() {
               className="absolute top-full right-0 mt-2 w-full min-w-[180px] bg-[#0F1621] border border-[#1e293b] rounded-xl shadow-xl overflow-hidden z-50"
             >
               <button
+                type="button"
                 onClick={handleDisconnect}
                 className="flex items-center gap-3 w-full px-4 py-3 text-red-400 hover:bg-white/5 transition-colors text-sm font-medium"
               >
@@ -96,9 +104,12 @@ export function ConnectButton() {
 
   return (
     <motion.button
+      type="button"
       whileHover={{ scale: 1.02 }}
       whileTap={{ scale: 0.98 }}
       onClick={openModal}
+      aria-haspopup="dialog"
+      aria-label="Connect wallet"
       className="flex items-center gap-4"
     >
       <div className="flex items-center gap-4 px-8 py-3 rounded-s-2xl bg-[#0F1621] border border-[#1e293b] hover:border-[#33C5E0]/50 transition-all text-[#33C5E0] font-medium tracking-wide shadow-lg shadow-black/20">
