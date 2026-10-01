@@ -35,6 +35,7 @@ import { FeeEstimationPreview } from "../components/FeeEstimationPreview";
 import { SyntaxHighlighter } from "../components/SyntaxHighlighter";
 import { UploadZone } from "../components/upload-zone";
 import { CopyButton } from "../components/CopyButton";
+import { ContractAddressLink } from "../components/ContractAddressLink";
 import { WalletBalanceCard } from "../components/WalletBalanceCard";
 import { LiquidityPoolAnalytics } from "../components/LiquidityPoolAnalytics";
 import { TransactionConfetti } from "../components/TransactionConfetti";
@@ -497,6 +498,16 @@ export default function Home() {
                   onChange={(e) => setContractId(e.target.value)}
                   className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
                 />
+                <div className="mt-2 flex items-center gap-3 text-xs">
+                  <ContractAddressLink
+                    value={contractId}
+                    kind="contract"
+                    label={null}
+                    className="text-xs"
+                  />
+                  <span className="text-slate-600">&middot;</span>
+                  <span className="text-slate-500">opens on the active network explorer</span>
+                </div>
               </div>
               <ContractInteraction
                 selectedFunction={selectedFunction}
