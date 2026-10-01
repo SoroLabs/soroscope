@@ -5,6 +5,7 @@ use soroban_sdk::xdr::{
     StringM, Uint256, VecM, WriteXdr,
 };
 use stellar_strkey::Strkey;
+use stellar_xdr::curr::{ScEnvMetaEntry, ScSpecEntry, ScSpecTypeDef};
 use thiserror::Error;
 
 #[derive(Error, Debug)]

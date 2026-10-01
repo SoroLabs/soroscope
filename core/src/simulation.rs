@@ -6,14 +6,14 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use soroban_sdk::xdr::{
-    AccountId, DiagnosticEvent, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization,
-    HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerEntry, LedgerKey,
-    LedgerKeyContractCode, LedgerKeyContractData, Limits, Memo, MuxedAccount, Operation,
-    OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScMapEntry, ScSymbol, ScVal,
-    SequenceNumber, SorobanAddressCredentials, SorobanAuthorizationEntry,
-    SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials,
-    SorobanTransactionData, Transaction, TransactionExt, TransactionV1Envelope, Uint256, VecM,
-    WriteXdr,
+    AccountId, ContractDataDurability, DiagnosticEvent, ExtensionPoint, Hash, HashIdPreimage,
+    HashIdPreimageSorobanAuthorization, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
+    LedgerEntry, LedgerFootprint, LedgerKey, LedgerKeyContractCode, LedgerKeyContractData, Limits,
+    Memo, MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress,
+    ScMapEntry, ScSymbol, ScVal, SequenceNumber, SorobanAddressCredentials,
+    SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+    SorobanCredentials, SorobanTransactionData, Transaction, TransactionExt, TransactionV1Envelope,
+    Uint256, VecM, WriteXdr,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -352,6 +352,8 @@ pub fn classify_ledger_key_xdr(key_xdr: &[u8]) -> LedgerKeyKind {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct NetworkLimits {
     pub max_cpu_instructions: u64,
+    #[serde(default = "default_max_memory_bytes")]
+    pub max_memory_bytes: u64,
     pub max_read_entries: u32,
     pub max_write_entries: u32,
     #[serde(default = "default_max_transaction_size_bytes")]
@@ -368,16 +370,137 @@ fn default_max_entry_size_bytes() -> u64 {
     64 * 1024
 }
 
+fn default_max_memory_bytes() -> u64 {
+    40 * 1024 * 1024
+}
+
 impl Default for NetworkLimits {
     fn default() -> Self {
         Self {
             max_cpu_instructions: 100_000_000,
+            max_memory_bytes: default_max_memory_bytes(),
             max_read_entries: 40,
             max_write_entries: 20,
             max_transaction_size_bytes: default_max_transaction_size_bytes(),
             max_entry_size_bytes: default_max_entry_size_bytes(),
         }
     }
+}
+
+/// Where a set of `NetworkLimits` came from.
+///
+/// Offline analysis uses a checked-in builtin table (protocol-20 testnet
+/// defaults); online analysis can override from RPC. The source is recorded
+/// on every headroom report so consumers can tell which table applied.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub enum LimitsSource {
+    /// Checked-in protocol defaults (no RPC round-trip).
+    Builtin,
+    /// Limits fetched from an RPC node.
+    Rpc,
+}
+
+/// Per-dimension usage against a network limit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct DimensionHeadroom {
+    pub used: u64,
+    pub limit: u64,
+    /// `used / limit * 100`, clamped at 100 when over.
+    pub percent_used: u32,
+    /// `100 - percent_used`, floored at 0 when over.
+    pub percent_remaining: u32,
+}
+
+/// Usage vs limit for every dimension the issue tracks.
+///
+/// Entry counts come from the transaction footprint (not byte sizes); CPU,
+/// memory and transaction size use the measured resource values.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct LimitHeadroom {
+    pub cpu_instructions: DimensionHeadroom,
+    pub memory_bytes: DimensionHeadroom,
+    pub read_entries: DimensionHeadroom,
+    pub write_entries: DimensionHeadroom,
+    pub transaction_size_bytes: DimensionHeadroom,
+    /// Which table produced the limits.
+    pub limits_source: LimitsSource,
+}
+
+fn dimension_headroom(used: u64, limit: u64) -> DimensionHeadroom {
+    let percent_used = if limit == 0 {
+        if used == 0 {
+            0
+        } else {
+            100
+        }
+    } else {
+        let pct = (used as f64 / limit as f64 * 100.0).round();
+        pct.clamp(0.0, 100.0) as u32
+    };
+    DimensionHeadroom {
+        used,
+        limit,
+        percent_used,
+        percent_remaining: 100u32.saturating_sub(percent_used),
+    }
+}
+
+/// Footprint entry counts decoded from `SorobanTransactionData` XDR.
+///
+/// Returns `(read_entries, write_entries)` where read counts every key in the
+/// footprint and write counts only `readWrite` keys (the entries that may be
+/// mutated). Returns `(0, 0)` when the XDR cannot be decoded.
+pub fn extract_footprint_entry_counts(transaction_data: &str) -> (u32, u32) {
+    let Ok(bytes) = BASE64.decode(transaction_data) else {
+        return (0, 0);
+    };
+    let Ok(data) = SorobanTransactionData::from_xdr(&bytes, Limits::none()) else {
+        return (0, 0);
+    };
+    let read_only = data.resources.footprint.read_only.len() as u32;
+    let read_write = data.resources.footprint.read_write.len() as u32;
+    let read_entries = read_only.saturating_add(read_write);
+    (read_entries, read_write)
+}
+
+/// Build a `LimitHeadroom` report from measured resources and (optionally)
+/// footprint-derived entry counts.
+///
+/// When `footprint_counts` is `None`, entry dimensions are left at zero so
+/// callers that have no transaction data still get CPU/memory/tx headroom.
+pub fn compute_limit_headroom(
+    resources: &SorobanResources,
+    footprint_counts: Option<(u32, u32)>,
+    limits: &NetworkLimits,
+    source: LimitsSource,
+) -> LimitHeadroom {
+    let (read_entries, write_entries) = footprint_counts.unwrap_or((0, 0));
+    LimitHeadroom {
+        cpu_instructions: dimension_headroom(resources.cpu_instructions, limits.max_cpu_instructions),
+        memory_bytes: dimension_headroom(resources.ram_bytes, limits.max_memory_bytes),
+        read_entries: dimension_headroom(u64::from(read_entries), u64::from(limits.max_read_entries)),
+        write_entries: dimension_headroom(u64::from(write_entries), u64::from(limits.max_write_entries)),
+        transaction_size_bytes: dimension_headroom(
+            resources.transaction_size_bytes,
+            limits.max_transaction_size_bytes,
+        ),
+        limits_source: source,
+    }
+}
+
+/// First dimension whose usage is at or over `threshold` percent, in the
+/// issue's fixed order (CPU, memory, read entries, write entries, tx size).
+pub fn first_dimension_at_or_above(headroom: &LimitHeadroom, threshold: u32) -> Option<&'static str> {
+    let dims: [(&'static str, u32); 5] = [
+        ("cpu_instructions", headroom.cpu_instructions.percent_used),
+        ("memory_bytes", headroom.memory_bytes.percent_used),
+        ("read_entries", headroom.read_entries.percent_used),
+        ("write_entries", headroom.write_entries.percent_used),
+        ("transaction_size_bytes", headroom.transaction_size_bytes.percent_used),
+    ];
+    dims.into_iter()
+        .find(|(_, pct)| *pct >= threshold)
+        .map(|(name, _)| name)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -1547,6 +1670,12 @@ pub struct SimulationResult {
     /// events.  Never causes a simulation to fail when missing.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cost_breakdown: Option<CostBreakdown>,
+    /// Usage-vs-limit headroom for CPU, memory, entry counts and tx size.
+    ///
+    /// Computed offline from measured resources plus footprint-derived entry
+    /// counts. Absent only when the caller supplied no resource measurements.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub limit_headroom: Option<LimitHeadroom>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1624,7 +1753,6 @@ impl AuthTreeReport {
                 SorobanCredentials::Address(credentials) => match &credentials.address {
                     ScAddress::Account(_) => AuthCredentialKind::Ed25519,
                     ScAddress::Contract(_) => AuthCredentialKind::Contract,
-                    _ => AuthCredentialKind::Other,
                 },
             });
         }
@@ -6362,6 +6490,7 @@ mod tests {
         let suggestion = ttl_batch_test_suggestion("key-a", 10, 10, 44);
         let limits = NetworkLimits {
             max_cpu_instructions: 10,
+            max_memory_bytes: default_max_memory_bytes(),
             max_read_entries: 0,
             max_write_entries: 1,
             max_transaction_size_bytes: TTL_BATCH_BASE_TRANSACTION_SIZE_BYTES + 44,
@@ -6391,6 +6520,7 @@ mod tests {
         ];
         let limits = NetworkLimits {
             max_cpu_instructions: 10,
+            max_memory_bytes: default_max_memory_bytes(),
             max_read_entries: 0,
             max_write_entries: 1,
             max_transaction_size_bytes: 1_000,
@@ -6423,6 +6553,7 @@ mod tests {
         let suggestion = ttl_batch_test_suggestion("key-a", 10, 11, 45);
         let base_limits = NetworkLimits {
             max_cpu_instructions: 10,
+            max_memory_bytes: default_max_memory_bytes(),
             max_read_entries: 0,
             max_write_entries: 1,
             max_transaction_size_bytes: TTL_BATCH_BASE_TRANSACTION_SIZE_BYTES + 45,
@@ -7119,6 +7250,7 @@ mod tests {
 
         let limits = NetworkLimits {
             max_cpu_instructions: 100_000_000,
+            max_memory_bytes: default_max_memory_bytes(),
             max_read_entries: 40,
             max_write_entries: 20,
             max_transaction_size_bytes: 100_000,
@@ -7154,6 +7286,139 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("Non-monotonic read entries detected"));
+    }
+
+    // ── #991: network limits & limit headroom ──────────────────────────────
+
+    #[test]
+    fn default_network_limits_include_memory_and_builtin_source() {
+        let limits = NetworkLimits::default();
+        assert_eq!(limits.max_cpu_instructions, 100_000_000);
+        assert_eq!(limits.max_memory_bytes, 40 * 1024 * 1024);
+        assert_eq!(limits.max_read_entries, 40);
+        assert_eq!(limits.max_write_entries, 20);
+        assert_eq!(limits.max_transaction_size_bytes, 100_000);
+        assert_eq!(limits.max_entry_size_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn footprint_entry_counts_come_from_xdr_not_bytes() {
+        // xdr::SorobanResources (footprint/instructions/...) is distinct from
+        // the local SorobanResources; alias it to avoid the name clash.
+        use soroban_sdk::xdr::SorobanResources as XdrSorobanResources;
+
+        // Synthetic SorobanTransactionData with 2 readOnly + 3 readWrite keys.
+        let data = SorobanTransactionData {
+            ext: ExtensionPoint::V0,
+            resources: XdrSorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::try_from(vec![
+                        LedgerKey::ContractData(LedgerKeyContractData {
+                            contract: ScAddress::Contract(Hash([1; 32])),
+                            key: ScVal::Symbol(ScSymbol::try_from("A").unwrap()),
+                            durability: ContractDataDurability::Persistent,
+                        });
+                        2
+                    ])
+                    .unwrap(),
+                    read_write: VecM::try_from(vec![
+                        LedgerKey::ContractData(LedgerKeyContractData {
+                            contract: ScAddress::Contract(Hash([2; 32])),
+                            key: ScVal::Symbol(ScSymbol::try_from("B").unwrap()),
+                            durability: ContractDataDurability::Persistent,
+                        });
+                        3
+                    ])
+                    .unwrap(),
+                },
+                instructions: 0,
+                read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+        let xdr = data.to_xdr(Limits::none()).unwrap();
+        let b64 = BASE64.encode(xdr);
+
+        let (read_entries, write_entries) = extract_footprint_entry_counts(&b64);
+        assert_eq!(read_entries, 5); // 2 readOnly + 3 readWrite
+        assert_eq!(write_entries, 3); // only readWrite
+
+        // Undecodable payload degrades to (0, 0), never panics.
+        assert_eq!(extract_footprint_entry_counts("not-base64"), (0, 0));
+    }
+
+    #[test]
+    fn limit_headroom_write_entries_just_under_and_over_the_limit() {
+        let limits = NetworkLimits {
+            max_cpu_instructions: 1_000_000,
+            max_memory_bytes: 1_000_000,
+            max_read_entries: 40,
+            max_write_entries: 20,
+            max_transaction_size_bytes: 100_000,
+            max_entry_size_bytes: 64 * 1024,
+        };
+        let resources = SorobanResources {
+            cpu_instructions: 100_000,
+            ram_bytes: 100_000,
+            transaction_size_bytes: 1_000,
+            ..Default::default()
+        };
+
+        // Just under: 18/20 = 90% → Critical on write_entries.
+        let under = compute_limit_headroom(
+            &resources,
+            Some((30, 18)),
+            &limits,
+            LimitsSource::Builtin,
+        );
+        assert_eq!(under.write_entries.used, 18);
+        assert_eq!(under.write_entries.limit, 20);
+        assert_eq!(under.write_entries.percent_used, 90);
+        assert_eq!(under.limits_source, LimitsSource::Builtin);
+        assert_eq!(
+            first_dimension_at_or_above(&under, 90),
+            Some("write_entries")
+        );
+
+        // Over the limit: 21/20 clamps to 100%.
+        let over = compute_limit_headroom(
+            &resources,
+            Some((30, 21)),
+            &limits,
+            LimitsSource::Builtin,
+        );
+        assert_eq!(over.write_entries.used, 21);
+        assert_eq!(over.write_entries.percent_used, 100);
+        assert_eq!(over.write_entries.percent_remaining, 0);
+        assert_eq!(
+            first_dimension_at_or_above(&over, 90),
+            Some("write_entries")
+        );
+    }
+
+    #[test]
+    fn limit_headroom_names_first_failing_dimension_in_issue_order() {
+        let limits = NetworkLimits::default();
+        let resources = SorobanResources {
+            // 95% of 100M
+            cpu_instructions: 95_000_000,
+            // 80% of 40MiB — also elevated, but CPU comes first
+            ram_bytes: 32 * 1024 * 1024,
+            transaction_size_bytes: 1_000,
+            ..Default::default()
+        };
+        let headroom = compute_limit_headroom(
+            &resources,
+            Some((40, 20)),
+            &limits,
+            LimitsSource::Rpc,
+        );
+        assert_eq!(
+            first_dimension_at_or_above(&headroom, 90),
+            Some("cpu_instructions")
+        );
+        assert_eq!(headroom.limits_source, LimitsSource::Rpc);
     }
 
     #[tokio::test]

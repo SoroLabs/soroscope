@@ -45,6 +45,7 @@ utoipa-swagger-ui = { version = "7", features = ["axum", "vendored"] }
 base64 = "0.22"
 hex = "0.4"
 stellar-strkey = "0.0.9"
+stellar-xdr = "22.0.0"
 jsonwebtoken = "9"
 ed25519-dalek = "=2.1.1"
 rand = "0.8"

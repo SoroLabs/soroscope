@@ -154,6 +154,7 @@ impl LocalRunner {
             state_snapshot: None,
             protocol_version: 0,
             cost_breakdown: None,
+            limit_headroom: None,
         })
     }
 }
