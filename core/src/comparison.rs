@@ -1,5 +1,6 @@
 use crate::simulation::{SimulationEngine, SimulationError, SorobanResources};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use utoipa::ToSchema;
 
@@ -7,6 +8,44 @@ use utoipa::ToSchema;
 
 /// Any resource that increases by more than this percentage is flagged.
 const REGRESSION_THRESHOLD: f64 = 10.0;
+
+// ── Protocol snapshot ────────────────────────────────────────────────────────
+
+/// Identifies where the ledger limits used for a simulation came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LimitsSource {
+    /// Limits were fetched from the RPC node.
+    Rpc,
+    /// Limits fell back to the built-in defaults.
+    Builtin,
+}
+
+impl Default for LimitsSource {
+    fn default() -> Self {
+        LimitsSource::Builtin
+    }
+}
+
+/// Immutable snapshot of the protocol settings that were in effect for a
+/// simulation run.
+///
+/// Two runs are only comparable when their `cost_params_hash` matches.
+/// `protocol_version`, `network_passphrase`, `ledger_sequence` and
+/// `limits_source` are recorded for diagnostics and audit purposes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ProtocolSnapshot {
+    /// Stellar protocol version active during the run.
+    pub protocol_version: u32,
+    /// Network passphrase of the target network.
+    pub network_passphrase: String,
+    /// Stable hash of the cost parameters (fee schedule) in effect.
+    pub cost_params_hash: String,
+    /// Ledger sequence the simulation was pinned to.
+    pub ledger_sequence: u32,
+    /// Where the ledger limits were sourced from.
+    pub limits_source: LimitsSource,
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -58,6 +97,10 @@ pub struct RegressionFlag {
     pub severity: String,
 }
 
+/// Reason string used when two runs cannot be compared because their protocol
+/// snapshots disagree.
+pub const INCOMPARABLE_COST_PARAMS: &str = "incomparable: cost_params_hash differs";
+
 use soroban_sdk::xdr::{Limits, ReadXdr, ScSpecEntry, ScSpecTypeDef};
 
 /// Event schema specification extracted from contractspecv0 section.
@@ -100,6 +143,13 @@ pub struct RegressionReport {
     pub regression_flags: Vec<RegressionFlag>,
     /// Human-readable summary of the comparison
     pub summary: String,
+    /// `true` when the two runs used different cost parameters and the deltas
+    /// must not be interpreted as a percentage regression.
+    #[serde(default)]
+    pub incomparable: bool,
+    /// Human-readable reason when `incomparable` is `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomparable_reason: Option<String>,
 }
 
 // ── Core logic ───────────────────────────────────────────────────────────────
@@ -109,6 +159,9 @@ pub struct RegressionReport {
 /// Both simulations are executed concurrently via `tokio::join!` using the same
 /// `SimulationEngine` (and therefore the same ledger state / RPC node) for
 /// consistency.
+///
+/// If the two runs report different `cost_params_hash` values the report is
+/// marked `incomparable` and no percentage deltas are produced.
 pub async fn run_comparison(
     engine: &SimulationEngine,
     mode: CompareMode,
@@ -130,7 +183,9 @@ pub async fn run_comparison(
                 engine.simulate_from_contract_id(&base_id, "compare", vec![], None, None, None)
             );
 
-            (current_result?.resources, base_result?.resources)
+            let current = current_result?;
+            let base = base_result?;
+            (current.resources, base.resources, current.protocol_snapshot, base.protocol_snapshot)
         }
         CompareMode::LocalVsDeployed {
             current_wasm,
@@ -159,11 +214,18 @@ pub async fn run_comparison(
                 )
             );
 
-            (current_result?.resources, base_result?.resources)
+            let current = current_result?;
+            let base = base_result?;
+            (current.resources, base.resources, current.protocol_snapshot, base.protocol_snapshot)
         }
     };
 
-    Ok(build_report(current_resources, base_resources))
+    Ok(build_report_with_snapshots(
+        current_resources,
+        base_resources,
+        current_snapshot,
+        base_snapshot,
+    ))
 }
 
 pub fn extract_event_specs(wasm_bytes: &[u8]) -> Option<Vec<EventSchemaSpec>> {
@@ -293,6 +355,48 @@ pub fn build_report_with_event_diff(
     base: SorobanResources,
     event_schema_diff: EventSchemaDiff,
 ) -> RegressionReport {
+    build_report_with_event_diff_and_snapshots(current, base, event_schema_diff, None, None)
+}
+
+/// Build a `RegressionReport` from two sets of resource metrics and their
+/// protocol snapshots.
+///
+/// When both snapshots are present and their `cost_params_hash` values differ,
+/// the report is marked `incomparable` and the deltas are zeroed out so they
+/// cannot be mistaken for a regression.
+pub fn build_report_with_event_diff_and_snapshots(
+    current: SorobanResources,
+    base: SorobanResources,
+    event_schema_diff: EventSchemaDiff,
+    current_snapshot: Option<ProtocolSnapshot>,
+    base_snapshot: Option<ProtocolSnapshot>,
+) -> RegressionReport {
+    let incomparable_reason = match (&current_snapshot, &base_snapshot) {
+        (Some(c), Some(b)) if c.cost_params_hash != b.cost_params_hash => {
+            Some(INCOMPARABLE_COST_PARAMS.to_string())
+        }
+        _ => None,
+    };
+
+    if let Some(reason) = &incomparable_reason {
+        return RegressionReport {
+            current,
+            base,
+            deltas: ResourceDelta {
+                cpu_instructions: 0.0,
+                ram_bytes: 0.0,
+                ledger_read_bytes: 0.0,
+                ledger_write_bytes: 0.0,
+                transaction_size_bytes: 0.0,
+            },
+            event_schema_diff,
+            regression_flags: vec![],
+            summary: format!("Comparison skipped: {reason}"),
+            incomparable: true,
+            incomparable_reason: Some(reason.clone()),
+        };
+    }
+
     let deltas = calculate_deltas(&current, &base);
     let mut regression_flags = detect_regressions(&deltas, REGRESSION_THRESHOLD);
 
@@ -333,6 +437,8 @@ pub fn build_report_with_event_diff(
         event_schema_diff,
         regression_flags,
         summary,
+        incomparable: false,
+        incomparable_reason: None,
     }
 }
 
@@ -345,6 +451,29 @@ pub fn build_report(current: SorobanResources, base: SorobanResources) -> Regres
         changed_events: vec![],
     };
     build_report_with_event_diff(current, base, empty_diff)
+}
+
+/// Build a `RegressionReport` from two sets of resource metrics and their
+/// protocol snapshots.
+pub fn build_report_with_snapshots(
+    current: SorobanResources,
+    base: SorobanResources,
+    current_snapshot: Option<ProtocolSnapshot>,
+    base_snapshot: Option<ProtocolSnapshot>,
+) -> RegressionReport {
+    let empty_diff = EventSchemaDiff {
+        schema_status: "unavailable".to_string(),
+        added_events: vec![],
+        removed_events: vec![],
+        changed_events: vec![],
+    };
+    build_report_with_event_diff_and_snapshots(
+        current,
+        base,
+        empty_diff,
+        current_snapshot,
+        base_snapshot,
+    )
 }
 
 /// Compute percentage change for each resource metric.
