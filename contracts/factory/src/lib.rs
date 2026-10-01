@@ -1,7 +1,8 @@
 #![no_std]
 
 use emergency_guard::{
-    DefaultEmergencyGuard, EmergencyGuard, EmergencyGuardTrait, GuardDataKey, GuardError, PauseType,
+    DefaultEmergencyGuard, EmergencyGuard, EmergencyGuardTrait, GuardDataKey, GuardError,
+    PauseMask, PauseType,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, IntoVal,
@@ -37,7 +38,15 @@ pub struct DefaultEmergencyGuard;
 
 impl DefaultEmergencyGuard {
     pub fn check_not_paused(env: &Env, operation: u32) -> Result<(), GuardError> {
-        let pause_state: PauseType = env
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::AutoUnpauseAt)
+            .unwrap_or(0);
+        if deadline > 0 && env.ledger().timestamp() >= deadline {
+            return Ok(());
+        }
+        let pause_state: PauseMask = env
             .storage()
             .instance()
             .get(&GuardDataKey::PauseState)
@@ -51,7 +60,15 @@ impl DefaultEmergencyGuard {
     }
 
     pub fn get_pause_state(env: &Env) -> u32 {
-        let pause_state: PauseType = env
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::AutoUnpauseAt)
+            .unwrap_or(0);
+        if deadline > 0 && env.ledger().timestamp() >= deadline {
+            return 0;
+        }
+        let pause_state: PauseMask = env
             .storage()
             .instance()
             .get(&GuardDataKey::PauseState)
@@ -60,7 +77,7 @@ impl DefaultEmergencyGuard {
     }
 
     pub fn set_pause_state(env: &Env, operation: u32, paused: bool) -> Result<(), GuardError> {
-        let mut pause_state: PauseType = env
+        let mut pause_state: PauseMask = env
             .storage()
             .instance()
             .get(&GuardDataKey::PauseState)

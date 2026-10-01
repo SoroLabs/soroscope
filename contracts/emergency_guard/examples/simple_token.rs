@@ -129,10 +129,6 @@ impl SimpleToken {
             .set(&DataKey::TotalSupply, &(supply - amount));
     }
 
-    pub fn get_pause_state(env: Env) -> u32 {
-        EmergencyGuard::get_pause_state(env)
-    }
-
     // ==== EMERGENCY GUARD FUNCTIONS ====
 
     /// Pause only transfers (minting and burning still work)
