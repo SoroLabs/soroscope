@@ -1,13 +1,53 @@
-# Rust
+# ── Rust ──────────────────────────────────────────────────────────────
 /target
 **/target
 test_snapshots/
 
-# Node
+# ── Node / Next.js ────────────────────────────────────────────────────
 /node_modules
 **/node_modules
+.next/
+**/out/
+web/build/
+web/.next/
+web/out/
 
-# Misc
-.DS_Store
+# ── Environment & Secrets ─────────────────────────────────────────────
 .env
 .env.local
+.env.*.local
+.env.production
+.env.development
+.env.test
+*.pem
+*.key
+
+# ── Logs ─────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Build / Deploy artifacts ──────────────────────────────────────────
+dist/
+build/
+*.wasm.opt
+*.optimized.wasm
+
+# ── Editor / IDE ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── TypeScript ────────────────────────────────────────────────────────
+*.tsbuildinfo
+
+# ── Misc ─────────────────────────────────────────────────────────────
+.vercel
+coverage/
