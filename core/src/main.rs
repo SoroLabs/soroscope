@@ -341,6 +341,95 @@ fn load_config() -> Result<AppConfig, ConfigError> {
     settings.try_deserialize()
 }
 
+impl AppConfig {
+    /// Validate required startup config before the server starts (issue #1132).
+    ///
+    /// Prints a table of required values and returns the names of any that
+    /// are missing or invalid, so operators see one clear error instead of a
+    /// panic deep inside a request handler.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let required: &[(&str, &str)] = &[
+            ("SOROBAN_RPC_URL", &self.soroban_rpc_url),
+            ("NETWORK_PASSPHRASE", &self.network_passphrase),
+            ("DATABASE_URL", &self.database_url),
+            ("REDIS_URL", &self.redis_url),
+        ];
+        eprintln!("{:<20} {:<10} VALUE", "VAR", "STATUS");
+        let mut problems = Vec::new();
+        for (name, value) in required {
+            if value.trim().is_empty() {
+                eprintln!("{name:<20} {:<10} <missing>", "MISSING");
+                problems.push((*name).to_string());
+            } else {
+                eprintln!("{name:<20} {:<10} {value}", "OK");
+            }
+        }
+        if self.server_port == 0 {
+            eprintln!("{:<20} {:<10} <invalid: port 0>", "SERVER_PORT", "INVALID");
+            problems.push("SERVER_PORT".to_string());
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems)
+        }
+    }
+}
+
+#[cfg(test)]
+mod config_validation_tests {
+    use super::*;
+
+    fn valid_config() -> AppConfig {
+        AppConfig {
+            server_port: 8080,
+            rust_log: "info".to_string(),
+            soroban_rpc_url: "https://soroban-testnet.stellar.org".to_string(),
+            jwt_private_key: None,
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            rpc_providers: String::new(),
+            registry_instance_id: String::new(),
+            registry_public_url: String::new(),
+            registry_seed_peers: String::new(),
+            health_check_interval_secs: 30,
+            gossip_interval_secs: 30,
+            simulation_timeout_secs: 30,
+            simulation_mode: "failover".to_string(),
+            database_url: "sqlite://soroscope.db".to_string(),
+            inbound_webhook_secret: String::new(),
+            job_timeout_secs: 300,
+            max_concurrent_jobs: 10,
+            event_worker_threads: 4,
+            fee_collection_interval_secs: 5,
+            fee_retention_days: 30,
+            fee_analysis_enabled: true,
+            emergency_verification_paused: false,
+            disk_cache_path: String::new(),
+            max_ledger_age: 100,
+            cors_allowed_origins: String::new(),
+            event_bus_capacity: 256,
+            log_format_json: false,
+            allowed_origins: String::new(),
+        }
+    }
+
+    #[test]
+    fn complete_config_passes_validation() {
+        assert!(valid_config().validate().is_ok());
+    }
+
+    #[test]
+    fn missing_required_values_fail_validation() {
+        let mut config = valid_config();
+        config.database_url = String::new();
+        config.server_port = 0;
+        let err = config.validate().expect_err("should fail");
+        assert!(err.contains(&"DATABASE_URL".to_string()));
+        assert!(err.contains(&"SERVER_PORT".to_string()));
+    }
+}
+
 /// Build the tracing `EnvFilter` from the configured log directive
 /// (`RUST_LOG`, defaulting to `"info"` — see [`AppConfig::rust_log`]).
 ///
@@ -2377,6 +2466,16 @@ async fn main() {
     // from the `RUST_LOG` env var, defaulting to "info") can drive log level
     // filtering without recompiling the binary.
     let config = load_config().expect("Failed to load configuration");
+
+    // Fail fast on missing/invalid config (issue #1132): exit 1 with a clear
+    // table instead of panicking on first use deep inside a handler.
+    if let Err(problems) = config.validate() {
+        eprintln!(
+            "Invalid startup configuration: {}. Set the env vars above and restart.",
+            problems.join(", ")
+        );
+        std::process::exit(1);
+    }
 
     // ── Tracing init (#572: JSON format + x-request-id correlation) ────
     let log_json = env::var("LOG_FORMAT").map(|v| v.to_lowercase() == "json").unwrap_or(false);
