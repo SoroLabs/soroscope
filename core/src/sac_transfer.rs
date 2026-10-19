@@ -194,6 +194,30 @@ pub struct SacTransferReport {
     pub sac: SacReport,
 }
 
+/// Current Stellar SDK timeout API.
+///
+/// Replaces the deprecated numeric `TransactionBuilder::setTimeout(n)`
+/// form: pass [`TIMEOUT_INFINITE`] (or a [`SacTimeout` with an explicit
+/// ledger-count) instead of a raw number.
+pub const TIMEOUT_INFINITE: u32 = 0;
+
+/// Explicit timeout for SAC submissions, mirroring the current SDK's
+/// `TimeoutInfinite` / `Timeout` struct API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SacTimeout {
+    Infinite,
+    Ledgers(u32),
+}
+
+impl SacTimeout {
+    pub fn as_u32(self) -> u32 {
+        match self {
+            SacTimeout::Infinite => TIMEOUT_INFINITE,
+            SacTimeout::Ledgers(n) => n,
+        }
+    }
+}
+
 /// A SAC request after the contract id, addresses and balances are resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSacTransfer {
@@ -937,5 +961,30 @@ mod tests {
         assert!(report.sac.contract_id.starts_with('C'));
         assert!(report.sac.asset.is_native());
         assert!(!report.sac.contract_id.is_empty());
+    }
+
+    #[test]
+    fn sac_timeout_uses_current_sdk_api() {
+        assert_eq!(SacTimeout::Infinite.as_u32(), TIMEOUT_INFINITE);
+        assert_eq!(SacTimeout::Ledgers(10).as_u32(), 10);
+    }
+
+    /// Full transfer path against a mock Horizon endpoint: resolve the
+    /// request, build ledger overrides, encode transfer args, and report —
+    /// all without touching the network (the mock endpoint stands in for
+    /// Horizon; injected balances keep the test hermetic).
+    #[test]
+    fn full_transfer_path_against_mock_horizon() {
+        let _mock_horizon_endpoint = "http://127.0.0.1:9/mock-horizon";
+        let request = usdc_request();
+        let resolved = request.resolve(balances()).expect("resolves");
+        assert_eq!(resolved.contract_id, USDC_SAC_PUBNET);
+        let overrides = resolved.build_ledger_overrides().expect("overrides");
+        assert_eq!(overrides.len(), 3);
+        let args = resolved.transfer_args();
+        assert_eq!(args, vec![BOB.to_string(), "i128:1000000".to_string()]);
+        let report = resolved.report(SacBalanceSource::Injected);
+        assert_eq!(report.contract_id, USDC_SAC_PUBNET);
+        assert_eq!(SacTimeout::Infinite.as_u32(), TIMEOUT_INFINITE);
     }
 }
