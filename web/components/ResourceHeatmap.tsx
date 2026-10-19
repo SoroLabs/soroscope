@@ -32,7 +32,7 @@ interface Cell {
 }
 
 interface ResourceHeatmapProps {
-  resourceCost: {
+  resourceCost?: {
     cpu_instructions: number;
     ram_bytes: number;
     ledger_read_bytes: number;
@@ -64,14 +64,14 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
   const [tooltip, setTooltip] = useState<{ x: number; y: number; cell: Cell } | null>(null);
 
   const {
-    cpu_instructions,
-    ram_bytes,
-    ledger_read_bytes,
-    ledger_write_bytes,
-    transaction_size_bytes,
+    cpu_instructions = 0,
+    ram_bytes = 0,
+    ledger_read_bytes = 0,
+    ledger_write_bytes = 0,
+    transaction_size_bytes = 0,
     cost_stroops = 120,
     state_snapshot
-  } = resourceCost;
+  } = resourceCost ?? {};
 
   // ── Budget percentages ──────────────────────────────────────────────────────
   const cpuPct     = Math.min((cpu_instructions         / LIMITS.CPU)          * 100, 100);
@@ -118,9 +118,10 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
   // ── Ledger footprint ────────────────────────────────────────────────────────
   const ledgerEntries = state_snapshot?.ledger_entries ?? {};
   const ttlEntries    = state_snapshot?.ttl_entries    ?? {};
+  const dataEntries = (Object.entries(ledgerEntries ?? {}) ?? []) as Array<[string, string]>;
 
-  const footprintItems = Object.keys(ledgerEntries).length > 0
-    ? Object.entries(ledgerEntries).map(([key, value]) => {
+  const footprintItems = dataEntries.length > 0
+    ? dataEntries.map(([key, value]) => {
         const sizeBytes = Math.floor((key.length + value.length) * 0.75);
         const isWrite = ledger_write_bytes > 0 && Math.random() > 0.6;
         const ttl = ttlEntries[key] || Math.floor(Math.random() * 4000) + 1000;
@@ -469,6 +470,14 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
   const handleTouchCancel = useCallback(() => {
     touchGestureRef.current = null;
   }, []);
+
+  if (!resourceCost) {
+    return (
+      <div className="w-full rounded-xl border border-slate-800 bg-slate-900/90 p-6">
+        <p className="py-16 text-center text-sm text-slate-500">No data</p>
+      </div>
+    );
+  }
 
   return (
     <div className="w-full bg-slate-900/90 backdrop-blur-2xl border border-slate-800 rounded-xl shadow-2xl p-6 relative overflow-hidden font-sans select-none">
