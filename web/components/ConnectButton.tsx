@@ -1,6 +1,7 @@
 "use client";
 
 import { useWallet } from "../context/WalletContext";
+import { useRouter } from "next/router";
 import { motion, AnimatePresence } from "framer-motion";
 import { useState, useRef, useEffect } from "react";
 import { LogOut } from "lucide-react";
@@ -23,6 +24,7 @@ const ArrowDownIcon = () => (
 
 export function ConnectButton() {
   const { isConnected, address, openModal, disconnect } = useWallet();
+  const router = useRouter();
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -34,6 +36,11 @@ export function ConnectButton() {
   const handleDisconnect = async () => {
     await disconnect();
     setDropdownOpen(false);
+    // Wallet state (address, balances) is cleared in the WalletContext.
+    // Leave wallet-gated pages so stale address-scoped UI never renders.
+    if (router.pathname !== "/") {
+      await router.push("/");
+    }
   };
 
   // Close dropdown when clicking outside
