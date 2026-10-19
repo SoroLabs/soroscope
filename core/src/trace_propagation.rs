@@ -87,6 +87,28 @@ pub fn inject_grpc(metadata: &mut MetadataMap) {
     });
 }
 
+/// Inject the active span's context into outgoing Soroban RPC `reqwest`
+/// requests. Call before every RPC call so spans are not orphaned in
+/// Jaeger/Zipkin.
+pub fn inject_rpc(headers: &mut reqwest::header::HeaderMap) {
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject(&mut ReqwestInjector(headers));
+    });
+}
+
+struct ReqwestInjector<'a>(&'a mut reqwest::header::HeaderMap);
+
+impl opentelemetry::propagation::Injector for ReqwestInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(val)) = (
+            key.parse::<reqwest::header::HeaderName>(),
+            reqwest::header::HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(name, val);
+        }
+    }
+}
+
 /// Extract W3C context from inbound tonic metadata.
 pub fn extract_grpc(metadata: &MetadataMap) -> opentelemetry::Context {
     let carrier: HashMap<String, String> = metadata
