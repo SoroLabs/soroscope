@@ -254,6 +254,21 @@ test('FeeEstimationPreview: handles very small resource costs', () => {
   assert.ok(state.feeEstimate.totalFeeStroops > 1);
 });
 
+test('FeeEstimationPreview: defaults base fee to 100 stroops when base_fee is zero', () => {
+  const state = createFeeEstimationState({ costStroops: 500_000 });
+  state.loadFeeEstimate({ min_ledger_fee: 0, surge_multiplier: 1, soroban_fee_rate: 1 });
+
+  const est = state.feeEstimate;
+  assert.equal(est.classicFeeStroops, 100);
+  assert.equal(est.totalFeeStroops, 500_100);
+  assert.ok(!Number.isNaN(est.totalFeeStroops));
+  assert.ok(!est.totalFeeXlm.includes('NaN'));
+  for (const bump of est.feeBumps) {
+    assert.ok(!Number.isNaN(bump.feeStroops));
+    assert.ok(!bump.feeXlm.includes('NaN'));
+  }
+});
+
 test('FeeEstimationPreview: handles very large resource costs without overflow', () => {
   const state = createFeeEstimationState({ costStroops: 1_000_000_000_000 });
   state.loadFeeEstimate(null);
