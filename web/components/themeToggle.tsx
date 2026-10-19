@@ -13,7 +13,7 @@ interface ThemeContextType {
 
 const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
 
-const STORAGE_KEY = 'soroScope-theme';
+const STORAGE_KEY = 'theme';
 const THEME_ATTRIBUTE = 'data-theme';
 
 function getSystemTheme(): 'dark' | 'light' {
