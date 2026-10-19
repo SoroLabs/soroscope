@@ -7,6 +7,7 @@ import type { TransactionRecord, TransactionStatus } from '../lib/sorobantypes';
 import { paginate } from '../lib/paginationUtils';
 import { DEFAULT_TRANSACTION_FILTER, filterTransactions, type TransactionFilter } from '../lib/transactionFilters';
 import { CopyButton } from './CopyButton';
+import { exportTransactionsToCsv } from '../lib/exportReport';
 import { useInfiniteScroll } from '../hooks/useInfiniteScroll';
 
 const PER_PAGE = 10;
@@ -270,8 +271,12 @@ export function TransactionHistoryTable({
     URL.revokeObjectURL(url);
   }, [transactions]);
 
-  const exportToJSON = useCallback(() => {
-    const jsonContent = JSON.stringify(transactions, null, 2);
+  const exportFilteredToCSV = useCallback(() => {
+    if (!sortedTransactions.length) return;
+    exportTransactionsToCsv(sortedTransactions);
+  }, [sortedTransactions]);
+
+  const exportToJSON = useCallback(() => {    const jsonContent = JSON.stringify(transactions, null, 2);
     const blob = new Blob([jsonContent], { type: 'application/json;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -374,6 +379,15 @@ export function TransactionHistoryTable({
 
   return (
     <div className="overflow-hidden rounded-lg border border-[#30363d] bg-[#0d1117]">
+      <div className="flex items-center justify-end border-b border-[#30363d] px-4 py-2">
+        <button
+          type="button"
+          onClick={exportFilteredToCSV}
+          className="inline-flex items-center gap-1 rounded border border-[#30363d] bg-[#161b22] px-2.5 py-1.5 text-xs text-[#8b949e] hover:border-[#8b949e] hover:text-[#c9d1d9]"
+        >
+          <Download className="h-3 w-3" /> Export CSV
+        </button>
+      </div>
       {filterControls}
       {searchControls}
       <div className="overflow-x-auto">
