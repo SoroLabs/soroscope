@@ -25,3 +25,15 @@ To prevent horizontal scroll overflow on mobile screen widths, follow these step
 
 ## 💅 Questions?
 Feel free to open an **Issue**or reach out to the *SoroLabs team. Let's build the best Soroban developer tools together!
+
+## 🔬 Fuzzing (cargo-fuzz)
+
+The XDR decoder and WASM parser handle untrusted input. Fuzz them locally with:
+
+```bash
+cargo install cargo-fuzz
+cargo fuzz run --fuzz-dir core/fuzz fuzz_xdr_decoder -- -max_total_time=60
+cargo fuzz run --fuzz-dir core/fuzz fuzz_wasm_parser -- -max_total_time=60
+```
+
+CI runs each target for 60 seconds and fails on any panic.

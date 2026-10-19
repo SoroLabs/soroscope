@@ -170,6 +170,23 @@ jobs:
         run: cargo test --locked
 
   # --------------------------------------------------------------------------
+  # Job: Fuzz smoke test (XDR decoder + WASM parser, 60s each, no panics)
+  # --------------------------------------------------------------------------
+  fuzz:
+    name: Fuzz Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz XDR decoder (60s)
+        run: timeout 70 cargo fuzz run --fuzz-dir core/fuzz fuzz_xdr_decoder -- -max_total_time=60
+      - name: Fuzz WASM parser (60s)
+        run: timeout 70 cargo fuzz run --fuzz-dir core/fuzz fuzz_wasm_parser -- -max_total_time=60
+
+  # --------------------------------------------------------------------------
   # Job 4: Frontend (Lint & Typecheck)
   # --------------------------------------------------------------------------
   frontend:
