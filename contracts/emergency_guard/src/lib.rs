@@ -94,6 +94,8 @@ pub enum GuardDataKey {
     SignatureThreshold,
     AutoUnpauseDelay,
     AutoUnpauseAt,
+    PauseVotes,
+    UnpauseVotes,
 }
 
 const DEFAULT_AUTO_UNPAUSE_DELAY_SECONDS: u64 = 86_400;
@@ -298,6 +300,125 @@ impl EmergencyGuard {
         emit_guard_initialized(&env, &admins, threshold);
         Ok(())
     }
+
+    /// Initialize the emergency guard with guardians and M-of-N voting threshold.
+    pub fn init(env: Env, guardians: Vec<Address>, threshold: u32) -> Result<(), GuardError> {
+        if threshold == 0 || threshold > guardians.len() {
+            return Err(GuardError::InvalidThreshold);
+        }
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Guardians, &guardians);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Admins, &guardians);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::SignatureThreshold, &threshold);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::PauseState, &PauseType::new(0));
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::PauseVotes, &Vec::<Address>::new(&env));
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::UnpauseVotes, &Vec::<Address>::new(&env));
+        env.storage().instance().set(
+            &GuardDataKey::AutoUnpauseDelay,
+            &DEFAULT_AUTO_UNPAUSE_DELAY_SECONDS,
+        );
+        emit_guard_initialized(&env, &guardians, threshold);
+        Ok(())
+    }
+
+    /// Accumulates guardian votes to pause. Auto-pauses when votes >= threshold.
+    pub fn vote_pause(env: Env, guardian: Address) -> Result<u32, GuardError> {
+        guardian.require_auth();
+        if !Self::is_guardian(env.clone(), guardian.clone()) {
+            return Err(GuardError::Unauthorized);
+        }
+        let threshold = Self::get_threshold(env.clone());
+        if threshold == 0 {
+            return Err(GuardError::NotInitialized);
+        }
+        let mut votes: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::PauseVotes)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !votes.iter().any(|v| v == guardian) {
+            votes.push_back(guardian);
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::PauseVotes, &votes);
+        }
+        let vote_count = votes.len();
+        if vote_count >= threshold {
+            let mut state = PauseType::new(0);
+            state.pause_all();
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::PauseState, &state);
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::UnpauseVotes, &Vec::<Address>::new(&env));
+            emit_emergency_paused_all(&env, &votes);
+        }
+        Ok(vote_count)
+    }
+
+    /// Accumulates guardian votes to unpause. Auto-unpauses when votes >= threshold.
+    pub fn vote_unpause(env: Env, guardian: Address) -> Result<u32, GuardError> {
+        guardian.require_auth();
+        if !Self::is_guardian(env.clone(), guardian.clone()) {
+            return Err(GuardError::Unauthorized);
+        }
+        let threshold = Self::get_threshold(env.clone());
+        if threshold == 0 {
+            return Err(GuardError::NotInitialized);
+        }
+        let mut votes: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::UnpauseVotes)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !votes.iter().any(|v| v == guardian) {
+            votes.push_back(guardian);
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::UnpauseVotes, &votes);
+        }
+        let vote_count = votes.len();
+        if vote_count >= threshold {
+            let state = PauseType::new(0);
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::PauseState, &state);
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::PauseVotes, &Vec::<Address>::new(&env));
+            emit_resumed_all(&env, &votes);
+        }
+        Ok(vote_count)
+    }
+
+    pub fn get_pause_votes(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&GuardDataKey::PauseVotes)
+            .map(|v: Vec<Address>| v.len())
+            .unwrap_or(0)
+    }
+
+    pub fn get_unpause_votes(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&GuardDataKey::UnpauseVotes)
+            .map(|v: Vec<Address>| v.len())
+            .unwrap_or(0)
+    }
+
 
     /// Initialize admins and guardians separately. Guardian role changes are
     /// protected by the admin signature threshold.
@@ -1125,6 +1246,16 @@ impl DefaultEmergencyGuard {
     /// Public wrapper to validate a set of approvers against the stored threshold.
     pub fn validate_multi_sig(env: Env, approvers: Vec<Address>) -> Result<(), GuardError> {
         EmergencyGuard::check_multi_sig(&env, &approvers)
+    }
+
+    /// Guardian vote to pause helper
+    pub fn vote_pause(env: &Env, guardian: Address) -> Result<u32, GuardError> {
+        EmergencyGuard::vote_pause(env.clone(), guardian)
+    }
+
+    /// Guardian vote to unpause helper
+    pub fn vote_unpause(env: &Env, guardian: Address) -> Result<u32, GuardError> {
+        EmergencyGuard::vote_unpause(env.clone(), guardian)
     }
 }
 

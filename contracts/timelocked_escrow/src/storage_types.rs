@@ -49,6 +49,7 @@ pub enum Error {
     DuplicateGuardian = 12,
     CancellationFeeTooHigh = 13,
     InvalidTimelockExtension = 14,
+    LockPeriodTooShort = 15,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

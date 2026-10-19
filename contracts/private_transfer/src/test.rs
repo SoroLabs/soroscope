@@ -334,3 +334,128 @@ fn emits_obfuscated_transfer_event_without_addresses() {
     assert_eq!(payload.0, receipt.new_root);
     assert_eq!(payload.1, receipt.leaf_index_start);
 }
+
+#[test]
+fn test_fixed_curve_generators_are_on_curve() {
+    let g = pedersen::GENERATOR_G;
+    let h = pedersen::GENERATOR_H;
+    assert!(pedersen::point_is_on_curve(&g));
+    assert!(pedersen::point_is_on_curve(&h));
+    assert_eq!(g.x, 3);
+    assert_eq!(g.y, 4294967296);
+}
+
+#[test]
+fn test_pedersen_commitment_generation_and_storage() {
+    let (env, contract_id, _, _, _) = setup();
+    let client = PrivateTransferContractClient::new(&env, &contract_id);
+
+    let amount: i128 = 50_000;
+    let blinding_factor = bytes32(&env, 42);
+
+    let commitment = client.compute_pedersen_commitment(&amount, &blinding_factor);
+    assert!(!client.has_commitment(&commitment));
+
+    // Store commitment on-chain
+    client.store_commitment(&commitment);
+    assert!(client.has_commitment(&commitment));
+
+    // Verify opening against stored commitment
+    let opening = CommitmentOpening {
+        amount,
+        blinding_factor: blinding_factor.clone(),
+    };
+    let valid = client.verify_opening(&commitment, &opening);
+    assert!(valid);
+
+    // Verify alias
+    assert!(client.verify_commitment(&commitment, &opening));
+
+    // Verify direct opening helper
+    assert!(client.verify_commitment_opening(&commitment, &opening));
+}
+
+#[test]
+fn test_pedersen_commitment_rejects_incorrect_opening() {
+    let (env, contract_id, _, _, _) = setup();
+    let client = PrivateTransferContractClient::new(&env, &contract_id);
+
+    let amount: i128 = 250_000;
+    let blinding_factor = bytes32(&env, 77);
+
+    let commitment = client.compute_pedersen_commitment(&amount, &blinding_factor);
+    client.store_commitment(&commitment);
+
+    // Wrong amount
+    let wrong_amount_opening = CommitmentOpening {
+        amount: 250_001,
+        blinding_factor: blinding_factor.clone(),
+    };
+    assert!(!client.verify_opening(&commitment, &wrong_amount_opening));
+
+    // Wrong blinding factor
+    let wrong_blinding_opening = CommitmentOpening {
+        amount,
+        blinding_factor: bytes32(&env, 99),
+    };
+    assert!(!client.verify_opening(&commitment, &wrong_blinding_opening));
+}
+
+#[test]
+fn test_pedersen_verify_opening_rejects_unstored_commitment() {
+    let (env, contract_id, _, _, _) = setup();
+    let client = PrivateTransferContractClient::new(&env, &contract_id);
+
+    let amount: i128 = 10_000;
+    let blinding_factor = bytes32(&env, 12);
+    let commitment = client.compute_pedersen_commitment(&amount, &blinding_factor);
+
+    let opening = CommitmentOpening {
+        amount,
+        blinding_factor,
+    };
+    // Not stored yet -> verify_opening returns false
+    assert!(!client.verify_opening(&commitment, &opening));
+}
+
+#[test]
+fn test_pedersen_commitment_rejects_negative_amount() {
+    let (env, contract_id, _, _, _) = setup();
+    let client = PrivateTransferContractClient::new(&env, &contract_id);
+
+    let blinding = bytes32(&env, 1);
+    let res = client.try_compute_pedersen_commitment(&-100i128, &blinding);
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_pedersen_additive_homomorphism() {
+    let env = Env::default();
+    let a1: i128 = 100;
+    let a2: i128 = 250;
+    let r1 = bytes32(&env, 10);
+    let r2 = bytes32(&env, 20);
+
+    let c1_bytes = pedersen::commit(&env, a1, &r1).unwrap();
+    let c2_bytes = pedersen::commit(&env, a2, &r2).unwrap();
+
+    let pt1 = pedersen::bytes_to_point(&c1_bytes);
+    let pt2 = pedersen::bytes_to_point(&c2_bytes);
+    let sum_pt = pedersen::point_add(&pt1, &pt2);
+
+    // Sum of scalars
+    let sum_amount = a1 + a2;
+    let r1_u64 = u64::from_be_bytes(r1.to_array()[0..8].try_into().unwrap());
+    let r2_u64 = u64::from_be_bytes(r2.to_array()[0..8].try_into().unwrap());
+    let sum_r_u64 = pedersen::mod_add(r1_u64, r2_u64);
+    let mut sum_r_arr = [0u8; 32];
+    sum_r_arr[0..8].copy_from_slice(&sum_r_u64.to_be_bytes());
+    let sum_r = BytesN::from_array(&env, &sum_r_arr);
+
+    let c_sum_bytes = pedersen::commit(&env, sum_amount, &sum_r).unwrap();
+    let c_sum_pt = pedersen::bytes_to_point(&c_sum_bytes);
+
+    assert_eq!(sum_pt.x, c_sum_pt.x);
+    assert_eq!(sum_pt.y, c_sum_pt.y);
+}
+

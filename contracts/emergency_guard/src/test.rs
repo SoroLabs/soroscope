@@ -99,3 +99,71 @@ fn resume_clears_auto_unpause_schedule() {
         Err(Ok(GuardError::TimelockNotElapsed))
     );
 }
+
+#[test]
+fn test_m_of_n_guardian_multi_sig_pause_and_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EmergencyGuard, ());
+    let client = EmergencyGuardClient::new(&env, &contract_id);
+
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    let g3 = Address::generate(&env);
+    let outsider = Address::generate(&env);
+
+    let guardians = vec![&env, g1.clone(), g2.clone(), g3.clone()];
+    // 2-of-3 threshold
+    client.init(&guardians, &2);
+
+    assert_eq!(client.get_threshold(), 2);
+    assert_eq!(client.get_pause_votes(), 0);
+    assert_eq!(client.get_unpause_votes(), 0);
+    assert!(!client.is_paused(&PauseType::SWAP));
+
+    // Non-guardian cannot vote
+    assert_eq!(
+        client.try_vote_pause(&outsider),
+        Err(Ok(GuardError::Unauthorized))
+    );
+
+    // First guardian votes to pause: 1/2 votes -> not paused yet
+    let count1 = client.vote_pause(&g1);
+    assert_eq!(count1, 1);
+    assert_eq!(client.get_pause_votes(), 1);
+    assert!(!client.is_paused(&PauseType::SWAP));
+    assert_eq!(client.get_pause_type(), PauseType::Unpaused);
+
+    // Duplicate vote from g1 should not increment
+    let count_dup = client.vote_pause(&g1);
+    assert_eq!(count_dup, 1);
+    assert_eq!(client.get_pause_votes(), 1);
+
+    // Second guardian votes to pause: 2/2 votes -> threshold reached, auto-pauses!
+    let count2 = client.vote_pause(&g2);
+    assert_eq!(count2, 2);
+    assert_eq!(client.get_pause_votes(), 2);
+    assert!(client.is_paused(&PauseType::SWAP));
+    assert_eq!(client.get_pause_type(), PauseType::FullPause);
+
+    // Now test vote_unpause:
+    // Non-guardian cannot vote unpause
+    assert_eq!(
+        client.try_vote_unpause(&outsider),
+        Err(Ok(GuardError::Unauthorized))
+    );
+
+    // First guardian votes to unpause: 1/2 votes -> still paused
+    let unpause_count1 = client.vote_unpause(&g1);
+    assert_eq!(unpause_count1, 1);
+    assert_eq!(client.get_unpause_votes(), 1);
+    assert!(client.is_paused(&PauseType::SWAP));
+
+    // Third guardian votes to unpause: 2/2 votes -> threshold reached, auto-unpauses!
+    let unpause_count2 = client.vote_unpause(&g3);
+    assert_eq!(unpause_count2, 2);
+    assert!(!client.is_paused(&PauseType::SWAP));
+    assert_eq!(client.get_pause_type(), PauseType::Unpaused);
+    assert_eq!(client.get_pause_votes(), 0); // pause votes reset after unpause
+}
+
