@@ -1,8 +1,9 @@
-import { useState } from 'react';
+import { Suspense, useState } from 'react';
 import type { InvocationResult } from '../lib/sorobantypes';
 import { exportReport } from '../lib/exportReport';
 
 import { CallGraphVisualizer } from './CallGraphVisualizer';
+import { CallGraphVisualizerSkeleton } from './CallGraphVisualizerSkeleton';
 import { CopyButton } from './CopyButton';
 
 interface ResultViewerProps {
@@ -254,10 +255,12 @@ export function ResultViewer({ result, contractId }: ResultViewerProps) {
       )}
 
       {(result.callGraph || result.callGraphMermaid) && (
-        <CallGraphVisualizer
-          callGraph={result.callGraph}
-          mermaidDefinition={result.callGraphMermaid}
-        />
+        <Suspense fallback={<CallGraphVisualizerSkeleton />}>
+          <CallGraphVisualizer
+            callGraph={result.callGraph}
+            mermaidDefinition={result.callGraphMermaid}
+          />
+        </Suspense>
       )}
     </div>
   );

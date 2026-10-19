@@ -1,7 +1,7 @@
 import Head from "next/head";
 import dynamic from "next/dynamic";
 import { useRouter } from "next/router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { Code, FileCode, ChevronDown, ChevronRight } from "lucide-react";
 
 import { HeaderNav, type NavTab } from "../components/HeaderNav";
@@ -56,6 +56,8 @@ import { GasUsageChart } from '../components/GasUsageChart';
 import { InvocationHistory, useInvocationHistory } from '../components/InnovocationHistory';
 import { NutritionLabel } from '../components/NutritionLabel';
 import { NutritionLabelSkeleton } from '../components/NutritionLabelSkeleton';
+import { ResourceHeatmapSkeleton } from '../components/ResourceHeatmapSkeleton';
+import { GasUsageChartSkeleton } from '../components/GasUsageChartSkeleton';
 import { ResourceHeatmap } from '../components/ResourceHeatmap';
 import { ResultViewer } from '../components/Resultviewer';
 import { ResultViewerSkeleton } from '../components/ResultViewerSkeleton';
@@ -547,6 +549,7 @@ export default function Home() {
                     <ResultViewer result={currentResult} />
                     {analysisReport && (
                       <div className="mt-4 flex flex-col gap-4">
+                        <Suspense fallback={<ResourceHeatmapSkeleton />}>
                         <ResourceHeatmap resourceCost={{
                           cpu_instructions: analysisReport.cpu_instructions,
                           ram_bytes: analysisReport.ram_bytes,
@@ -556,8 +559,10 @@ export default function Home() {
                           cost_stroops: analysisReport.cost_stroops,
                           state_snapshot: currentResult.stateSnapshot
                         }} />
+                        </Suspense>
                     )}
                       <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                        <Suspense fallback={<NutritionLabelSkeleton />}>
                         <NutritionLabel
                           cpu_instructions={analysisReport.cpu_instructions}
                           ram_bytes={analysisReport.ram_bytes}
@@ -565,6 +570,8 @@ export default function Home() {
                           ledger_write_bytes={analysisReport.ledger_write_bytes}
                           transaction_size_bytes={analysisReport.transaction_size_bytes}
                         />
+                        </Suspense>
+                        <Suspense fallback={<GasUsageChartSkeleton />}>
                         <GasUsageChart
                           cost_stroops={(analysisReport as any).cost_stroops}
                           testnetAverages={(analysisReport as any).testnet_averages}
@@ -576,6 +583,7 @@ export default function Home() {
                           cost_stroops={analysisReport.cost_stroops}
                           testnetAverages={analysisReport.testnet_averages}
                         />
+                        </Suspense>
                       </div>
                     )}
                     {analysisReport && analysisReport.cost_stroops !== undefined && (
