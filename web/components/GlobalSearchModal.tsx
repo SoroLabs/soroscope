@@ -111,7 +111,7 @@ export function GlobalSearchModal() {
 
   useEffect(() => {
     setHighlight(0);
-  }, [query]);
+  }, [results]);
 
   if (!open) return null;
 
@@ -124,7 +124,7 @@ export function GlobalSearchModal() {
       setHighlight((current) => moveHighlight(current, -1, results.length));
     } else if (event.key === 'Enter') {
       event.preventDefault();
-      runCommand(results[highlight]);
+      runCommand(results[Math.min(highlight, Math.max(results.length - 1, 0))]);
     }
   };
 
