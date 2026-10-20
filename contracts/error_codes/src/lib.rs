@@ -42,6 +42,9 @@ pub enum ContractError {
     DivisionByZero = 16,
     InvalidInput = 17,
     InvalidAmount = 18,
+
+    // ── Staking ──────────────────────────────────────────────────────────────
+    WithdrawExceedsSurplus = 19,
 }
 
 impl ContractError {
@@ -71,6 +74,7 @@ impl ContractError {
             16 => Some(Self::DivisionByZero),
             17 => Some(Self::InvalidInput),
             18 => Some(Self::InvalidAmount),
+            19 => Some(Self::WithdrawExceedsSurplus),
             _ => None,
         }
     }
@@ -100,7 +104,8 @@ pub const ERROR_SCHEMA_JSON: &str = r#"{
     { "name": "Overflow", "code": 15, "description": "Arithmetic overflow occurred." },
     { "name": "DivisionByZero", "code": 16, "description": "Attempted division by zero." },
     { "name": "InvalidInput", "code": 17, "description": "Input argument provided is invalid." },
-    { "name": "InvalidAmount", "code": 18, "description": "Amount is invalid, negative, or below the minimum required." }
+    { "name": "InvalidAmount", "code": 18, "description": "Amount is invalid, negative, or below the minimum required." },
+    { "name": "WithdrawExceedsSurplus", "code": 19, "description": "Admin withdraw amount exceeds surplus reward tokens." }
   ]
 }"#;
 
@@ -128,16 +133,17 @@ mod test {
         assert_eq!(ContractError::DivisionByZero.as_u32(), 16);
         assert_eq!(ContractError::InvalidInput.as_u32(), 17);
         assert_eq!(ContractError::InvalidAmount.as_u32(), 18);
+        assert_eq!(ContractError::WithdrawExceedsSurplus.as_u32(), 19);
     }
 
     #[test]
     fn test_from_u32_conversion() {
-        for code in 1..=18 {
+        for code in 1..=19 {
             let err = ContractError::from_u32(code).expect("Valid discriminant should convert");
             assert_eq!(err.as_u32(), code);
         }
         assert_eq!(ContractError::from_u32(0), None);
-        assert_eq!(ContractError::from_u32(19), None);
+        assert_eq!(ContractError::from_u32(20), None);
     }
 
     #[test]
@@ -145,7 +151,9 @@ mod test {
         assert!(ERROR_SCHEMA_JSON.contains("AlreadyInitialized"));
         assert!(ERROR_SCHEMA_JSON.contains("InvalidInput"));
         assert!(ERROR_SCHEMA_JSON.contains("InvalidAmount"));
+        assert!(ERROR_SCHEMA_JSON.contains("WithdrawExceedsSurplus"));
         assert!(ERROR_SCHEMA_JSON.contains("\"code\": 1"));
         assert!(ERROR_SCHEMA_JSON.contains("\"code\": 18"));
+        assert!(ERROR_SCHEMA_JSON.contains("\"code\": 19"));
     }
 }
