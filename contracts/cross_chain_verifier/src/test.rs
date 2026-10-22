@@ -1,4 +1,5 @@
 #![cfg(test)]
+#![cfg(test)]
 
 use crate::{CrossChainVerifier, CrossChainVerifierClient, Payload};
 use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, Vec};
@@ -18,6 +19,26 @@ fn make_payload(env: &Env, nonce: u64) -> Payload {
 fn compute_leaf(env: &Env, payload: &Payload) -> BytesN<32> {
     CrossChainVerifier::compute_payload_hash(env, payload)
 }
+
+#[test]
+fn test_verify_message_rejects_empty_proof() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    client.initialize(&admin);
+
+    let payload = make_payload(&env, 1);
+    let proof = Vec::new(&env);
+    let proof_flags = Vec::new(&env);
+
+    let result = client.try_verify_message(&100, &payload, &proof, &proof_flags);
+    assert_eq!(result, Err(Ok(crate::Error::InvalidProof)));
+}
+
 use crate::{
     CrossChainMessage, CrossChainVerifier, CrossChainVerifierClient, SignatureAlgorithm,
     SignedMessage,
