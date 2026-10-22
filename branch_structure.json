@@ -1,0 +1,21 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "feat/issue-847-client-side-issue-soroban-network-congestion",
+    "main",
+    "origin",
+    "security/issue-1319-feat-contracts-multi-yield-vault-add-pause"
+  ],
+  "parent": {
+    "feat/issue-847-client-side-issue-soroban-network-congestion": "main",
+    "main": null,
+    "origin": "main",
+    "security/issue-1319-feat-contracts-multi-yield-vault-add-pause": "main"
+  },
+  "order": [
+    "main",
+    "feat/issue-847-client-side-issue-soroban-network-congestion",
+    "origin",
+    "security/issue-1319-feat-contracts-multi-yield-vault-add-pause"
+  ]
+}
