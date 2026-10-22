@@ -660,5 +660,16 @@ export function UploadZone({
         }
       `}</style>
     </div>
+    
   );
 }
+-    const hasFiles = Array.from(event.dataTransfer.items).some(
+-      (item) => item.kind === "file",
+-    );
++    // Firefox may leave DataTransfer.items empty during `dragover` and only
++    // populate it when the user drops. Fall back to `files` for drag feedback.
++    const transferItems = event.dataTransfer.items;
++    const hasFiles =
++      (transferItems?.length > 0 &&
++        Array.from(transferItems).some((item) => item.kind === "file")) ||
++      event.dataTransfer.files.length > 0;
