@@ -1,3 +1,4 @@
+
 //! Admin rotation integration tests for AuctionFactory (issue #452).
 //!
 //! These tests verify that admin rotation via EmergencyGuard works correctly:
@@ -132,6 +133,7 @@ fn test_factory_deploys_auctions_collects_fees_and_indexes_them() {
         &100,
         &200,
         &10,
+        &100,
         &english_wasm_hash(&env),
     );
     let dutch = client.create_dutch_auction(
@@ -142,6 +144,7 @@ fn test_factory_deploys_auctions_collects_fees_and_indexes_them() {
         &200,
         &100,
         &10,
+        &100,
         &dutch_wasm_hash(&env),
     );
 
@@ -174,7 +177,7 @@ fn test_factory_rejects_deployment_without_fee_configuration() {
     let zero_hash = BytesN::from_array(&env, &[0; 32]);
 
     let result = client.try_create_dutch_auction(
-        &seller, &contract, &1, &contract, &200, &100, &10, &zero_hash,
+        &seller, &contract, &1, &contract, &200, &100, &10, &100, &zero_hash,
     );
 
     assert_eq!(result, Err(Ok(FactoryError::FeeNotConfigured)));

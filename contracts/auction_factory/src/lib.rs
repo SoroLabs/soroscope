@@ -36,6 +36,7 @@ pub enum FactoryError {
     InvalidFee = 1,
     FeeNotConfigured = 2,
     Unauthorized = 3,
+    InvalidBidIncrement = 4,
 }
 
 const MAX_PAGE_SIZE: u32 = 100;
@@ -168,6 +169,7 @@ impl AuctionFactory {
         starting_price: i128,
         reserve_price: i128,
         duration_ledgers: u32,
+        min_bid_increment_bps: u32,
         english_wasm_hash: BytesN<32>,
     ) -> Result<Address, FactoryError> {
         collect_deployment_fee(&env, &seller)?;
@@ -199,6 +201,7 @@ impl AuctionFactory {
                 starting_price.into_val(&env),
                 reserve_price.into_val(&env),
                 duration_ledgers.into_val(&env),
+                min_bid_increment_bps.into_val(&env),
             ],
         );
 
@@ -222,6 +225,7 @@ impl AuctionFactory {
         start_price: i128,
         end_price: i128,
         duration_ledgers: u32,
+        min_bid_increment_bps: u32,
         dutch_wasm_hash: BytesN<32>,
     ) -> Result<Address, FactoryError> {
         collect_deployment_fee(&env, &seller)?;
@@ -252,6 +256,7 @@ impl AuctionFactory {
                 start_price.into_val(&env),
                 end_price.into_val(&env),
                 duration_ledgers.into_val(&env),
+                min_bid_increment_bps.into_val(&env),
             ],
         );
 
@@ -270,6 +275,18 @@ impl AuctionFactory {
         env.storage()
             .persistent()
             .get(&DataKey::Auction(auction_address))
+    }
+
+    /// Compute the minimum acceptable next bid given the current bid and the
+    /// configured `min_bid_increment_bps` (basis points, 1 bps = 0.01%).
+    ///
+    /// next_bid >= current_bid + ceil(current_bid * bps / 10_000)
+    pub fn min_next_bid(current_bid: i128, min_bid_increment_bps: u32) -> i128 {
+        let bps = min_bid_increment_bps as i128;
+        let numerator = current_bid.saturating_mul(bps);
+        // Ceiling division so dust bids are always rejected.
+        let increment = (numerator + 9_999) / 10_000;
+        current_bid.saturating_add(increment)
     }
 
     pub fn get_auction_count(env: Env) -> u32 {
@@ -302,3 +319,5 @@ impl AuctionFactory {
 }
 
 mod test;
+// min_bid_increment_bps is forwarded to the auction contract's initialize
+// entrypoint; the auction contract enforces the increment on each bid.
