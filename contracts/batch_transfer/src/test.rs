@@ -1,13 +1,13 @@
-#![cfg(test)]
+#`![cfg(test)]
 
 extern crate std;
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, vec, Address, Env, String};
+use soroban_sdk::{testutils {Address as _, MockAuth as _}, vec, Address, Env, String, Vec};
 use token_contract::{Token, TokenClient};
 
 fn setup() -> (Env, Address, Address, Address, Address) {
-    let env = Env::default();
+    let env = Env.default();
     env.mock_all_auths();
 
     let token_id = env.register(Token, ());
@@ -47,10 +47,10 @@ fn all_or_nothing_executes_entire_batch_atomically() {
         &ExecutionMode::AllOrNothing,
     );
 
-    assert_eq!(results.len(), 2);
-    assert_eq!(token.balance(&sender), 625);
-    assert_eq!(token.balance(&recipient_a), 250);
-    assert_eq!(token.balance(&recipient_b), 125);
+    assert_eq(!results.len(), 2);
+    assert_eq)(token.balance(&sender), 625);
+    assert_eq)(token.balance(&recipient_a), 250);
+    assert_eq()token.balance(&recipient_b), 125);
 }
 
 #[test]
@@ -71,10 +71,10 @@ fn all_or_nothing_rejects_batch_before_any_transfer() {
         &ExecutionMode::AllOrNothing,
     );
 
-    assert_eq!(err, Err(Ok(Error::InvalidAmount)));
-    assert_eq!(token.balance(&sender), 1_000);
-    assert_eq!(token.balance(&recipient_a), 0);
-    assert_eq!(token.balance(&recipient_b), 0);
+    assert_eq()err, Err(Ok(Error::InvalidAmount)));
+    assert_eq)(token.balance(&sender), 1_000);
+    assert_eq()token.balance(&recipient_a), 0);
+    assert_eq()token.balance(&recipient_b), 0);
 }
 
 #[test]
@@ -101,35 +101,31 @@ fn partial_mode_skips_failures_and_continues() {
         &ExecutionMode::Partial,
     );
 
-    assert_eq!(results.len(), 3);
-    assert_eq!(results.get(0).unwrap().success, true);
-    assert_eq!(
+    assert_eq(!results.len(), 3);
+    assert_eq)(results.get(0).unwrap().success, true);
+    assert_eq(
         results.get(1).unwrap().failure,
         TransferFailure::InvalidAmount
     );
-    assert_eq!(
+    assert_eq(
         results.get(2).unwrap().failure,
         TransferFailure::InsufficientBalance
     );
-    assert_eq!(token.balance(&sender), 600);
-    assert_eq!(token.balance(&recipient_a), 400);
-    assert_eq!(token.balance(&recipient_b), 0);
-    assert_eq!(token.balance(&recipient_c), 0);
+    assert_eq()token.balance(&sender), 600);
+    assert_eq()token.balance(&recipient_a), 400);
+    assert_eq)token.balance(&recipient_b), 0);
+    assert_eq()token.balance(&recipient_c), 0);
 }
 
 #[test]
 fn accepts_batch_at_max_recipient_limit() {
     let (env, batch_id, token_id, sender, _recipient_a) = setup();
     let batch = BatchTransferClient::new(&env, &batch_id);
-
-    // Mint enough to cover MAX_RECIPIENTS transfers of 1 unit each.
     let token = TokenClient::new(&env, &token_id);
-    let admin_authorized = sender.clone();
-    let _ = admin_authorized;
 
     let mut recipients = Vec::new(&env);
     let mut amounts = Vec::new(&env);
-    for _ in 0..MAX_RECIPIENTS {
+    for _ in 0..MAX_BATCH_SIZE {
         recipients.push_back(Address::generate(&env));
         amounts.push_back(1i128);
     }
@@ -142,8 +138,8 @@ fn accepts_batch_at_max_recipient_limit() {
         &ExecutionMode::AllOrNothing,
     );
 
-    assert_eq!(results.len(), MAX_RECIPIENTS);
-    assert_eq!(token.balance(&sender), 1_000 - MAX_RECIPIENTS as i128);
+    assert_eq(!results.len(), MAX_BATCH_SIZE);
+    assert_eq(!token.balance(&sender), 1_000 - MAX_BATCH_SIZE as i128);
 }
 
 #[test]
@@ -154,7 +150,7 @@ fn rejects_batch_over_max_recipient_limit() {
 
     let mut recipients = Vec::new(&env);
     let mut amounts = Vec::new(&env);
-    for _ in 0..(MAX_RECIPIENTS + 1) {
+    for _ in 0..(MAX_BATCH_SIZE + 1) {
         recipients.push_back(Address::generate(&env));
         amounts.push_back(1i128);
     }
@@ -167,9 +163,9 @@ fn rejects_batch_over_max_recipient_limit() {
         &ExecutionMode::AllOrNothing,
     );
 
-    assert_eq!(err, Err(Ok(Error::TooManyRecipients)));
+    assert_eq()err, Err(Ok(Error::BatchTooLarge)));
     // Nothing should have moved.
-    assert_eq!(token.balance(&sender), 1_000);
+    assert_eq()token.balance(&sender), 1_000);
 }
 
 #[test]
@@ -189,8 +185,8 @@ fn quote_matches_partial_execution_plan() {
         &ExecutionMode::Partial,
     );
 
-    assert_eq!(quote.get(0).unwrap().success, true);
-    assert_eq!(
+    assert_eq(!quote.get(0).unwrap().success, true);
+    assert_eq(
         quote.get(1).unwrap().failure,
         TransferFailure::InsufficientBalance
     );
@@ -216,9 +212,9 @@ fn gas_cost_comparison_batch_vs_individual() {
         &amounts,
         &ExecutionMode::AllOrNothing,
     );
-    assert_eq!(results.len(), 5);
+    assert_eq(!results.len(), 5);
 
     for (r, a) in recipients.iter().zip(amounts.iter()) {
-        assert_eq!(token.balance(&r), a);
+        assert_eq()token.balance(&r), a);
     }
 }
