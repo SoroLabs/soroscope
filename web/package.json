@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
+    "dev": "node init && next dev",
+    "build": "node init && next build",
+    "start": "node init && next start",
     "lint": "eslint . --ext .ts,.tsx,.js,.jsx",
     "test:a11y": "playwright test e2e/accessibility.spec.ts",
     "test": "node --test lib/__tests__/*.test.js components/**/*.test.cjs"

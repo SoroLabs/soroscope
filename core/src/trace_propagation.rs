@@ -1,4 +1,4 @@
-//! Trace-context carriers for Tokio channels and spawned tasks.
+//! Trace-context carriers for Tokio channels, spawned tasks, and outgoing RPC calls.
 
 use axum::http::{HeaderMap, HeaderValue};
 use axum::{body::Body, extract::Request, middleware::Next, response::Response};
@@ -58,6 +58,20 @@ pub fn inject_http(headers: &mut HeaderMap) {
             }
         }
     });
+}
+
+/// Inject the active span's W3C context into an outgoing `reqwest` request.
+///
+/// Call this before every outgoing Soroban RPC request so that the RPC spans
+/// are linked to the originating trace instead of appearing orphaned.
+pub fn inject_reqwest(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let mut header_map = HeaderMap::new();
+    inject_http(&mut header_map);
+    let mut request = request;
+    for (name, value) in header_map.iter() {
+        request = request.header(name, value);
+    }
+    request
 }
 
 /// Extract W3C context from an inbound HTTP or WebSocket handshake.
@@ -321,6 +335,32 @@ mod tests {
         let mut metadata = MetadataMap::new();
         inject_grpc(&mut metadata);
         assert_eq!(metadata.get("traceparent").unwrap(), TRACEPARENT);
+    }
+
+    #[test]
+    fn reqwest_request_injects_traceparent() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let subscriber = tracing_subscriber::registry().with(tracing_opentelemetry::layer());
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let context = opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+            TraceId::from(1),
+            opentelemetry::trace::SpanId::from(2),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        ));
+        let span = tracing::info_span!("outbound_rpc");
+        span.set_parent(context);
+        let _guard = span.enter();
+
+        let client = reqwest::Client::new();
+        let request = inject_reqwest(client.post("http://127.0.0.1:1/"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get("traceparent").unwrap(),
+            TRACEPARENT
+        );
     }
 
     #[test]

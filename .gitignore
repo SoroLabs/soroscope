@@ -13,12 +13,7 @@ web/.next/
 web/out/
 
 # ── Environment & Secrets ─────────────────────────────────────────────
-.env
-.env.local
 .env.*.local
-.env.production
-.env.development
-.env.test
 *.pem
 *.key
 
@@ -35,7 +30,6 @@ build/
 *.optimized.wasm
 
 # ── Editor / IDE ─────────────────────────────────────────────────────
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -51,3 +45,4 @@ Thumbs.db
 # ── Misc ─────────────────────────────────────────────────────────────
 .vercel
 coverage/
+config.bat
