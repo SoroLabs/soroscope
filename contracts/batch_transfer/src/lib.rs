@@ -14,12 +14,17 @@ pub enum Error {
     InvalidAmount = 3,
     InsufficientBalance = 4,
     TooManyRecipients = 5,
+    BatchTooLarge = 6,
 }
 
 /// Upper bound on recipients per batch. Oversized recipient vectors are
 /// rejected before any iteration so a caller cannot exhaust the
 /// transaction's CPU instruction budget by passing an unbounded batch.
 const MAX_RECIPIENTS: u32 = 100;
+
+/// Upper bound on the total number of transfers per batch. Enforced before
+/// any iteration to prevent resource exhaustion from oversized batches.
+const MAX_BATCH_SIZE: u32 = 100;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +71,9 @@ fn process_batch(
     }
     if len > MAX_RECIPIENTS {
         return Err(Error::TooManyRecipients);
+    }
+    if len > MAX_BATCH_SIZE {
+        return Err(Error::BatchTooLarge);
     }
     if len != amounts.len() {
         return Err(Error::LengthMismatch);
