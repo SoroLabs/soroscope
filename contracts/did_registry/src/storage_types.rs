@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes, Map, String, Symbol, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, Bytes, String, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,9 +65,10 @@ pub struct DIDUpdated {
 }
 
 // Storage keys
-pub const DID_DOCUMENT: Symbol = Symbol::short("DID_DOC");
-pub const DID_METADATA: Symbol = Symbol::short("DID_META");
-pub const DID_INDEX: Symbol = Symbol::short("DID_IDX");
-pub const CLAIMS: Symbol = Symbol::short("CLAIMS");
-pub const ATTESTATIONS: Symbol = Symbol::short("ATTEST");
-pub const OWNER: Symbol = Symbol::short("OWNER");
+pub const DID_DOCUMENT: Symbol = symbol_short!("DID_DOC");
+pub const DID_METADATA: Symbol = symbol_short!("DID_META");
+pub const DID_INDEX: Symbol = symbol_short!("DID_IDX");
+pub const CLAIMS: Symbol = symbol_short!("CLAIMS");
+pub const ATTESTATIONS: Symbol = symbol_short!("ATTEST");
+pub const OWNER: Symbol = symbol_short!("OWNER");
+pub const DID_CID: Symbol = symbol_short!("DID_CID");

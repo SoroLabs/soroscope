@@ -1,6 +1,11 @@
+extern crate std;
+
 use crate::contract::{DIDRegistry, DIDRegistryClient};
-use crate::storage_types::{Attestation, Claim, DIDDocument, Service, VerificationMethod};
-use soroban_sdk::{testutils::Address as _, Address, Bytes, Env, String, Vec};
+use crate::storage_types::{Claim, DIDDocument, VerificationMethod};
+use soroban_sdk::{
+    testutils::{Address as _, Events as _, Ledger as _},
+    Address, Bytes, Env, String, Symbol, TryIntoVal, Vec,
+};
 
 #[test]
 fn test_register_and_update_did() {
@@ -401,4 +406,131 @@ fn test_invalid_did_uri() {
     };
 
     client.register_did(&invalid_did, &document, &None);
+}
+
+#[test]
+fn test_update_document_emits_event_and_chains_cid() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let did_id = String::from_str(&env, "did:soroban:test_cid_tracking");
+    let document = DIDDocument {
+        context: Vec::from_array(
+            &env,
+            [String::from_str(&env, "https://www.w3.org/ns/did/v1")],
+        ),
+        id: did_id.clone(),
+        verification_method: Vec::new(&env),
+        authentication: Vec::new(&env),
+        assertion_method: Vec::new(&env),
+        key_agreement: Vec::new(&env),
+        capability_invocation: Vec::new(&env),
+        capability_delegation: Vec::new(&env),
+        service: Vec::new(&env),
+    };
+
+    client.register_did(&did_id, &document, &None);
+
+    let cid_v1 = String::from_str(
+        &env,
+        "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+    );
+    client.update_document(&did_id, &cid_v1);
+
+    // Verify first event immediately after update_document
+    let events = env.events().all();
+    let event_name = Symbol::new(&env, "did_updated");
+    let matching: std::vec::Vec<_> = events
+        .iter()
+        .filter(|(c_id, topics, _)| {
+            if c_id != &contract_id || topics.len() != 2 {
+                return false;
+            }
+            let sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            let did_topic: Result<String, _> = topics.get(1).unwrap().try_into_val(&env);
+            sym.ok() == Some(event_name.clone()) && did_topic.ok() == Some(did_id.clone())
+        })
+        .collect();
+
+    assert_eq!(matching.len(), 1);
+    let (_, _, data) = matching.last().unwrap();
+    let payload: (String, String) = data.clone().try_into_val(&env).unwrap();
+    assert_eq!(payload.0, String::from_str(&env, ""));
+    assert_eq!(payload.1, cid_v1);
+
+    assert_eq!(client.get_document_cid(&did_id), cid_v1);
+
+    // Second update to confirm old CID chains correctly
+    let cid_v2 = String::from_str(
+        &env,
+        "bafybeihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+    );
+    client.update_document(&did_id, &cid_v2);
+
+    let events2 = env.events().all();
+    let matching2: std::vec::Vec<_> = events2
+        .iter()
+        .filter(|(c_id, topics, _)| {
+            if c_id != &contract_id || topics.len() != 2 {
+                return false;
+            }
+            let sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            let did_topic: Result<String, _> = topics.get(1).unwrap().try_into_val(&env);
+            sym.ok() == Some(event_name.clone()) && did_topic.ok() == Some(did_id.clone())
+        })
+        .collect();
+
+    assert_eq!(matching2.len(), 1);
+    let (_, _, data2) = matching2.last().unwrap();
+    let payload2: (String, String) = data2.clone().try_into_val(&env).unwrap();
+    assert_eq!(payload2.0, cid_v1);
+    assert_eq!(payload2.1, cid_v2);
+
+    assert_eq!(client.get_document_cid(&did_id), cid_v2);
+}
+
+#[test]
+#[should_panic(expected = "DID not found")]
+fn test_update_document_did_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let unregistered_did = String::from_str(&env, "did:soroban:unregistered");
+    let cid = String::from_str(
+        &env,
+        "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+    );
+    client.update_document(&unregistered_did, &cid);
+}
+
+#[test]
+#[should_panic(expected = "invalid DID URI format")]
+fn test_update_document_invalid_did_uri() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let invalid_did = String::from_str(&env, "http://invalid-uri");
+    let cid = String::from_str(
+        &env,
+        "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+    );
+    client.update_document(&invalid_did, &cid);
 }

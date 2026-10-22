@@ -1,6 +1,6 @@
 use crate::storage_types::{
     Attestation, Claim, DIDDocument, DIDMetadata, DIDUpdated, Service, VerificationMethod,
-    ATTESTATIONS, CLAIMS, DID_DOCUMENT, DID_INDEX, DID_METADATA, OWNER,
+    ATTESTATIONS, CLAIMS, DID_CID, DID_DOCUMENT, DID_INDEX, DID_METADATA, OWNER,
 };
 use soroban_sdk::{contract, contractimpl, Address, Bytes, Env, String, Symbol, Vec};
 
@@ -16,6 +16,10 @@ pub trait DIDRegistryTrait {
     fn is_did_valid(e: Env, did: String) -> bool;
 
     fn update_did_document(e: Env, did: String, document: DIDDocument);
+
+    fn update_document(e: Env, did_id: String, new_cid: String);
+
+    fn get_document_cid(e: Env, did_id: String) -> String;
 
     fn add_verification_method(e: Env, did: String, method: VerificationMethod);
 
@@ -58,13 +62,14 @@ impl DIDRegistry {
         owner.require_auth();
     }
 
-    fn validate_did_uri(e: &Env, did: &String) {
-        if did.len() < 4 {
+    fn validate_did_uri(_e: &Env, did: &String) {
+        let len = did.len() as usize;
+        if !(4..=256).contains(&len) {
             panic!("invalid DID URI format");
         }
-        let mut buf = [0u8; 4];
-        did.copy_into_slice(&mut buf[..4]);
-        if &buf != b"did:" {
+        let mut buf = [0u8; 256];
+        did.copy_into_slice(&mut buf[..len]);
+        if &buf[..4] != b"did:" {
             panic!("invalid DID URI format");
         }
     }
@@ -85,7 +90,7 @@ impl DIDRegistry {
             .storage()
             .persistent()
             .get(&DID_INDEX)
-            .unwrap_or(Vec::new(&e));
+            .unwrap_or(Vec::new(e));
         let mut i = 0;
         while i < dids.len() {
             if dids.get(i).unwrap() == *did {
@@ -107,7 +112,7 @@ impl DIDRegistry {
             .storage()
             .persistent()
             .get(&DID_INDEX)
-            .unwrap_or(Vec::new(&e));
+            .unwrap_or(Vec::new(e));
         let mut i = 0;
         while i < dids.len() {
             let did = dids.get(i).unwrap();
@@ -156,7 +161,9 @@ impl DIDRegistryTrait for DIDRegistry {
             panic!("already initialized");
         }
         e.storage().instance().set(&OWNER, &owner);
-        e.storage().persistent().set(&DID_INDEX, &Vec::new(&e));
+        e.storage()
+            .persistent()
+            .set(&DID_INDEX, &Vec::<String>::new(&e));
     }
 
     fn register_did(e: Env, did: String, document: DIDDocument, expiration_timestamp: Option<u64>) {
@@ -224,6 +231,41 @@ impl DIDRegistryTrait for DIDRegistry {
 
         e.storage().persistent().set(&key, &document);
         Self::emit_did_updated(&e, &did, "update");
+    }
+
+    fn update_document(e: Env, did_id: String, new_cid: String) {
+        Self::require_owner_auth(&e);
+        Self::validate_did_uri(&e, &did_id);
+
+        let did_key = (DID_DOCUMENT, did_id.clone());
+        let cid_key = (DID_CID, did_id.clone());
+
+        if !e.storage().persistent().has(&did_key) && !e.storage().persistent().has(&cid_key) {
+            panic!("DID not found");
+        }
+
+        let old_cid: String = e
+            .storage()
+            .persistent()
+            .get(&cid_key)
+            .unwrap_or_else(|| String::from_str(&e, ""));
+
+        e.storage().persistent().set(&cid_key, &new_cid);
+        Self::append_did_index(&e, &did_id);
+
+        e.events().publish(
+            (Symbol::new(&e, "did_updated"), did_id.clone()),
+            (old_cid.clone(), new_cid.clone()),
+        );
+    }
+
+    fn get_document_cid(e: Env, did_id: String) -> String {
+        let cid_key = (DID_CID, did_id.clone());
+        if let Some(cid) = e.storage().persistent().get(&cid_key) {
+            cid
+        } else {
+            panic!("CID not found");
+        }
     }
 
     fn add_verification_method(e: Env, did: String, method: VerificationMethod) {
@@ -370,7 +412,7 @@ impl DIDRegistryTrait for DIDRegistry {
     }
 
     fn verify_attestation(e: Env, attestation: Attestation) -> bool {
-        if attestation.timestamp == 0 || attestation.signature.len() == 0 {
+        if attestation.timestamp == 0 || attestation.signature.is_empty() {
             return false;
         }
 
