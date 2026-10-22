@@ -120,3 +120,64 @@ export function ConnectButton() {
     </motion.button>
   );
 }
+const handleDisconnect = async () => {
+  setDropdownOpen(false);
+
+  try {
+    await disconnect();
+
+    const walletRequiredRoutes = [
+      // Add the actual wallet-protected routes in this repository.
+    ];
+
+    const requiresWallet = walletRequiredRoutes.some(
+      (route) => pathname === route || pathname.startsWith(`${route}/`),
+    );
+
+    if (requiresWallet) {
+      router.replace("/");
+    }
+  } catch (error) {
+    console.error("Failed to disconnect wallet:", error);
+  }
+};const resetWalletSession = useCallback(() => {
+  balanceReqRef.current?.abort();
+  balanceReqRef.current = null;
+
+  setAddress(null);
+  setSelectedWalletId(null);
+  setIsConnecting(false);
+  setError(null);
+
+  setBalances([]);
+  setBalancesLoading(false);
+  setBalancesError(null);
+
+  try {
+    localStorage.removeItem("inheritx_wallet_address");
+    localStorage.removeItem("inheritx_wallet_id");
+  } catch (error) {
+    console.warn("Failed to clear persisted wallet state:", error);
+  }
+}, []);
+
+const resetWalletSession = useCallback(() => {
+  balanceReqRef.current?.abort();
+  balanceReqRef.current = null;
+
+  setAddress(null);
+  setSelectedWalletId(null);
+  setIsConnecting(false);
+  setError(null);
+
+  setBalances([]);
+  setBalancesLoading(false);
+  setBalancesError(null);
+
+  try {
+    localStorage.removeItem("inheritx_wallet_address");
+    localStorage.removeItem("inheritx_wallet_id");
+  } catch (error) {
+    console.warn("Failed to clear persisted wallet state:", error);
+  }
+}, []);
