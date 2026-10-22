@@ -1,7 +1,9 @@
 extern crate std;
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Ledger as _, Address, Env, Symbol, TryFromVal, Val, Vec,
+};
 
 #[test]
 fn test_proxy_upgrade_with_timelock() {
@@ -74,4 +76,50 @@ fn test_cancel_upgrade() {
 
     proxy.cancel_upgrade();
     assert_eq!(proxy.get_pending_upgrade(), None);
+}
+
+#[test]
+fn test_delegate_call_forwards_original_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let proxy_id = env.register(Proxy, ());
+    let impl_id = env.register(ProxyLogicV1, ());
+
+    let proxy = ProxyClient::new(&env, &proxy_id);
+    proxy.initialize(&admin, &impl_id);
+
+    // `whoami` authenticates and returns the caller forwarded by the proxy.
+    // Passing `user` as the caller must make the implementation observe `user`,
+    // not the proxy's address. The proxy prepends the caller, so `args` is empty.
+    let args: Vec<Val> = Vec::new(&env);
+    let result = proxy.delegate_call(&user, &Symbol::new(&env, "whoami"), &args);
+    let observed = Address::try_from_val(&env, &result).unwrap();
+
+    assert_eq!(observed, user);
+    assert_ne!(observed, proxy_id);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_delegate_call_requires_original_caller_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let proxy_id = env.register(Proxy, ());
+    let impl_id = env.register(ProxyLogicV1, ());
+
+    let proxy = ProxyClient::new(&env, &proxy_id);
+    proxy.initialize(&admin, &impl_id);
+
+    // The implementation requires authorization from the forwarded caller, so
+    // an unauthenticated delegation must be rejected.
+    env.mock_auths(&[]);
+
+    let args: Vec<Val> = Vec::new(&env);
+    proxy.delegate_call(&user, &Symbol::new(&env, "whoami"), &args);
 }
