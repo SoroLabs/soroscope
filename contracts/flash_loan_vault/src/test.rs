@@ -276,7 +276,9 @@ fn test_initialize() {
     assert_eq!(s.vault_client.get_admin(), s.admin);
     assert_eq!(s.vault_client.get_token(), s.token);
     assert_eq!(s.vault_client.get_fee(), DEFAULT_FEE_BPS);
+    assert_eq!(s.vault_client.get_flash_fee_bps(), DEFAULT_FLASH_FEE_BPS);
     assert_eq!(s.vault_client.get_total_deposited(), 0);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 0);
 }
 
 #[test]
@@ -334,13 +336,16 @@ fn test_withdraw_exceeds_deposited() {
 #[test]
 fn test_set_fee() {
     let s = setup();
-    assert_eq!(s.vault_client.get_fee(), 0);
+    assert_eq!(s.vault_client.get_fee(), DEFAULT_FEE_BPS);
+    assert_eq!(s.vault_client.get_flash_fee_bps(), 5);
 
-    s.vault_client.set_fee(&50);
+    s.vault_client.set_flash_fee_bps(&50);
+    assert_eq!(s.vault_client.get_flash_fee_bps(), 50);
     assert_eq!(s.vault_client.get_fee(), 50);
 
     s.vault_client.set_fee(&0);
     assert_eq!(s.vault_client.get_fee(), 0);
+    assert_eq!(s.vault_client.get_flash_fee_bps(), 0);
 }
 
 #[test]
@@ -356,6 +361,7 @@ fn test_set_fee_invalid() {
 fn test_borrow_pause_blocks_flash_loan_and_borrow_and_resume_allows() {
     let s = setup();
     fund_vault(&s, 10_000);
+    s.vault_client.set_fee(&0);
 
     let initiator = Address::generate(&s.e);
     let receiver_id = s.e.register(good::GoodReceiver, ());
@@ -413,6 +419,7 @@ fn test_borrow_pause_does_not_affect_deposit_withdraw() {
 fn test_flash_loan_success_zero_fee() {
     let s = setup();
     fund_vault(&s, 10_000);
+    s.vault_client.set_fee(&0);
 
     // Deploy good receiver.
     let receiver_id = s.e.register(good::GoodReceiver, ());
@@ -453,14 +460,23 @@ fn test_flash_loan_with_fee() {
 
     // Vault should now have 10_000 + 50 = 10_050.
     assert_eq!(s.vault_client.get_available(), 10_050);
-    // Total deposited should also reflect the fee.
-    assert_eq!(s.vault_client.get_total_deposited(), 10_050);
+    // Accumulated fees should reflect the fee.
+    assert_eq!(s.vault_client.get_accumulated_fees(), 50);
+    assert_eq!(s.vault_client.get_total_deposited(), 10_000);
+
+    // Admin collects fees.
+    let collected = s.vault_client.collect_fees();
+    assert_eq!(collected, 50);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 0);
+    assert_eq!(s.token_client.balance(&s.admin), 50);
+    assert_eq!(s.vault_client.get_available(), 10_000);
 }
 
 #[test]
 fn test_flash_loan_borrow_entire_vault() {
     let s = setup();
     fund_vault(&s, 10_000);
+    s.vault_client.set_fee(&0);
 
     let receiver_id = s.e.register(good::GoodReceiver, ());
     let receiver_client = good::GoodReceiverClient::new(&s.e, &receiver_id);
@@ -554,6 +570,7 @@ fn test_flash_loan_partial_repay_returns_error() {
 fn test_flash_loan_overpay() {
     let s = setup();
     fund_vault(&s, 10_000);
+    s.vault_client.set_fee(&0);
 
     let receiver_id = s.e.register(overpay::OverpayReceiver, ());
     let receiver_client = overpay::OverpayReceiverClient::new(&s.e, &receiver_id);
@@ -622,7 +639,8 @@ fn test_mutations_reject_while_flash_loan_active() {
         set_flash_loan_active(&s.e, false);
     });
 
-    assert_eq!(s.vault_client.get_fee(), 0);
+    assert_eq!(s.vault_client.get_fee(), DEFAULT_FEE_BPS);
+    assert_eq!(s.vault_client.get_flash_fee_bps(), DEFAULT_FLASH_FEE_BPS);
     assert_eq!(s.vault_client.get_available(), 10_000);
     assert_eq!(s.vault_client.get_total_deposited(), 10_000);
     assert_eq!(s.token_client.balance(&s.admin), 0);
@@ -673,6 +691,7 @@ fn test_flash_loan_negative_amount() {
 fn test_sequential_flash_loans() {
     let s = setup();
     fund_vault(&s, 10_000);
+    s.vault_client.set_fee(&0);
 
     let receiver_id = s.e.register(good::GoodReceiver, ());
     let receiver_client = good::GoodReceiverClient::new(&s.e, &receiver_id);
@@ -716,6 +735,13 @@ fn test_sequential_flash_loans_with_fee() {
 
     assert_eq!(total_fees, 45);
     assert_eq!(s.vault_client.get_available(), 10_045);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 45);
+
+    let collected = s.vault_client.collect_fees();
+    assert_eq!(collected, 45);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 0);
+    assert_eq!(s.token_client.balance(&s.admin), 45);
+    assert_eq!(s.vault_client.get_available(), 10_000);
 }
 
 // ── Borrow (alias) tests ───────────────────────────────────────────────────
@@ -724,6 +750,7 @@ fn test_sequential_flash_loans_with_fee() {
 fn test_borrow_success_zero_fee() {
     let s = setup();
     fund_vault(&s, 10_000);
+    s.vault_client.set_fee(&0);
 
     // Deploy good receiver and have it repay to the vault.
     let receiver_id = s.e.register(good::GoodReceiver, ());
@@ -757,7 +784,15 @@ fn test_borrow_with_fee() {
 
     // Vault should now have 10_000 + 50 = 10_050.
     assert_eq!(s.vault_client.get_available(), 10_050);
-    assert_eq!(s.vault_client.get_total_deposited(), 10_050);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 50);
+    assert_eq!(s.vault_client.get_total_deposited(), 10_000);
+
+    // Admin collects fees.
+    let collected = s.vault_client.collect_fees();
+    assert_eq!(collected, 50);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 0);
+    assert_eq!(s.token_client.balance(&s.admin), 50);
+    assert_eq!(s.vault_client.get_available(), 10_000);
 }
 
 // ── View functions ───────────────────────────────────────────────────────────
@@ -803,9 +838,6 @@ fn test_borrow_non_compliant_receiver_returns_error() {
     let receiver_id = s.e.register(non_compliant::NonCompliantReceiver, ());
     let result = s.vault_client.try_borrow(&receiver_id, &5_000);
     assert!(result.is_err());
-}
-
-    assert!(result.is_err());
     assert_eq!(s.vault_client.get_available(), 10_000);
 }
 
@@ -841,4 +873,139 @@ fn test_borrow_repayment_failure_returns_error() {
     let result = s.vault_client.try_borrow(&receiver_id, &5_000);
 
     assert_eq!(result, Err(Ok(Error::LoanNotRepaid)));
+}
+
+// ── Fee accumulation & collection (Issue #1341) ──────────────────────────────
+
+#[test]
+fn test_default_fee_bps_is_5_and_collect_fees() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    // Verify default fee is 5 bps = 0.05%.
+    assert_eq!(s.vault_client.get_flash_fee_bps(), 5);
+    assert_eq!(s.vault_client.get_fee(), 5);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 0);
+
+    let receiver_id = s.e.register(good::GoodReceiver, ());
+    let receiver_client = good::GoodReceiverClient::new(&s.e, &receiver_id);
+    receiver_client.set_vault(&s.vault_id);
+
+    // 10_000 * 5 bps = 5 tokens.
+    // Pre-fund receiver with 5 tokens for the fee.
+    s.token_admin.mint(&receiver_id, &5);
+
+    let initiator = Address::generate(&s.e);
+    let fee = s.vault_client.flash_loan(&initiator, &receiver_id, &10_000);
+    assert_eq!(fee, 5);
+
+    // Borrower fee was deducted: receiver has 0 tokens left.
+    assert_eq!(s.token_client.balance(&receiver_id), 0);
+
+    // Fee is held in vault and accumulated.
+    assert_eq!(s.vault_client.get_available(), 10_005);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 5);
+
+    // Fully claimable by admin via collect_fees().
+    let admin_bal_before = s.token_client.balance(&s.admin);
+    let collected = s.vault_client.collect_fees();
+    assert_eq!(collected, 5);
+
+    // Accumulated fees in vault reset to 0.
+    assert_eq!(s.vault_client.get_accumulated_fees(), 0);
+    // Vault balance returns to principal.
+    assert_eq!(s.vault_client.get_available(), 10_000);
+    // Admin received the collected fees.
+    assert_eq!(
+        s.token_client.balance(&s.admin),
+        admin_bal_before + 5
+    );
+}
+
+#[test]
+fn test_collect_fees_empty() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    // No fees accumulated yet.
+    assert_eq!(s.vault_client.get_accumulated_fees(), 0);
+    let admin_bal_before = s.token_client.balance(&s.admin);
+
+    let collected = s.vault_client.collect_fees();
+    assert_eq!(collected, 0);
+    assert_eq!(s.token_client.balance(&s.admin), admin_bal_before);
+    assert_eq!(s.vault_client.get_available(), 10_000);
+}
+
+#[test]
+fn test_collect_fees_to_custom_destination() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    let receiver_id = s.e.register(good::GoodReceiver, ());
+    let receiver_client = good::GoodReceiverClient::new(&s.e, &receiver_id);
+    receiver_client.set_vault(&s.vault_id);
+
+    s.token_admin.mint(&receiver_id, &5);
+
+    let initiator = Address::generate(&s.e);
+    let fee = s.vault_client.flash_loan(&initiator, &receiver_id, &10_000);
+    assert_eq!(fee, 5);
+
+    let treasury = Address::generate(&s.e);
+    let collected = s.vault_client.collect_fees_to(&treasury);
+    assert_eq!(collected, 5);
+    assert_eq!(s.token_client.balance(&treasury), 5);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 0);
+}
+
+#[test]
+fn test_borrow_accumulates_fees_and_admin_claims() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    let receiver_id = s.e.register(good::GoodReceiver, ());
+    let receiver_client = good::GoodReceiverClient::new(&s.e, &receiver_id);
+    receiver_client.set_vault(&s.vault_id);
+
+    // Pre-fund receiver for 5 bps on 10,000 borrow = 5.
+    s.token_admin.mint(&receiver_id, &5);
+
+    let fee = s.vault_client.borrow(&receiver_id, &10_000);
+    assert_eq!(fee, 5);
+
+    assert_eq!(s.vault_client.get_accumulated_fees(), 5);
+    assert_eq!(s.vault_client.get_available(), 10_005);
+
+    let admin_bal_before = s.token_client.balance(&s.admin);
+    let collected = s.vault_client.collect_fees();
+    assert_eq!(collected, 5);
+    assert_eq!(s.token_client.balance(&s.admin), admin_bal_before + 5);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 0);
+}
+
+#[test]
+fn test_set_flash_fee_bps_updates_calculation() {
+    let s = setup();
+    fund_vault(&s, 20_000);
+
+    // Change fee to 20 bps (0.2%).
+    s.vault_client.set_flash_fee_bps(&20);
+    assert_eq!(s.vault_client.get_flash_fee_bps(), 20);
+
+    let receiver_id = s.e.register(good::GoodReceiver, ());
+    let receiver_client = good::GoodReceiverClient::new(&s.e, &receiver_id);
+    receiver_client.set_vault(&s.vault_id);
+
+    // 10_000 * 20 / 10000 = 20.
+    s.token_admin.mint(&receiver_id, &20);
+
+    let initiator = Address::generate(&s.e);
+    let fee = s.vault_client.flash_loan(&initiator, &receiver_id, &10_000);
+    assert_eq!(fee, 20);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 20);
+
+    let collected = s.vault_client.collect_fees();
+    assert_eq!(collected, 20);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 0);
 }
