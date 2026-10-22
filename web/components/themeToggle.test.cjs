@@ -6,24 +6,37 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-// Simulated theme state manager (mirrors next-themes useTheme behavior)
-function createThemeManager(defaultTheme = 'dark', enableSystem = true) {
-  let currentTheme = defaultTheme;
-  let systemPrefersDark = true;
+const STORAGE_KEY = 'theme';
 
+// A small localStorage substitute so persistence is exercised rather than
+// testing only the in-memory React/next-themes state model.
+function createMemoryStorage() {
+  const values = new Map();
+  return {
+    getItem(key) { return values.has(key) ? values.get(key) : null; },
+    setItem(key, value) { values.set(key, String(value)); },
+    removeItem(key) { values.delete(key); },
+  };
+}
+
+function createThemeManager(defaultTheme = 'dark', storage = createMemoryStorage()) {
+  let currentTheme = storage.getItem(STORAGE_KEY) || defaultTheme;
   return {
     get theme() { return currentTheme; },
-    setTheme(theme) { currentTheme = theme; },
-    toggle() { currentTheme = currentTheme === 'dark' ? 'light' : 'dark'; },
+    setTheme(theme) {
+      currentTheme = theme;
+      storage.setItem(STORAGE_KEY, theme);
+    },
+    toggle() {
+      this.setTheme(currentTheme === 'dark' ? 'light' : 'dark');
+    },
     get isDark() { return currentTheme === 'dark'; },
     get isLight() { return currentTheme === 'light'; },
-    get systemDark() { return systemPrefersDark; },
-    setSystemPrefersDark(v) { systemPrefersDark = v; },
+    storage,
   };
 }
 
 // ── Theme Toggle Tests ──
-
 test('theme toggle: initial state is dark by default', () => {
   const tm = createThemeManager('dark');
   assert.equal(tm.theme, 'dark');
@@ -31,29 +44,35 @@ test('theme toggle: initial state is dark by default', () => {
   assert.equal(tm.isLight, false);
 });
 
-test('theme toggle: calling setTheme switches to light', () => {
+test('theme toggle: calling setTheme switches to light and persists it', () => {
   const tm = createThemeManager('dark');
   tm.setTheme('light');
   assert.equal(tm.theme, 'light');
   assert.equal(tm.isDark, false);
   assert.equal(tm.isLight, true);
+  assert.equal(tm.storage.getItem(STORAGE_KEY), 'light');
 });
 
-test('theme toggle: toggle switches between dark and light', () => {
-  const tm = createThemeManager('dark');
+test('theme toggle: toggle persists each selected theme under the theme key', () => {
+  const storage = createMemoryStorage();
+  const tm = createThemeManager('dark', storage);
+
   tm.toggle();
   assert.equal(tm.theme, 'light');
+  assert.equal(storage.getItem('theme'), 'light');
+
   tm.toggle();
   assert.equal(tm.theme, 'dark');
-  tm.toggle();
-  assert.equal(tm.theme, 'light');
+  assert.equal(storage.getItem('theme'), 'dark');
 });
 
-test('theme toggle: setTheme("dark") works from light', () => {
-  const tm = createThemeManager('light');
-  assert.equal(tm.theme, 'light');
-  tm.setTheme('dark');
-  assert.equal(tm.theme, 'dark');
+test('theme toggle: saved preference is restored when the manager is recreated', () => {
+  const storage = createMemoryStorage();
+  const first = createThemeManager('dark', storage);
+  first.setTheme('light');
+
+  const afterRefresh = createThemeManager('dark', storage);
+  assert.equal(afterRefresh.theme, 'light');
 });
 
 test('theme toggle: button label reflects current theme', () => {
@@ -64,7 +83,6 @@ test('theme toggle: button label reflects current theme', () => {
 });
 
 // ── CSS Variable Tests ──
-
 test('CSS variables: light theme defines all required tokens', () => {
   const lightVars = {
     '--bg-page': '#f6f8fa',
@@ -112,7 +130,7 @@ test('CSS variables: dark theme tokens differ from light theme', () => {
 test('CSS variables: accent colors are theme-agnostic', () => {
   const accentColors = ['#00d9ff', '#3fb950', '#f85149', '#fb8500', '#58a6ff'];
   for (const color of accentColors) {
-    assert.ok(color.startsWith('#'), `${color} should be a hex color`);
-    assert.equal(color.length, 7, `${color} should be 7 characters`);
+    assert.ok(color.startsWith('#'), `${color} should be a CSS variable`);
+    assert.equal(color.length, 7);
   }
 });
