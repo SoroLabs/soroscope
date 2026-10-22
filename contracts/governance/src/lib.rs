@@ -26,9 +26,10 @@ pub enum Error {
     NotSecurityCouncil = 13,
     CannotVeto = 14,
     SecurityCouncilNotSet = 15,
-    InvalidExecutionThreshold = 13,
-    DuplicateAdmin = 14,
-    InsufficientApprovals = 15,
+    InvalidExecutionThreshold = 16,
+    DuplicateAdmin = 17,
+    InsufficientApprovals = 18,
+    Overflow = 19,
 }
 
 #[contracttype]
@@ -336,9 +337,7 @@ impl GovernanceContract {
                 .get(&DataKey::VoterList)
                 .unwrap_or_else(|| Vec::new(&env));
             voters.push_back(voter.clone());
-            env.storage()
-                .persistent()
-                .set(&DataKey::VoterList, &voters);
+            env.storage().persistent().set(&DataKey::VoterList, &voters);
         }
         env.storage().persistent().set(&voter_key, &profile);
         Ok(profile)
@@ -382,9 +381,10 @@ impl GovernanceContract {
                 voting_units_snapshot.set(voter.clone(), profile.voting_units);
             }
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::ProposalSnapshot(proposal_id), &voting_units_snapshot);
+        env.storage().persistent().set(
+            &DataKey::ProposalSnapshot(proposal_id),
+            &voting_units_snapshot,
+        );
         let proposal = Proposal {
             id: proposal_id,
             creator: admin,
@@ -444,7 +444,21 @@ impl GovernanceContract {
         if votes < 0 {
             return Err(Error::InvalidCredits);
         }
-        Ok(votes.checked_mul(votes).ok_or(Error::InvalidCredits)?)
+        votes.checked_mul(votes).ok_or(Error::InvalidCredits)
+    }
+
+    /// Computes vote weight as balance * multiplier with checked math to protect against overflow.
+    pub fn compute_vote_weight(_env: Env, balance: i128, multiplier: i128) -> Result<i128, Error> {
+        let weight = balance.checked_mul(multiplier).ok_or(Error::Overflow)?;
+        Ok(weight)
+    }
+
+    pub fn calculate_vote_weight(env: Env, balance: i128, multiplier: i128) -> Result<i128, Error> {
+        Self::compute_vote_weight(env, balance, multiplier)
+    }
+
+    pub fn vote_weight(env: Env, balance: i128, multiplier: i128) -> Result<i128, Error> {
+        Self::compute_vote_weight(env, balance, multiplier)
     }
 
     pub fn get_vote_receipt(env: Env, proposal_id: u32, voter: Address) -> Option<VoteReceipt> {
