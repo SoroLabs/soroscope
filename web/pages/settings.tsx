@@ -3,12 +3,14 @@ import Link from 'next/link';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  BarChart2,
   CheckCircle2,
   Globe,
   Loader2,
   RefreshCw,
   RotateCcw,
   Save,
+  Shield,
   Signal,
   Wifi,
   WifiOff,
@@ -21,6 +23,7 @@ import {
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip } from 'recharts';
 
 import { useNetwork } from '../context/NetworkContext';
+import { useTelemetry } from '../context/TelemetryContext';
 import { API_URL } from '../lib/api';
 import {
   DEFAULT_SETTINGS,
@@ -161,6 +164,7 @@ async function probeEndpoint(url: string, body: object | null, timeoutMs: number
 
 export default function SettingsPage() {
   const { network } = useNetwork();
+  const { telemetryEnabled, dntActive, setEnabled: setTelemetryEnabled_ } = useTelemetry();
   const [settings, setSettings] = useState<UserSettings>(DEFAULT_SETTINGS);
   const [errors, setErrors] = useState<Partial<Record<keyof UserSettings, string>>>({});
   const [saved, setSaved] = useState(false);
@@ -475,6 +479,68 @@ export default function SettingsPage() {
                 </div>
               </div>
             )}
+          </div>
+
+          {/* ── Telemetry ──────────────────────────────────────────────── */}
+          <div className="mt-10 rounded-xl border border-slate-800 bg-slate-900/60 p-6">
+            <div className="mb-4 flex items-center gap-3">
+              <BarChart2 className="h-5 w-5 text-cyan-400" aria-hidden="true" />
+              <h2 className="text-base font-semibold text-slate-100">Anonymous Telemetry</h2>
+            </div>
+
+            <p className="mb-4 text-sm text-slate-400 leading-relaxed">
+              Help improve SoroScope by sharing anonymous usage events (e.g. which features you
+              use). No personal data, wallet addresses, contract source, or IP addresses are ever
+              collected. Events are associated only with a random per-session identifier that
+              resets on every page load.
+            </p>
+
+            {dntActive ? (
+              <div
+                role="status"
+                className="mb-4 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-300"
+              >
+                <Shield className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>
+                  Your browser has <strong>Do Not Track</strong> or{' '}
+                  <strong>Global Privacy Control</strong> enabled. SoroScope respects this
+                  signal — telemetry is permanently disabled regardless of the toggle below.
+                </span>
+              </div>
+            ) : null}
+
+            <label className="flex cursor-pointer items-center gap-3 select-none">
+              <span
+                role="switch"
+                aria-checked={telemetryEnabled}
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === ' ' || e.key === 'Enter') {
+                    e.preventDefault();
+                    setTelemetryEnabled_(!telemetryEnabled);
+                  }
+                }}
+                onClick={() => setTelemetryEnabled_(!telemetryEnabled)}
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border-2 transition-colors focus:outline-none focus:ring-2 focus:ring-cyan-500/50 ${
+                  telemetryEnabled
+                    ? 'border-cyan-500 bg-cyan-500'
+                    : 'border-slate-600 bg-slate-700'
+                } ${dntActive ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                    telemetryEnabled ? 'translate-x-5' : 'translate-x-0.5'
+                  }`}
+                />
+              </span>
+              <span className="text-sm text-slate-300">
+                {telemetryEnabled ? 'Telemetry enabled' : 'Telemetry disabled'}
+              </span>
+            </label>
+
+            <p className="mt-3 text-xs text-slate-500">
+              Your preference is stored locally and can be changed at any time.
+            </p>
           </div>
 
           <div className="mt-8 flex flex-wrap items-center gap-3">
