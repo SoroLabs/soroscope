@@ -25,17 +25,17 @@
   --bg-input: #ffffff;
   --bg-header: rgba(255, 255, 255, 0.9);
 
-  /* Text tokens */
+  /* Text tokens (WCAG 2.1 AA >= 4.5:1 contrast against page and card backgrounds) */
   --text-primary: #1f2328;
-  --text-secondary: #656d76;
-  --text-muted: #8b949e;
+  --text-secondary: #57606a;
+  --text-muted: #57606a;
 
   /* Border tokens */
   --border-default: #d0d7de;
   --border-subtle: #e1e4e8;
 
   /* Interactive tokens */
-  --tab-inactive: #656d76;
+  --tab-inactive: #57606a;
   --tab-hover: #1f2328;
   --skeleton: #e1e4e8;
 }
@@ -48,17 +48,17 @@
   --bg-input: #0d1117;
   --bg-header: rgba(13, 17, 23, 0.9);
 
-  /* Text tokens */
+  /* Text tokens (WCAG 2.1 AA >= 4.5:1 contrast against page and card backgrounds) */
   --text-primary: #c9d1d9;
-  --text-secondary: #8b949e;
-  --text-muted: #6e7681;
+  --text-secondary: #9198a1;
+  --text-muted: #9198a1;
 
   /* Border tokens */
   --border-default: #30363d;
   --border-subtle: #21262d;
 
   /* Interactive tokens */
-  --tab-inactive: #8b949e;
+  --tab-inactive: #9198a1;
   --tab-hover: #c9d1d9;
   --skeleton: #30363d;
 }
