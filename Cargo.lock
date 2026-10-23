@@ -2692,6 +2692,7 @@ dependencies = [
  "emergency_guard",
  "proptest",
  "soroban-sdk",
+ "twap_oracle",
 ]
 
 [[package]]
@@ -2839,7 +2840,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "multi_yield_vault"
+name = "multi-yield-vault"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
@@ -4872,6 +4873,7 @@ dependencies = [
  "soroban-sdk",
  "sqlx",
  "stellar-strkey",
+ "stellar-xdr",
  "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
