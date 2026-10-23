@@ -26,9 +26,12 @@ pub enum Error {
     NotSecurityCouncil = 13,
     CannotVeto = 14,
     SecurityCouncilNotSet = 15,
-    InvalidExecutionThreshold = 13,
-    DuplicateAdmin = 14,
-    InsufficientApprovals = 15,
+    InvalidExecutionThreshold = 16,
+    DuplicateAdmin = 17,
+    InsufficientApprovals = 18,
+    QuorumNotMet = 19,
+    ProposalNotPassed = 20,
+    InvalidQuorum = 21,
 }
 
 #[contracttype]
@@ -38,6 +41,9 @@ pub struct GovernanceConfig {
     pub min_voting_units: i128,
     pub identity_required: bool,
     pub execution_threshold: u32,
+    /// Minimum number of votes (for + against combined) required for a proposal
+    /// to be considered valid. Prevents a proposal from passing with a single vote.
+    pub min_quorum: i128,
 }
 
 #[contracttype]
@@ -85,6 +91,7 @@ pub enum DataKey {
     Receipt(u32, Address),
     ExecutionAdmins,
     ExecutionThreshold,
+    MinQuorum,
 }
 
 fn sqrt(x: i128) -> i128 {
@@ -174,12 +181,18 @@ fn get_config(env: &Env) -> Result<GovernanceConfig, Error> {
         .instance()
         .get(&DataKey::ExecutionThreshold)
         .unwrap_or(1u32);
+    let min_quorum = env
+        .storage()
+        .instance()
+        .get(&DataKey::MinQuorum)
+        .unwrap_or(1i128);
 
     Ok(GovernanceConfig {
         admin,
         min_voting_units,
         identity_required,
         execution_threshold,
+        min_quorum,
     })
 }
 
@@ -216,7 +229,7 @@ impl GovernanceContract {
 
         let mut admins = Vec::new(&env);
         admins.push_back(admin.clone());
-        Self::initialize_with_admins(env, admin, admins, 1, min_voting_units, identity_required)
+        Self::initialize_with_admins(env, admin, admins, 1, min_voting_units, identity_required, 1)
     }
 
     pub fn initialize_with_admins(
@@ -226,6 +239,7 @@ impl GovernanceContract {
         execution_threshold: u32,
         min_voting_units: i128,
         identity_required: bool,
+        min_quorum: i128,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -238,6 +252,9 @@ impl GovernanceContract {
         }
         if !execution_admins.iter().any(|candidate| candidate == admin) {
             return Err(Error::Unauthorized);
+        }
+        if min_quorum <= 0 {
+            return Err(Error::InvalidQuorum);
         }
         let mut unique_admins = Vec::new(&env);
         for candidate in execution_admins.iter() {
@@ -263,6 +280,9 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .set(&DataKey::ExecutionThreshold, &execution_threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinQuorum, &min_quorum);
 
         Ok(())
     }
@@ -278,6 +298,13 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .get(&DataKey::ExecutionThreshold)
+            .ok_or(Error::NotInitialized)
+    }
+
+    pub fn get_min_quorum(env: Env) -> Result<i128, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinQuorum)
             .ok_or(Error::NotInitialized)
     }
 
@@ -428,6 +455,23 @@ impl GovernanceContract {
         if !proposal.open || env.ledger().sequence() <= proposal.voting_ends_at {
             return Err(Error::ProposalClosed);
         }
+
+        // Quorum check: total votes cast (for + against) must meet the minimum
+        // threshold. This prevents a proposal from passing with a single vote.
+        let config = get_config(&env)?;
+        let total_votes = proposal
+            .for_votes
+            .checked_add(proposal.against_votes)
+            .unwrap_or(i128::MAX);
+        if total_votes < config.min_quorum {
+            return Err(Error::QuorumNotMet);
+        }
+
+        // Majority check: the proposal must have more for_votes than against_votes.
+        if proposal.for_votes <= proposal.against_votes {
+            return Err(Error::ProposalNotPassed);
+        }
+
         proposal.open = false;
         write_proposal(&env, &proposal);
         Ok(proposal)

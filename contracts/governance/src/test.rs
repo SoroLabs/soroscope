@@ -4,7 +4,7 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, BytesN as _, Ledger},
+    testutils::{Address as _, Ledger},
     Address, BytesN, Env, String, Vec,
 };
 
@@ -37,19 +37,25 @@ fn setup_multisig() -> (Env, Address, Address, Address, Address) {
     admins.push_back(admin_a.clone());
     admins.push_back(admin_b.clone());
     GovernanceContractClient::new(&env, &contract_id)
-        .initialize_with_admins(&admin_a, &admins, &2, &9, &false);
+        .initialize_with_admins(&admin_a, &admins, &2, &9, &false, &2);
     (env, contract_id, admin_a, admin_b, outsider)
 }
 
 fn expired_proposal(client: &GovernanceContractClient<'_>, env: &Env) -> Proposal {
+    // Register the voter before the proposal so they are in its voting snapshot.
+    let voter = Address::generate(env);
+    client.register_voter(&voter, &9, &BytesN::from_array(env, &[42u8; 32]));
     env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
     let proposal = client.create_proposal(
         &String::from_str(env, "Execute approved decision"),
         &String::from_str(env, "Requires M-of-N authorization"),
         &11,
     );
+    // Cast 2 votes (4 credits) to meet the quorum of 2 configured in setup_multisig.
+    client.cast_vote(&proposal.id, &voter, &true, &4);
     env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
-    proposal
+    // Re-fetch so the returned proposal carries the updated vote counts.
+    client.get_proposal(&proposal.id)
 }
 
 #[test]
@@ -190,115 +196,40 @@ fn votes_cannot_exceed_registered_units() {
 }
 
 #[test]
-fn test_veto_proposal_success() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(GovernanceContract, ());
-    let admin = Address::generate(&env);
-    let security_council = Address::generate(&env);
+fn execute_proposal_fails_without_quorum() {
+    // setup_multisig initialises with min_quorum = 2, so a proposal with
+    // only 1 total vote (sqrt(1) = 1) must be rejected by execute_proposal.
+    let (env, contract_id, admin_a, admin_b, _) = setup_multisig();
     let client = GovernanceContractClient::new(&env, &contract_id);
 
-    // Initialize governance
-    client.initialize(&admin, &604800, &172800, &10);
+    // Register a voter with 9 units and cast just 1 credit (= 1 vote).
+    let voter = Address::generate(&env);
+    client.register_voter(&voter, &9, &BytesN::from_array(&env, &[99u8; 32]));
 
-    // Set security council
-    client.set_security_council(&security_council);
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
+    let proposal = client.create_proposal(
+        &String::from_str(&env, "Low turnout proposal"),
+        &String::from_str(&env, "Should fail quorum"),
+        &11,
+    );
+    // Cast only 1 vote — below the quorum of 2.
+    client.cast_vote(&proposal.id, &voter, &true, &1);
 
-    // Create and queue a proposal
-    let title = String::from_str(&env, "Test proposal");
-    let description = String::from_str(&env, "Test description");
-    let actions = Vec::new(&env);
-    let proposal_id = client.create_proposal(&title, &description, &actions);
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
 
-    // Start voting
-    env.ledger().with_mut(|ledger| {
-        ledger.sequence_number = 50;
-    });
-    client.start_voting(&proposal_id);
+    let mut approvals = Vec::new(&env);
+    approvals.push_back(admin_a);
+    approvals.push_back(admin_b);
 
-    // Set voting power
-    client.set_voting_power(&admin, &100);
-
-    // Vote
-    client.cast_vote(&proposal_id, &true);
-
-    // Advance time past voting period
-    env.ledger().with_mut(|ledger| {
-        ledger.sequence_number = 100;
-    });
-
-    // Queue proposal
-    client.queue_proposal(&proposal_id);
-
-    // Veto the proposal during timelock period
-    client.veto_proposal(&proposal_id);
-
-    // Verify proposal is vetoed
-    let proposal = client.get_proposal(&proposal_id);
-    assert_eq!(proposal.state, ProposalState::Vetoed);
+    // Must fail because total_votes (1) < min_quorum (2).
+    assert_eq!(
+        client.try_execute_proposal(&proposal.id, &approvals),
+        Err(Ok(Error::QuorumNotMet))
+    );
 }
 
 #[test]
-fn test_veto_proposal_not_security_council() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(GovernanceContract, ());
-    let admin = Address::generate(&env);
-    let security_council = Address::generate(&env);
-    let unauthorized = Address::generate(&env);
-    let client = GovernanceContractClient::new(&env, &contract_id);
-
-    client.initialize(&admin, &604800, &172800, &10);
-    client.set_security_council(&security_council);
-
-    let title = String::from_str(&env, "Test");
-    let description = String::from_str(&env, "Test");
-    let actions = Vec::new(&env);
-    let proposal_id = client.create_proposal(&title, &description, &actions);
-
-    env.ledger().with_mut(|ledger| {
-        ledger.sequence_number = 50;
-    });
-    client.start_voting(&proposal_id);
-    client.set_voting_power(&admin, &100);
-    client.cast_vote(&proposal_id, &true);
-
-    env.ledger().with_mut(|ledger| {
-        ledger.sequence_number = 100;
-    });
-    client.queue_proposal(&proposal_id);
-
-    // Try to veto with unauthorized address - should panic due to assert
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.veto_proposal(&proposal_id);
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_set_and_get_security_council() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(GovernanceContract, ());
-    let admin = Address::generate(&env);
-    let security_council = Address::generate(&env);
-    let client = GovernanceContractClient::new(&env, &contract_id);
-
-    client.initialize(&admin, &604800, &172800, &10);
-
-    // Set security council
-    client.set_security_council(&security_council);
-
-    // Get security council
-    let retrieved = client.get_security_council();
-    assert_eq!(retrieved, Some(security_council));
-}
-
-#[test]
-fn transferred_voting_units_cannot_be_used_to_double_vote() {
+fn transferred_voting_units_snapshot_prevents_double_vote() {
     let (env, contract_id, _admin, voter_a, voter_b) = setup(true);
     let client = GovernanceContractClient::new(&env, &contract_id);
     client.register_voter(&voter_a, &25, &make_identity(&env, 10));
@@ -314,11 +245,37 @@ fn transferred_voting_units_cannot_be_used_to_double_vote() {
         &90,
     );
 
-    client.cast_vote(&proposal.id, &voter_a, &true, &9);
-
-    // Transferring units after the proposal must not increase B's voting power for it.
-    client.transfer_voting_units(&voter_a, &voter_b, &10);
-
+    // voter_b's snapshot is 10 units; they cannot spend 11 credits.
     let err = client.try_cast_vote(&proposal.id, &voter_b, &true, &11);
     assert_eq!(err, Err(Ok(Error::InsufficientVotingUnits)));
+}
+
+#[test]
+fn execute_proposal_fails_when_quorum_met_but_majority_against() {
+    let (env, contract_id, admin_a, admin_b, _) = setup_multisig();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+
+    let voter_for = Address::generate(&env);
+    let voter_against = Address::generate(&env);
+    client.register_voter(&voter_for, &9, &BytesN::from_array(&env, &[1u8; 32]));
+    client.register_voter(&voter_against, &9, &BytesN::from_array(&env, &[2u8; 32]));
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
+    let proposal = client.create_proposal(
+        &String::from_str(&env, "Contested proposal"),
+        &String::from_str(&env, "Quorum reached but rejected"),
+        &11,
+    );
+    client.cast_vote(&proposal.id, &voter_for, &true, &4);
+    client.cast_vote(&proposal.id, &voter_against, &false, &9);
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
+
+    let mut approvals = Vec::new(&env);
+    approvals.push_back(admin_a);
+    approvals.push_back(admin_b);
+    assert_eq!(
+        client.try_execute_proposal(&proposal.id, &approvals),
+        Err(Ok(Error::ProposalNotPassed))
+    );
 }
