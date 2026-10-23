@@ -39,6 +39,15 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
     return simulationQueueManager.subscribe(setQueueStatus);
   }, []);
 
+  // A different contract function has different inputs, so values typed for
+  // the previous one must not carry over (or be submitted with the new one).
+  const selectedFunction = func.name;
+  useEffect(() => {
+    setFormData({});
+    setErrors({});
+    setJsonMode({});
+  }, [selectedFunction]);
+
   const handleChange = (name: string, value: string | number | boolean) => {
     const updatedData = { ...formData, [name]: value };
     setFormData(updatedData);
