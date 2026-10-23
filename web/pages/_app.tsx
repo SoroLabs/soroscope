@@ -6,6 +6,8 @@ import { NetworkProvider } from "../context/NetworkContext";
 import { WalletProvider } from "../context/WalletContext";
 import { ErrorBoundary } from "../components/ErrorBoundary";
 import { GlobalSearchModal } from "../components/GlobalSearchModal";
+import { OfflineBanner } from "../components/OfflineBanner";
+import { useEffect } from "react";
 
 const inter = Inter({
   subsets: ["latin"],
@@ -20,6 +22,21 @@ const jetBrainsMono = JetBrains_Mono({
 });
 
 export default function App({ Component, pageProps }: AppProps) {
+  // Register the service worker for offline support (issue #1300).
+  useEffect(() => {
+    if (
+      typeof window !== "undefined" &&
+      "serviceWorker" in navigator &&
+      process.env.NODE_ENV === "production"
+    ) {
+      navigator.serviceWorker
+        .register("/sw.js")
+        .catch((error) => {
+          console.warn("Service worker registration failed:", error);
+        });
+    }
+  }, []);
+
   return (
     <div className={`${inter.variable} ${jetBrainsMono.variable} font-sans`}>
       <ErrorBoundary>

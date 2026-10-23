@@ -60,9 +60,11 @@ import { ResourceHeatmap } from '../components/ResourceHeatmap';
 import { ResultViewer } from '../components/Resultviewer';
 import { ResultViewerSkeleton } from '../components/ResultViewerSkeleton';
 import { UploadZone } from '../components/upload-zone';
+import { CachedResults } from '../components/CachedResults';
 
 import { ApiError, analyzeService, apiUrl } from '../lib/api';
 import { loadLatestAnalysis, saveLatestAnalysis } from '../lib/analysisStorage';
+import { cacheAnalysis } from '../lib/offlineStorage';
 import { createUserFriendlyMessage, extractErrorDetails, formatError } from '../lib/errorHandling';
 import type { GasGolfingSuggestion } from '../lib/gasGolfingSort';
 import {
@@ -222,6 +224,7 @@ export default function Home() {
       setCurrentResult(result);
       addToHistory(result);
       saveLatestAnalysis(result);
+      cacheAnalysis(result, wasmFile?.name);
       if (typeof window !== 'undefined' && (window as any).triggerConfetti) {
         (window as any).triggerConfetti();
       }
@@ -610,9 +613,19 @@ export default function Home() {
                   onFunctionFilterChange={handleTransactionFunctionFilterChange}
                 />
               ) : (
-                <InvocationHistory onSelectResult={(result) => {
-                  setCurrentResult(result);
-                  setTab('explorer');
+                <>
+                  <InvocationHistory onSelectResult={(result) => {
+                    setCurrentResult(result);
+                    setTab('explorer');
+                  }} />
+                  <div className="mt-4">
+                    <CachedResults onSelectResult={(result) => {
+                      setCurrentResult(result);
+                      setTab('explorer');
+                    }} />
+                  </div>
+                </>
+              )}
             {/* Right Column - Results & History Tabs */}
             <div>
               {/* Tabs Header */}

@@ -64,22 +64,31 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
   const [tooltip, setTooltip] = useState<{ x: number; y: number; cell: Cell } | null>(null);
 
   const {
-    cpu_instructions,
-    ram_bytes,
-    ledger_read_bytes,
-    ledger_write_bytes,
-    transaction_size_bytes,
+    cpu_instructions = 0,
+    ram_bytes = 0,
+    ledger_read_bytes = 0,
+    ledger_write_bytes = 0,
+    transaction_size_bytes = 0,
     cost_stroops = 120,
     state_snapshot
-  } = resourceCost;
+  } = resourceCost ?? {};
+
+  // Coerce to numbers so undefined / null from an empty API response does not
+  // produce NaN percentages or crash downstream math.
+  const cpuInstructions = Number(cpu_instructions) || 0;
+  const ramBytes = Number(ram_bytes) || 0;
+  const ledgerReadBytes = Number(ledger_read_bytes) || 0;
+  const ledgerWriteBytes = Number(ledger_write_bytes) || 0;
+  const txSizeBytes = Number(transaction_size_bytes) || 0;
+  const costStroops = Number(cost_stroops) || 0;
 
   // ── Budget percentages ──────────────────────────────────────────────────────
-  const cpuPct     = Math.min((cpu_instructions         / LIMITS.CPU)          * 100, 100);
-  const ramPct     = Math.min((ram_bytes                / LIMITS.RAM)          * 100, 100);
-  const ioReadPct  = Math.min((ledger_read_bytes        / LIMITS.LEDGER_READ)  * 100, 100);
-  const ioWritePct = Math.min((ledger_write_bytes       / LIMITS.LEDGER_WRITE) * 100, 100);
-  const txSizePct  = Math.min((transaction_size_bytes   / LIMITS.TX_SIZE)      * 100, 100);
-  const ioPct      = Math.min(((ledger_read_bytes + ledger_write_bytes) / (LIMITS.LEDGER_READ + LIMITS.LEDGER_WRITE)) * 100, 100);
+  const cpuPct     = Math.min((cpuInstructions      / LIMITS.CPU)          * 100, 100);
+  const ramPct     = Math.min((ramBytes             / LIMITS.RAM)          * 100, 100);
+  const ioReadPct  = Math.min((ledgerReadBytes      / LIMITS.LEDGER_READ)  * 100, 100);
+  const ioWritePct = Math.min((ledgerWriteBytes     / LIMITS.LEDGER_WRITE) * 100, 100);
+  const txSizePct  = Math.min((txSizeBytes          / LIMITS.TX_SIZE)      * 100, 100);
+  const ioPct      = Math.min(((ledgerReadBytes + ledgerWriteBytes) / (LIMITS.LEDGER_READ + LIMITS.LEDGER_WRITE)) * 100, 100);
 
   const statusColor = (pct: number) => {
     if (pct > 80) return { text: 'text-rose-400',  ring: '#f43f5e', glow: 'drop-shadow-[0_0_6px_rgba(244,63,94,0.4)]'  };
@@ -96,35 +105,39 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
 
   // ── CPU hotspot cells ───────────────────────────────────────────────────────
   const hotspotCells = useMemo<CpuHotspotCell[]>(() => {
-    if (callGraph?.root) return cellsFromCallGraph(callGraph.root, cpu_instructions);
-    return defaultHotspotCells(cpu_instructions);
-  }, [callGraph, cpu_instructions]);
+    if (callGraph?.root) return cellsFromCallGraph(callGraph.root, cpuInstructions);
+    return defaultHotspotCells(cpuInstructions);
+  }, [callGraph, cpuInstructions]);
 
   const hoveredCell  = hotspotCells.find(c => c.id === hoveredCellId) ?? null;
   const isLiveData   = Boolean(callGraph?.root);
   const top3Share    = hotspotCells.slice(0, 3).reduce((s, c) => s + c.cpuShare, 0);
 
   // ── RAM allocation cells ────────────────────────────────────────────────────
-  const ramCells    = useMemo<RamAllocCell[]>(() => defaultRamCells(ram_bytes), [ram_bytes]);
+  const ramCells    = useMemo<RamAllocCell[]>(() => defaultRamCells(ramBytes), [ramBytes]);
   const hoveredRam  = ramCells.find(c => c.id === hoveredRamId) ?? null;
 
   // ── Ledger segment cells ────────────────────────────────────────────────────
-  const readSegments  = useMemo(() => buildReadSegments(ledger_read_bytes),   [ledger_read_bytes]);
-  const writeSegments = useMemo(() => buildWriteSegments(ledger_write_bytes), [ledger_write_bytes]);
+  const readSegments  = useMemo(() => buildReadSegments(ledgerReadBytes),   [ledgerReadBytes]);
+  const writeSegments = useMemo(() => buildWriteSegments(ledgerWriteBytes), [ledgerWriteBytes]);
   const allSegments   = [...readSegments, ...writeSegments];
   const hoveredSeg    = allSegments.find(s => s.id === hoveredSegmentId) ?? null;
-  const totalIoBytes  = ledger_read_bytes + ledger_write_bytes;
+  const totalIoBytes  = ledgerReadBytes + ledgerWriteBytes;
 
   // ── Ledger footprint ────────────────────────────────────────────────────────
+  // Guard against null/undefined state_snapshot and its sub-fields so empty
+  // API responses do not throw in Object.entries() or .map() (issue #1275).
   const ledgerEntries = state_snapshot?.ledger_entries ?? {};
   const ttlEntries    = state_snapshot?.ttl_entries    ?? {};
 
   const footprintItems = Object.keys(ledgerEntries).length > 0
     ? Object.entries(ledgerEntries).map(([key, value]) => {
-        const sizeBytes = Math.floor((key.length + value.length) * 0.75);
-        const isWrite = ledger_write_bytes > 0 && Math.random() > 0.6;
-        const ttl = ttlEntries[key] || Math.floor(Math.random() * 4000) + 1000;
-        return { key, sizeBytes, isWrite, ttl, name: key };
+        const safeValue = String(value ?? '');
+        const safeKey = String(key ?? '');
+        const sizeBytes = Math.floor((safeKey.length + safeValue.length) * 0.75);
+        const isWrite = ledgerWriteBytes > 0 && Math.random() > 0.6;
+        const ttl = ttlEntries[safeKey] || Math.floor(Math.random() * 4000) + 1000;
+        return { key: safeKey, sizeBytes, isWrite, ttl, name: safeKey };
       })
     : [
         { key: 'admin_thresholds', sizeBytes: 120, isWrite: false, ttl: 4800, name: 'Admin Thresholds (Key: ADM-1)' },
@@ -545,7 +558,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                     {cpuPct.toFixed(1)}%
                   </div>
                   <span className="text-[9px] font-mono text-slate-400">
-                    {new Intl.NumberFormat('en-US', { notation: 'compact' }).format(cpu_instructions)} ops
+                    {new Intl.NumberFormat('en-US', { notation: 'compact' }).format(cpuInstructions)} ops
                   </span>
                 </div>
               </div>
@@ -569,7 +582,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
             <div>
               <div className="flex items-center justify-between mb-1 text-[9px] font-mono text-slate-500">
                 <span>0 B</span>
-                <span className="text-slate-400 font-bold">{formatBytes(ram_bytes)} used</span>
+                <span className="text-slate-400 font-bold">{formatBytes(ramBytes)} used</span>
                 <span>40 MB limit</span>
               </div>
               <div className="h-2.5 w-full bg-slate-950 rounded-full overflow-hidden border border-slate-800">
@@ -603,7 +616,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                     stroke="#a371f7" 
                     strokeWidth="7" 
                     strokeDasharray="314.16"
-                    strokeDashoffset={314.16 - (((ledger_read_bytes + ledger_write_bytes) / (LIMITS.LEDGER_READ + LIMITS.LEDGER_WRITE)) * 100) * 3.1416}
+                    strokeDashoffset={314.16 - (((ledgerReadBytes + ledgerWriteBytes) / (LIMITS.LEDGER_READ + LIMITS.LEDGER_WRITE)) * 100) * 3.1416}
                     strokeLinecap="round"
                     className="transition-all duration-1000 ease-out drop-shadow-[0_0_6px_rgba(163,113,247,0.4)]"
                   />
@@ -774,7 +787,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                 </div>
 
                 <div className="border-t border-slate-900 pt-2 mt-4 text-[9px] font-mono text-slate-600 flex items-center justify-between">
-                  <span>TOTAL: {formatBytes(ram_bytes)}</span>
+                  <span>TOTAL: {formatBytes(ramBytes)}</span>
                   <span className="flex items-center gap-1">
                     <Info className="h-3 w-3" /> 7 regions
                   </span>
@@ -1056,14 +1069,14 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                 </h4>
                 <p className="text-[11px] text-slate-500 mt-0.5 font-mono">
                   Total I/O: {formatBytes(totalIoBytes)}
-                  {' • '}Reads: {formatBytes(ledger_read_bytes)}
-                  {' • '}Writes: {formatBytes(ledger_write_bytes)}
+                  {' • '}Reads: {formatBytes(ledgerReadBytes)}
+                  {' • '}Writes: {formatBytes(ledgerWriteBytes)}
                 </p>
               </div>
               {/* Write-ratio pill */}
               {totalIoBytes > 0 && (
                 <div className="text-[9px] font-mono bg-slate-800 border border-slate-700 text-slate-400 px-2 py-1 rounded uppercase tracking-widest">
-                  Write ratio: {((ledger_write_bytes / totalIoBytes) * 100).toFixed(0)}%
+                  Write ratio: {((ledgerWriteBytes / totalIoBytes) * 100).toFixed(0)}%
                 </div>
               )}
             </div>
@@ -1077,42 +1090,42 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                 </div>
                 <div className="flex h-8 w-full rounded-lg overflow-hidden border border-slate-800/80 gap-px bg-slate-800/80">
                   {/* Read segment */}
-                  {ledger_read_bytes > 0 && (
+                  {ledgerReadBytes > 0 && (
                     <div
                       className="h-full flex items-center justify-center transition-all duration-500 cursor-pointer hover:brightness-110"
                       style={{
-                        width: `${(ledger_read_bytes / totalIoBytes) * 100}%`,
+                        width: `${(ledgerReadBytes / totalIoBytes) * 100}%`,
                         background: 'linear-gradient(90deg, #0e7490, #06b6d4)',
                       }}
-                      title={`Reads: ${formatBytes(ledger_read_bytes)}`}
+                      title={`Reads: ${formatBytes(ledgerReadBytes)}`}
                     >
                       <span className="text-[9px] font-mono font-bold text-cyan-950 select-none truncate px-1">
-                        {ledger_read_bytes > totalIoBytes * 0.15 ? `R ${formatBytes(ledger_read_bytes)}` : ''}
+                        {ledgerReadBytes > totalIoBytes * 0.15 ? `R ${formatBytes(ledgerReadBytes)}` : ''}
                       </span>
                     </div>
                   )}
                   {/* Write segment */}
-                  {ledger_write_bytes > 0 && (
+                  {ledgerWriteBytes > 0 && (
                     <div
                       className="h-full flex items-center justify-center transition-all duration-500 cursor-pointer hover:brightness-110"
                       style={{
-                        width: `${(ledger_write_bytes / totalIoBytes) * 100}%`,
+                        width: `${(ledgerWriteBytes / totalIoBytes) * 100}%`,
                         background: 'linear-gradient(90deg, #e11d48, #f43f5e)',
                       }}
-                      title={`Writes: ${formatBytes(ledger_write_bytes)}`}
+                      title={`Writes: ${formatBytes(ledgerWriteBytes)}`}
                     >
                       <span className="text-[9px] font-mono font-bold text-rose-950 select-none truncate px-1">
-                        {ledger_write_bytes > totalIoBytes * 0.15 ? `W ${formatBytes(ledger_write_bytes)}` : ''}
+                        {ledgerWriteBytes > totalIoBytes * 0.15 ? `W ${formatBytes(ledgerWriteBytes)}` : ''}
                       </span>
                     </div>
                   )}
                 </div>
                 <div className="flex justify-between text-[8px] font-mono text-slate-600 mt-0.5 px-0.5">
                   <span className="text-cyan-600">
-                    ← Reads ({((ledger_read_bytes / totalIoBytes) * 100).toFixed(0)}%)
+                    ← Reads ({((ledgerReadBytes / totalIoBytes) * 100).toFixed(0)}%)
                   </span>
                   <span className="text-rose-600">
-                    Writes ({((ledger_write_bytes / totalIoBytes) * 100).toFixed(0)}%) →
+                    Writes ({((ledgerWriteBytes / totalIoBytes) * 100).toFixed(0)}%) →
                   </span>
                 </div>
               </div>
@@ -1136,7 +1149,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                       Ledger Reads
                     </span>
                     <span className="text-[9px] font-mono text-slate-500">
-                      {formatBytes(ledger_read_bytes)} / {formatBytes(LIMITS.LEDGER_READ)} limit
+                      {formatBytes(ledgerReadBytes)} / {formatBytes(LIMITS.LEDGER_READ)} limit
                     </span>
                   </div>
                   {/* Budget fill bar */}
@@ -1155,7 +1168,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                   </div>
                   <div className="flex justify-between text-[8px] font-mono text-slate-600 mb-3">
                     <span>{ioReadPct.toFixed(1)}% of 150 KB budget consumed</span>
-                    <span>{formatBytes(LIMITS.LEDGER_READ - ledger_read_bytes)} remaining</span>
+                    <span>{formatBytes(LIMITS.LEDGER_READ - ledgerReadBytes)} remaining</span>
                   </div>
 
                   {/* Read sub-segment rows */}
@@ -1203,7 +1216,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                       Ledger Writes
                     </span>
                     <span className="text-[9px] font-mono text-slate-500">
-                      {formatBytes(ledger_write_bytes)} / {formatBytes(LIMITS.LEDGER_WRITE)} limit
+                      {formatBytes(ledgerWriteBytes)} / {formatBytes(LIMITS.LEDGER_WRITE)} limit
                     </span>
                   </div>
                   {/* Budget fill bar */}
@@ -1222,7 +1235,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                   </div>
                   <div className="flex justify-between text-[8px] font-mono text-slate-600 mb-3">
                     <span>{ioWritePct.toFixed(1)}% of 100 KB budget consumed</span>
-                    <span>{formatBytes(LIMITS.LEDGER_WRITE - ledger_write_bytes)} remaining</span>
+                    <span>{formatBytes(LIMITS.LEDGER_WRITE - ledgerWriteBytes)} remaining</span>
                   </div>
 
                   {/* Write sub-segment rows */}
@@ -1268,7 +1281,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                       Transaction Size
                     </span>
                     <span className="text-[9px] font-mono text-slate-500">
-                      {formatBytes(transaction_size_bytes)} / {formatBytes(LIMITS.TX_SIZE)} limit
+                      {formatBytes(txSizeBytes)} / {formatBytes(LIMITS.TX_SIZE)} limit
                     </span>
                   </div>
                   <div className="h-1.5 w-full bg-slate-950 rounded-full overflow-hidden border border-slate-800">
@@ -1286,7 +1299,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                   </div>
                   <div className="flex justify-between text-[8px] font-mono text-slate-600 mt-1">
                     <span>{txSizePct.toFixed(1)}% of 70 KB budget</span>
-                    <span className={txStyle.text}>{formatBytes(transaction_size_bytes)}</span>
+                    <span className={txStyle.text}>{formatBytes(txSizeBytes)}</span>
                   </div>
                 </div>
               </div>
@@ -1301,7 +1314,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                   {hoveredSeg ? (() => {
                     const isRead = hoveredSeg.kind === 'read';
                     const budgetBytes = isRead ? LIMITS.LEDGER_READ : LIMITS.LEDGER_WRITE;
-                    const kindTotal   = isRead ? ledger_read_bytes  : ledger_write_bytes;
+                    const kindTotal   = isRead ? ledgerReadBytes  : ledgerWriteBytes;
                     const kindPct     = isRead ? ioReadPct : ioWritePct;
                     const segHex      = isRead ? READ_SHADES[readSegments.findIndex(s => s.id === hoveredSeg.id)] ?? READ_SHADES[0]
                                                : WRITE_SHADES[writeSegments.findIndex(s => s.id === hoveredSeg.id)] ?? WRITE_SHADES[0];
@@ -1480,24 +1493,24 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
       <div className="mt-6 pt-4 border-t border-slate-800/80 grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
         <div className="bg-slate-950/40 p-2.5 rounded-lg border border-slate-800/40">
           <span className="text-[9px] font-mono text-slate-500 block uppercase">STROOP FEE</span>
-          <span className="text-xs font-mono font-bold text-slate-300 mt-1 block">{cost_stroops.toLocaleString()} stroops</span>
+          <span className="text-xs font-mono font-bold text-slate-300 mt-1 block">{costStroops.toLocaleString()} stroops</span>
         </div>
         <div className="bg-slate-950/40 p-2.5 rounded-lg border border-slate-800/40">
           <span className="text-[9px] font-mono text-slate-500 block uppercase">TX SIZE</span>
           <span className={cn('text-xs font-mono font-bold mt-1 block', txStyle.text)}>
-            {formatBytes(transaction_size_bytes)} ({txSizePct.toFixed(1)}%)
+            {formatBytes(txSizeBytes)} ({txSizePct.toFixed(1)}%)
           </span>
         </div>
         <div className="bg-slate-950/40 p-2.5 rounded-lg border border-slate-800/40">
           <span className="text-[9px] font-mono text-slate-500 block uppercase">LEDGER READS</span>
           <span className={cn('text-xs font-mono font-bold mt-1 block', readStyle.text)}>
-            {formatBytes(ledger_read_bytes)} ({ioReadPct.toFixed(1)}%)
+            {formatBytes(ledgerReadBytes)} ({ioReadPct.toFixed(1)}%)
           </span>
         </div>
         <div className="bg-slate-950/40 p-2.5 rounded-lg border border-slate-800/40">
           <span className="text-[9px] font-mono text-slate-500 block uppercase">LEDGER WRITES</span>
           <span className={cn('text-xs font-mono font-bold mt-1 block', writeStyle.text)}>
-            {formatBytes(ledger_write_bytes)} ({ioWritePct.toFixed(1)}%)
+            {formatBytes(ledgerWriteBytes)} ({ioWritePct.toFixed(1)}%)
           </span>
         </div>
       </div>
