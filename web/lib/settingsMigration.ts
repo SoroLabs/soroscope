@@ -99,7 +99,7 @@ function coerceLanguage(value: unknown): string {
 
 function coerceFontSize(value: unknown): number {
   const numeric = typeof value === 'number' ? value : Number(value);
-  if (!Number.finite(numeric)) {
+  if (!Number.isFinite(numeric)) {
     return DEFAULT_PREFERENCES.fontSize;
   }
   // Clamp to a sane valid range.
@@ -141,10 +141,10 @@ export function validatePreferences(
     theme: coerceTheme(themeSource),
     language: coerceLanguage(languageSource),
     notifications: coerceBoolean(notificationsSource, DEFAULT_PREFERENCES.notifications),
-    autoPlayVideos: coerceBoolean(autoPlaySource, DEFAULT_PREFERENCE.autoPlayVideos),
+    autoPlayVideos: coerceBoolean(autoPlaySource, DEFAULT_PREFERENCES.autoPlayVideos),
     fontSize: coerceFontSize(fontSizeSource),
     sidebarCollapsed: coerceBoolean(source.sidebarCollapsed, DEFAULT_PREFERENCES.sidebarCollapsed),
-    reducedMotion: coerceBoolean(source.reducedMotion, DEFAULT_PREFERENCE.reducedMotion),
+    reducedMotion: coerceBoolean(source.reducedMotion, DEFAULT_PREFERENCES.reducedMotion),
     timezone: coerceTimezone(source.timezone),
   };
 }
@@ -179,7 +179,7 @@ export function migrateRawPayload(raw: RawSettingsPayload | null | undefined): U
     if (working.autoplay !== undefined && working.autoPlayVideos === undefined) {
       working.autoPlayVideos = working.autoplay;
     }
-    if (working.fontSizePx) !== undefined && working.fontSize === undefined) {
+    if (working.fontSizePx !== undefined && working.fontSize === undefined) {
       working.fontSize = working.fontSizePx;
     }
   }
