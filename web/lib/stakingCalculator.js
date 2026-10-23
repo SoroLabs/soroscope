@@ -147,6 +147,69 @@ function calculateStakingYield({
   };
 }
 
+/** Query-string keys used to share a calculation as a link. */
+const STAKING_QUERY_KEYS = ['deposit', 'apy', 'duration', 'compoundFrequency', 'tierMultiplier'];
+
+function firstQueryValue(value) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+/**
+ * Parse shared-link query params into calculator state. Accepts a Next.js
+ * `router.query` object or a plain `{ key: string }` map. Only keys that are
+ * present are returned, and every value is clamped/validated, so a crafted
+ * URL can never put the form into an invalid state.
+ */
+function parseStakingQuery(query = {}) {
+  const parsed = {};
+
+  const deposit = firstQueryValue(query.deposit);
+  if (deposit !== undefined && deposit !== '') {
+    parsed.depositAmount = sanitizeNumericInput(deposit, STAKING_INPUT_LIMITS.depositAmount);
+  }
+
+  const apy = firstQueryValue(query.apy);
+  if (apy !== undefined && apy !== '') {
+    parsed.baseApyPercentage = sanitizeNumericInput(apy, STAKING_INPUT_LIMITS.baseApyPercentage);
+  }
+
+  const duration = firstQueryValue(query.duration);
+  if (duration !== undefined && duration !== '') {
+    parsed.lockDurationMonths = Math.round(
+      sanitizeNumericInput(duration, STAKING_INPUT_LIMITS.lockDurationMonths),
+    );
+  }
+
+  const frequency = firstQueryValue(query.compoundFrequency);
+  if (frequency !== undefined && Object.prototype.hasOwnProperty.call(COMPOUND_FREQUENCIES, frequency)) {
+    parsed.compoundFrequency = frequency;
+  }
+
+  const tier = firstQueryValue(query.tierMultiplier);
+  if (tier === 'true' || tier === 'false') {
+    parsed.enableTierMultiplier = tier === 'true';
+  }
+
+  return parsed;
+}
+
+/** Serialize calculator state into shared-link query params (all strings). */
+function buildStakingQuery({
+  depositAmount,
+  baseApyPercentage,
+  lockDurationMonths,
+  compoundFrequency,
+  enableTierMultiplier,
+}) {
+  return {
+    deposit: String(depositAmount),
+    apy: String(baseApyPercentage),
+    duration: String(lockDurationMonths),
+    compoundFrequency: String(compoundFrequency),
+    tierMultiplier: String(Boolean(enableTierMultiplier)),
+  };
+}
+
 module.exports = {
   calculateStakingYield,
   getDurationTierMultiplier,
@@ -154,4 +217,7 @@ module.exports = {
   COMPOUND_FREQUENCIES,
   DURATION_TIER_MULTIPLIERS,
   STAKING_INPUT_LIMITS,
+  STAKING_QUERY_KEYS,
+  parseStakingQuery,
+  buildStakingQuery,
 };

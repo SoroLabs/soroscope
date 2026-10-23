@@ -1,10 +1,13 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+import { useRouter } from 'next/router';
 import {
+  buildStakingQuery,
   calculateStakingYield,
+  parseStakingQuery,
   sanitizeNumericInput,
   STAKING_INPUT_LIMITS,
 } from '../lib/stakingCalculator';
-import { Calculator, TrendingUp, Calendar, Zap, DollarSign, BarChart2 } from 'lucide-react';
+import { Calculator, TrendingUp, Calendar, Zap, DollarSign, BarChart2, Share2 } from 'lucide-react';
 
 export interface StakingCalculatorProps {
   initialDeposit?: number;
@@ -19,12 +22,79 @@ export function StakingCalculator({
   initialBaseApy = 12,
   className = '',
 }: StakingCalculatorProps) {
+  const router = useRouter();
   const [depositAmount, setDepositAmount] = useState<number>(initialDeposit);
   const [lockDurationMonths, setLockDurationMonths] = useState<number>(initialDurationMonths);
   const [baseApyPercentage, setBaseApyPercentage] = useState<number>(initialBaseApy);
   const [compoundFrequency, setCompoundFrequency] = useState<string>('monthly');
   const [enableTierMultiplier, setEnableTierMultiplier] = useState<boolean>(true);
   const [showTable, setShowTable] = useState<boolean>(false);
+  const [linkCopied, setLinkCopied] = useState<boolean>(false);
+  // URL sync starts only after the shared-link params have been applied once,
+  // so the defaults never overwrite an incoming link.
+  const [urlHydrated, setUrlHydrated] = useState<boolean>(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // On mount: pre-fill the form from a shared link's query params.
+  useEffect(() => {
+    if (!router.isReady || urlHydrated) return;
+    const shared = parseStakingQuery(router.query);
+    if (shared.depositAmount !== undefined) setDepositAmount(shared.depositAmount);
+    if (shared.baseApyPercentage !== undefined) setBaseApyPercentage(shared.baseApyPercentage);
+    if (shared.lockDurationMonths !== undefined) setLockDurationMonths(shared.lockDurationMonths);
+    if (shared.compoundFrequency !== undefined) setCompoundFrequency(shared.compoundFrequency);
+    if (shared.enableTierMultiplier !== undefined) setEnableTierMultiplier(shared.enableTierMultiplier);
+    setUrlHydrated(true);
+  }, [router.isReady, router.query, urlHydrated]);
+
+  // On change: mirror the parameters into the URL with a shallow replace
+  // (no navigation, no new history entry). Other query params are kept.
+  useEffect(() => {
+    if (!router.isReady || !urlHydrated) return;
+    const nextParams = buildStakingQuery({
+      depositAmount,
+      baseApyPercentage,
+      lockDurationMonths,
+      compoundFrequency,
+      enableTierMultiplier,
+    });
+    const unchanged = Object.entries(nextParams).every(([key, value]) => router.query[key] === value);
+    if (unchanged) return;
+    router.replace({ pathname: router.pathname, query: { ...router.query, ...nextParams } }, undefined, {
+      shallow: true,
+      scroll: false,
+    });
+    // `router` itself is not stable across renders; depend on the inputs only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [router.isReady, urlHydrated, depositAmount, baseApyPercentage, lockDurationMonths, compoundFrequency, enableTierMultiplier]);
+
+  useEffect(
+    () => () => {
+      if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
+
+  const handleCopyLink = useCallback(async () => {
+    if (typeof window === 'undefined') return;
+    const url = new URL(window.location.href);
+    const params = buildStakingQuery({
+      depositAmount,
+      baseApyPercentage,
+      lockDurationMonths,
+      compoundFrequency,
+      enableTierMultiplier,
+    });
+    Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+    try {
+      await navigator.clipboard.writeText(url.toString());
+      setLinkCopied(true);
+      if (copiedTimer.current) clearTimeout(copiedTimer.current);
+      copiedTimer.current = setTimeout(() => setLinkCopied(false), 2000);
+    } catch {
+      // Clipboard API unavailable (e.g. non-secure context); nothing to do.
+    }
+  }, [depositAmount, baseApyPercentage, lockDurationMonths, compoundFrequency, enableTierMultiplier]);
 
   const results = useMemo(() => {
     return calculateStakingYield({
@@ -81,9 +151,21 @@ export function StakingCalculator({
             Estimate projected APY, compounding returns, and rewards prior to locking your tokens.
           </p>
         </div>
-        <div className="inline-flex items-center gap-2 rounded-full border border-cyan-500/30 bg-cyan-950/40 px-3 py-1 text-xs font-semibold text-cyan-400">
-          <Zap className="h-3.5 w-3.5" />
-          <span>Soroban Staking</span>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleCopyLink}
+            title="Copy a link to this calculation"
+            aria-live="polite"
+            className="inline-flex items-center gap-1.5 rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-300 transition hover:border-cyan-500/50 hover:text-cyan-300"
+          >
+            <Share2 className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>{linkCopied ? 'Link copied!' : 'Copy link'}</span>
+          </button>
+          <div className="inline-flex items-center gap-2 rounded-full border border-cyan-500/30 bg-cyan-950/40 px-3 py-1 text-xs font-semibold text-cyan-400">
+            <Zap className="h-3.5 w-3.5" />
+            <span>Soroban Staking</span>
+          </div>
         </div>
       </div>
 
