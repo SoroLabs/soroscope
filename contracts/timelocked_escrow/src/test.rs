@@ -1,9 +1,10 @@
-use crate::contract::TimelockEscrowClient;
+use crate::contract::{TimelockEscrowClient, ADMIN_RELEASE_DELAY_LEDGERS};
 use crate::guardian::{approval_count, has_quorum, set_approval};
+use crate::storage_types::Error;
 use crate::TimelockEscrow;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token, Address, Env, Vec,
+    testutils::{Address as _, Events, Ledger},
+    token, Address, Env, Symbol, TryFromVal, Vec,
 };
 
 const LOCK_LEDGERS: u32 = 100;
@@ -28,6 +29,7 @@ fn setup() -> (
     let depositor = Address::generate(&e);
     let beneficiary = Address::generate(&e);
     let protocol_vault = Address::generate(&e);
+    let admin = Address::generate(&e);
 
     // Register a Stellar asset and mint to depositor
     let token_admin = Address::generate(&e);
@@ -54,6 +56,7 @@ fn setup() -> (
         &LOCK_LEDGERS,
         &FEE_BPS,
         &protocol_vault,
+        &admin,
     );
 
     (
@@ -325,6 +328,7 @@ fn test_duplicate_guardians_rejected() {
         &LOCK_LEDGERS,
         &FEE_BPS,
         &protocol_vault,
+        &Address::generate(&e),
     );
 }
 
@@ -333,7 +337,7 @@ fn test_duplicate_guardians_rejected() {
 #[test]
 #[should_panic(expected = "Error(Contract, #1)")]
 fn test_double_initialize_fails() {
-    let (_e, client, token_addr, depositor, beneficiary, guardians, _vault) = setup();
+    let (e, client, token_addr, depositor, beneficiary, guardians, _vault) = setup();
 
     client.initialize(
         &depositor,
@@ -343,6 +347,7 @@ fn test_double_initialize_fails() {
         &LOCK_LEDGERS,
         &FEE_BPS,
         &_vault,
+        &Address::generate(&e),
     );
 }
 
@@ -519,6 +524,7 @@ fn test_initialize_with_max_fee() {
         &LOCK_LEDGERS,
         &10_000u32,
         &protocol_vault,
+        &Address::generate(&e),
     );
 
     let config = client.get_config();
@@ -558,6 +564,7 @@ fn test_initialize_excessive_fee_fails() {
         &LOCK_LEDGERS,
         &10_001u32,
         &protocol_vault,
+        &Address::generate(&e),
     );
 }
 
@@ -595,6 +602,7 @@ fn test_cancel_with_zero_fee() {
         &LOCK_LEDGERS,
         &0u32,
         &protocol_vault,
+        &Address::generate(&e),
     );
 
     let token_client = token::Client::new(&e, &token_addr);
@@ -642,6 +650,7 @@ fn test_mutual_cancel_with_zero_fee() {
         &LOCK_LEDGERS,
         &0u32,
         &protocol_vault,
+        &Address::generate(&e),
     );
 
     let token_client = token::Client::new(&e, &token_addr);
@@ -715,4 +724,103 @@ fn test_timelock_extension_by_depositor() {
 fn test_timelock_cannot_be_shortened() {
     let (_e, client, _, _, _, _, _) = setup();
     client.extend_timelock(&(LOCK_LEDGERS - 1));
+}
+
+// ── Admin Emergency Release ───────────────────────────────────
+
+#[test]
+fn test_admin_release_after_72h_delay() {
+    let (e, client, token_addr, _depositor, beneficiary, _guardians, _vault) = setup();
+    let token_client = token::Client::new(&e, &token_addr);
+    client.deposit(&DEPOSIT_AMOUNT);
+
+    let voted_at = e.ledger().sequence();
+    let executable_at = client.vote_release();
+    assert_eq!(executable_at, voted_at + ADMIN_RELEASE_DELAY_LEDGERS);
+    assert_eq!(ADMIN_RELEASE_DELAY_LEDGERS, 72 * 60 * 12);
+    assert_eq!(client.get_admin_release_vote(), Some(voted_at));
+
+    advance_ledger(&e, ADMIN_RELEASE_DELAY_LEDGERS);
+    client.execute_release();
+
+    // No guardian approvals were needed.
+    assert_eq!(token_client.balance(&beneficiary), DEPOSIT_AMOUNT);
+    let config = client.get_config();
+    assert!(config.is_released);
+    assert_eq!(config.amount, 0);
+    assert_eq!(client.get_admin_release_vote(), None);
+}
+
+#[test]
+fn test_admin_execute_release_before_delay_fails() {
+    let (e, client, _, _, _, _, _) = setup();
+    client.deposit(&DEPOSIT_AMOUNT);
+    client.vote_release();
+
+    advance_ledger(&e, ADMIN_RELEASE_DELAY_LEDGERS - 1);
+    assert_eq!(
+        client.try_execute_release(),
+        Err(Ok(Error::AdminReleaseDelayNotElapsed))
+    );
+}
+
+#[test]
+fn test_admin_execute_release_without_vote_fails() {
+    let (_e, client, _, _, _, _, _) = setup();
+    client.deposit(&DEPOSIT_AMOUNT);
+    assert_eq!(
+        client.try_execute_release(),
+        Err(Ok(Error::AdminReleaseNotVoted))
+    );
+}
+
+#[test]
+fn test_admin_double_vote_fails() {
+    let (_e, client, _, _, _, _, _) = setup();
+    client.deposit(&DEPOSIT_AMOUNT);
+    client.vote_release();
+    assert_eq!(
+        client.try_vote_release(),
+        Err(Ok(Error::AdminReleaseAlreadyVoted))
+    );
+}
+
+#[test]
+fn test_admin_vote_release_requires_admin_auth() {
+    let (e, client, _, _, _, _, _) = setup();
+    client.deposit(&DEPOSIT_AMOUNT);
+    // Drop the blanket auth mock: nobody has signed, so the admin check must fail.
+    e.set_auths(&[]);
+    assert!(client.try_vote_release().is_err());
+}
+
+fn has_event(e: &Env, name: &str) -> bool {
+    let expected = Symbol::new(e, name);
+    e.events().all().iter().any(|(_, topics, _)| {
+        topics
+            .get(0)
+            .and_then(|t| Symbol::try_from_val(e, &t).ok())
+            .is_some_and(|sym| sym == expected)
+    })
+}
+
+#[test]
+fn test_admin_release_emits_events() {
+    let (e, client, _, _, _, _, _) = setup();
+    client.deposit(&DEPOSIT_AMOUNT);
+
+    client.vote_release();
+    assert!(has_event(&e, "admin_vote_release"));
+
+    advance_ledger(&e, ADMIN_RELEASE_DELAY_LEDGERS);
+    client.execute_release();
+    assert!(has_event(&e, "admin_execute_release"));
+}
+
+#[test]
+fn test_admin_vote_after_cancel_fails() {
+    let (_e, client, _, _, _, _, _) = setup();
+    client.deposit(&DEPOSIT_AMOUNT);
+    client.cancel();
+    assert_eq!(client.try_vote_release(), Err(Ok(Error::AlreadyFinalized)));
 }

@@ -1,14 +1,22 @@
-use crate::escrow::{has_config, read_config, require_active, require_funded, write_config};
+use crate::escrow::{
+    clear_admin_release_vote, has_config, read_admin, read_admin_release_vote, read_config,
+    require_active, require_funded, write_admin, write_admin_release_vote, write_config,
+};
 use crate::guardian::{
     approval_count, guardian_index, has_quorum, read_approvals, read_epoch, read_guardians,
     read_recovery_approvals, set_approval, validate_guardians, write_approvals, write_epoch,
     write_guardians, write_recovery_approvals, REQUIRED_APPROVALS,
 };
 use crate::storage_types::{
-    ApprovalEvent, CancelEvent, DepositEvent, Error, EscrowConfig, EscrowStatus,
-    GuardianRotationEvent, MutualCancelEvent, ReleaseEvent, StatusChangeEvent,
+    AdminReleaseEvent, AdminReleaseVoteEvent, ApprovalEvent, CancelEvent, DepositEvent, Error,
+    EscrowConfig, EscrowStatus, GuardianRotationEvent, MutualCancelEvent, ReleaseEvent,
+    StatusChangeEvent,
 };
 use soroban_sdk::{contract, contractimpl, token, Address, Env, Symbol, Vec};
+
+/// Delay between an admin `vote_release` and `execute_release`:
+/// 72 hours at ~5s per ledger (72 * 60 * 12).
+pub const ADMIN_RELEASE_DELAY_LEDGERS: u32 = 51_840;
 
 #[contract]
 pub struct TimelockEscrow;
@@ -19,6 +27,9 @@ impl TimelockEscrow {
     /// The timelock is computed as current ledger sequence + `lock_ledgers`.
     /// `cancellation_fee_bps` is the fee (in basis points) deducted on cancel, capped at 10000.
     /// `protocol_vault` receives the cancellation fee.
+    /// `admin` may start an emergency release (`vote_release` then, after a
+    /// 72-hour delay, `execute_release`) when the beneficiary key is lost.
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         e: Env,
         depositor: Address,
@@ -28,6 +39,7 @@ impl TimelockEscrow {
         lock_ledgers: u32,
         cancellation_fee_bps: u32,
         protocol_vault: Address,
+        admin: Address,
     ) -> Result<(), Error> {
         if has_config(&e) {
             return Err(Error::AlreadyInitialized);
@@ -55,6 +67,9 @@ impl TimelockEscrow {
         write_approvals(&e, 0u32);
         write_recovery_approvals(&e, 0u32);
         write_epoch(&e, 0u32);
+
+        // Store the admin address so release_by_admin can authenticate the caller.
+        write_admin(&e, &admin);
 
         e.storage().instance().extend_ttl(100, 100);
         Ok(())
@@ -428,6 +443,95 @@ impl TimelockEscrow {
             }
             Err(_) => false,
         }
+    }
+
+    /// Returns the stored contract admin address.
+    pub fn get_admin(e: Env) -> Result<Address, Error> {
+        read_admin(&e)
+    }
+
+    /// Returns the ledger at which the admin voted for an emergency release, if any.
+    pub fn get_admin_release_vote(e: Env) -> Option<u32> {
+        read_admin_release_vote(&e)
+    }
+
+    /// Step 1 of the admin emergency release (recovery path for a lost
+    /// beneficiary key). Records the vote and starts a 72-hour
+    /// (`ADMIN_RELEASE_DELAY_LEDGERS`) delay before `execute_release` may run.
+    pub fn vote_release(e: Env) -> Result<u32, Error> {
+        let admin = read_admin(&e)?;
+        admin.require_auth();
+
+        let config = read_config(&e)?;
+        require_active(&config)?;
+        require_funded(&config)?;
+
+        if read_admin_release_vote(&e).is_some() {
+            return Err(Error::AdminReleaseAlreadyVoted);
+        }
+
+        let voted_at_ledger = e.ledger().sequence();
+        let executable_at_ledger = voted_at_ledger.saturating_add(ADMIN_RELEASE_DELAY_LEDGERS);
+        write_admin_release_vote(&e, voted_at_ledger);
+
+        e.events().publish(
+            (Symbol::new(&e, "admin_vote_release"), admin.clone()),
+            AdminReleaseVoteEvent {
+                admin,
+                voted_at_ledger,
+                executable_at_ledger,
+            },
+        );
+
+        // Keep the contract live for the whole delay so execute_release can run.
+        let ttl = ADMIN_RELEASE_DELAY_LEDGERS + 100;
+        e.storage().instance().extend_ttl(ttl, ttl);
+        Ok(executable_at_ledger)
+    }
+
+    /// Step 2 of the admin emergency release. Callable only by the admin, and
+    /// only once `ADMIN_RELEASE_DELAY_LEDGERS` have passed since `vote_release`.
+    /// Sends the full escrowed amount to the beneficiary, bypassing the
+    /// guardian quorum and the timelock.
+    pub fn execute_release(e: Env) -> Result<(), Error> {
+        let admin = read_admin(&e)?;
+        admin.require_auth();
+
+        let mut config = read_config(&e)?;
+        require_active(&config)?;
+        require_funded(&config)?;
+
+        let voted_at_ledger = read_admin_release_vote(&e).ok_or(Error::AdminReleaseNotVoted)?;
+        if e.ledger().sequence() < voted_at_ledger.saturating_add(ADMIN_RELEASE_DELAY_LEDGERS) {
+            return Err(Error::AdminReleaseDelayNotElapsed);
+        }
+
+        // Effects before the token transfer.
+        let released_amount = config.amount;
+        config.amount = 0;
+        config.is_released = true;
+        write_config(&e, &config);
+        clear_admin_release_vote(&e);
+
+        token::Client::new(&e, &config.token).transfer(
+            &e.current_contract_address(),
+            &config.beneficiary,
+            &released_amount,
+        );
+
+        publish_status_change(&e, EscrowStatus::Funded, EscrowStatus::Released);
+        e.events().publish(
+            (Symbol::new(&e, "admin_execute_release"), admin.clone()),
+            AdminReleaseEvent {
+                admin,
+                beneficiary: config.beneficiary,
+                token: config.token,
+                amount: released_amount,
+            },
+        );
+
+        e.storage().instance().extend_ttl(100, 100);
+        Ok(())
     }
 }
 

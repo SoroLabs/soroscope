@@ -10,6 +10,9 @@ pub enum DataKey {
     Approvals,
     RecoveryApprovals,
     ApprovalEpoch,
+    Admin,
+    /// Ledger sequence at which the admin voted for an emergency release.
+    AdminReleaseVote,
 }
 
 // ── Escrow Configuration ──────────────────────────────────────
@@ -49,6 +52,9 @@ pub enum Error {
     DuplicateGuardian = 12,
     CancellationFeeTooHigh = 13,
     InvalidTimelockExtension = 14,
+    AdminReleaseNotVoted = 15,
+    AdminReleaseAlreadyVoted = 16,
+    AdminReleaseDelayNotElapsed = 17,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +122,23 @@ pub struct GuardianRotationEvent {
     pub old_guardians: Vec<Address>,
     pub new_guardians: Vec<Address>,
     pub new_epoch: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct AdminReleaseVoteEvent {
+    pub admin: Address,
+    pub voted_at_ledger: u32,
+    pub executable_at_ledger: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct AdminReleaseEvent {
+    pub admin: Address,
+    pub beneficiary: Address,
+    pub token: Address,
+    pub amount: i128,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
