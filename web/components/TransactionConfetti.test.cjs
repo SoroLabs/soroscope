@@ -74,3 +74,30 @@ test('TransactionConfetti: particle remains stable when traveling upwards', () =
 
   assert.strictEqual(p.opacity, 1.0, 'Opacity must remain stable when particle travels upwards');
 });
+
+// ── #1283: the overlay canvas must never swallow clicks ──────────────────────
+const fs = require('node:fs');
+const path = require('node:path');
+
+const confettiSource = fs.readFileSync(path.join(__dirname, 'TransactionConfetti.tsx'), 'utf8');
+
+test('TransactionConfetti: component is stored as TSX source, not an encoded blob', () => {
+  assert.match(confettiSource, /^'use client';/);
+  assert.match(confettiSource, /export const TransactionConfetti/);
+});
+
+test('TransactionConfetti: canvas is wired to its ref', () => {
+  assert.match(confettiSource, /<canvas[\s\S]*?ref=\{canvasRef\}/);
+});
+
+test('TransactionConfetti: canvas overlay does not intercept pointer events', () => {
+  const styleBlock = confettiSource.match(/CONFETTI_CANVAS_STYLE[^=]*=\s*\{([\s\S]*?)\};/);
+  assert.ok(styleBlock, 'CONFETTI_CANVAS_STYLE must be declared');
+  assert.match(styleBlock[1], /pointerEvents:\s*'none'/);
+  assert.match(styleBlock[1], /position:\s*'fixed'/);
+  assert.match(confettiSource, /<canvas[\s\S]*?style=\{CONFETTI_CANVAS_STYLE\}/);
+});
+
+test('TransactionConfetti: physics loop does not reset vertical speed every frame', () => {
+  assert.doesNotMatch(confettiSource, /p\.speedY\s*=\s*0\s*;/);
+});

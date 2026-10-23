@@ -64,7 +64,7 @@ import { UploadZone } from '../components/upload-zone';
 import { ApiError, analyzeService, apiUrl } from '../lib/api';
 import { loadLatestAnalysis, saveLatestAnalysis } from '../lib/analysisStorage';
 import { createUserFriendlyMessage, extractErrorDetails, formatError } from '../lib/errorHandling';
-import type { GasGolfingSuggestion } from '../lib/gasGolfingSort';
+import { normalizeGasGolfingSuggestions, type GasGolfingSuggestion } from '../lib/gasGolfingSort';
 import {
   MOCK_CONTRACT_FUNCTIONS,
   generateMockResult,
@@ -215,6 +215,7 @@ export default function Home() {
         resourceCost: report,
         stateSnapshot: report.state_snapshot,
         callGraphMermaid: report.call_graph_mermaid ?? undefined,
+        simulationId: report.simulation_id ?? undefined,
         timestamp: Date.now(),
         success: true,
       };
@@ -286,9 +287,7 @@ export default function Home() {
       }
 
       const data = await res.json();
-      setGasGolfingSuggestions(
-        (data?.report?.suggestions ?? []) as GasGolfingSuggestion[]
-      );
+      setGasGolfingSuggestions(normalizeGasGolfingSuggestions(data?.report?.suggestions));
     } catch (e) {
       setGasGolfingError(e instanceof Error ? e.message : 'Failed to analyze WASM');
     } finally {
@@ -544,7 +543,7 @@ export default function Home() {
                     </div>
                   </>
                 ) : currentResult ? (
-                    <ResultViewer result={currentResult} />
+                    <ResultViewer result={currentResult} contractId={wasmData ? undefined : contractId} />
                     {analysisReport && (
                       <div className="mt-4 flex flex-col gap-4">
                         <ResourceHeatmap resourceCost={{

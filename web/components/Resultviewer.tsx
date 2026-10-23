@@ -2,8 +2,11 @@ import { useState } from 'react';
 import type { InvocationResult } from '../lib/sorobantypes';
 import { exportReport } from '../lib/exportReport';
 
+import { buildShareUrl, isValidSimulationId } from '../lib/shareLinks';
+
 import { CallGraphVisualizer } from './CallGraphVisualizer';
 import { CopyButton } from './CopyButton';
+import { NetworkComparisonView } from './NetworkComparisonView';
 
 interface ResultViewerProps {
   result: InvocationResult | null;
@@ -13,6 +16,15 @@ interface ResultViewerProps {
 export function ResultViewer({ result, contractId }: ResultViewerProps) {
   const [exportFormat, setExportFormat] = useState<'pdf' | 'csv' | 'both'>('pdf');
   const [exporting, setExporting] = useState(false);
+  const [compareNetworks, setCompareNetworks] = useState(false);
+
+  // Share links need a server-persisted simulation id (#1286).
+  const shareUrl =
+    result?.simulationId && isValidSimulationId(result.simulationId)
+      ? buildShareUrl(result.simulationId, process.env.NEXT_PUBLIC_SHARE_BASE_URL)
+      : null;
+  // Comparing re-runs the call by contract id, so it needs one (#1282).
+  const canCompare = Boolean(result?.success && contractId);
 
   const handleExport = (format: 'pdf' | 'csv' | 'both' = exportFormat) => {
     if (!result) return;
@@ -138,6 +150,36 @@ export function ResultViewer({ result, contractId }: ResultViewerProps) {
             </select>
           </div>
 
+          {canCompare && (
+            <button
+              type="button"
+              onClick={() => setCompareNetworks((on) => !on)}
+              aria-pressed={compareNetworks}
+              title="Run this simulation on Testnet and Futurenet side by side"
+              style={{
+                padding: '6px 12px',
+                backgroundColor: compareNetworks ? 'rgba(0, 217, 255, 0.12)' : '#1f2937',
+                color: compareNetworks ? '#00d9ff' : '#f3f4f6',
+                borderRadius: '6px',
+                border: `1px solid ${compareNetworks ? '#00d9ff' : '#374151'}`,
+                fontSize: '12px',
+                cursor: 'pointer',
+              }}
+            >
+              {compareNetworks ? 'Comparing networks' : 'Compare networks'}
+            </button>
+          )}
+
+          {shareUrl && (
+            <CopyButton
+              text={shareUrl}
+              label="Share"
+              copiedLabel="Link copied!"
+              variant="outline"
+              tooltipPosition="bottom"
+            />
+          )}
+
           {result.stateSnapshot && (
             <button
               onClick={downloadSnapshot}
@@ -251,6 +293,15 @@ export function ResultViewer({ result, contractId }: ResultViewerProps) {
             {JSON.stringify(result.result, null, 2)}
           </div>
         )
+      )}
+
+      {canCompare && compareNetworks && contractId && (
+        <NetworkComparisonView
+          contractId={contractId}
+          functionName={result.functionName}
+          args={Object.values(result.inputs ?? {}).map((value) => String(value))}
+          runKey={result.id}
+        />
       )}
 
       {(result.callGraph || result.callGraphMermaid) && (

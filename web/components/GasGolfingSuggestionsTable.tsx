@@ -2,7 +2,10 @@
 
 import React, { useMemo, useState } from 'react';
 import clsx from 'clsx';
-import { sortGasGolfingSuggestions } from '../lib/gasGolfingSort';
+import {
+  normalizeGasGolfingSuggestions,
+  sortGasGolfingSuggestions,
+} from '../lib/gasGolfingSort';
 import type {
   GasGolfingSortKey,
   GasGolfingSuggestion,
@@ -68,11 +71,15 @@ export function GasGolfingSuggestionsTable({
   const [preview, setPreview] = useState<GasGolfingSuggestion | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
+  // Normalizing is idempotent: rows that already have an id keep it, and raw
+  // server rows (or ones from an older server without ids) get a unique one.
+  const rows = useMemo(() => normalizeGasGolfingSuggestions(suggestions), [suggestions]);
+
   const filtered = useMemo(() => {
-    if (!activeFilters.length) return suggestions;
+    if (!activeFilters.length) return rows;
     const wanted = new Set(activeFilters.map((f) => f.toLowerCase()));
-    return suggestions.filter((s) => wanted.has(String(s.severity).toLowerCase()));
-  }, [suggestions, activeFilters]);
+    return rows.filter((s) => wanted.has(String(s.severity).toLowerCase()));
+  }, [rows, activeFilters]);
 
   const sorted = useMemo(
     () => sortGasGolfingSuggestions(filtered, sortKey, direction),
@@ -199,10 +206,13 @@ export function GasGolfingSuggestionsTable({
             </tr>
           </thead>
           <tbody className="divide-y divide-[var(--border-default)]">
-            {sorted.map((s, idx) => {
-              const rowKey = `${s.title}-${idx}`;
+            {sorted.map((s) => {
+              // Key on the suggestion's stable id, never the array index, so
+              // re-sorting or re-fetching can't make React reuse the wrong
+              // row and render duplicates (#1285).
+              const rowKey = s.id;
               return (
-                <tr key={rowKey} className="hover:bg-[var(--bg-card)]">
+                <tr key={rowKey} data-suggestion-id={s.id} className="hover:bg-[var(--bg-card)]">
                   <td className="px-4 py-3">
                     <div className="font-medium text-[var(--text-primary)]">{s.title}</div>
                     {s.description ? (
@@ -287,10 +297,10 @@ export function GasGolfingSuggestionsTable({
             <div className="mt-3 flex justify-end">
               <button
                 type="button"
-                onClick={() => copySuggestion(preview, `preview-${preview.title}`)}
+                onClick={() => copySuggestion(preview, `preview-${preview.id}`)}
                 className="rounded border border-[var(--border-default)] px-3 py-1 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
               >
-                {copiedKey === `preview-${preview.title}` ? 'Copied!' : 'Copy Suggestion'}
+                {copiedKey === `preview-${preview.id}` ? 'Copied!' : 'Copy Suggestion'}
               </button>
             </div>
           </div>
