@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { isAuthFailure, shouldReconnect } from '../lib/websocketClose';
+import { emitToast } from '../lib/toastEvents';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -39,8 +41,15 @@ export interface UseWebSocketOptions<T = unknown> {
    */
   protocols?: string | string[];
   /**
+   * Called when the server closes the connection with code `4003`
+   * (unauthorized). No reconnect is attempted after this.
+   * When omitted, an error toast is shown instead.
+   */
+  onAuthError?: (event: CloseEvent) => void;
+  /**
    * Whether to reconnect automatically on unexpected close.
-   * Defaults to `false`.
+   * Only close codes `1001` (going away) and `1006` (abnormal close) are
+   * retried. Defaults to `false`.
    */
   reconnect?: boolean;
   /**
@@ -89,7 +98,9 @@ export interface UseWebSocketReturn<T = unknown> {
  * - Only one active connection exists at a time — previous sockets are torn
  *   down before a new one is opened.
  * - Optional exponential-back-off reconnection is bounded by
- *   `maxReconnectAttempts`.
+ *   `maxReconnectAttempts`, and only happens for close codes `1001` and
+ *   `1006`. A `4003` (unauthorized) close stops reconnecting and raises an
+ *   auth-error toast (or calls `onAuthError` when provided).
  *
  * @example
  * ```tsx
@@ -105,6 +116,7 @@ export function useWebSocket<T = unknown>({
   onOpen,
   onClose,
   onError,
+  onAuthError,
   reviver,
   protocols,
   reconnect = false,
@@ -120,6 +132,7 @@ export function useWebSocket<T = unknown>({
   const onOpenRef = useRef(onOpen);
   const onCloseRef = useRef(onClose);
   const onErrorRef = useRef(onError);
+  const onAuthErrorRef = useRef(onAuthError);
   const reviverRef = useRef(reviver);
 
   useEffect(() => {
@@ -137,6 +150,10 @@ export function useWebSocket<T = unknown>({
   useEffect(() => {
     onErrorRef.current = onError;
   }, [onError]);
+
+  useEffect(() => {
+    onAuthErrorRef.current = onAuthError;
+  }, [onAuthError]);
 
   useEffect(() => {
     reviverRef.current = reviver;
@@ -204,11 +221,26 @@ export function useWebSocket<T = unknown>({
         socketRef.current = null;
         onCloseRef.current?.(event);
 
-        // Attempt reconnection only when the close was unexpected and the
-        // consumer has not explicitly requested a teardown.
+        // An auth failure will fail again on every retry: report it and stop.
+        if (isAuthFailure(event.code)) {
+          setStatus('error');
+          if (onAuthErrorRef.current) {
+            onAuthErrorRef.current(event);
+          } else {
+            emitToast({
+              type: 'error',
+              message: 'Live connection rejected: you are not authorized. Please reconnect your wallet or sign in again.',
+            });
+          }
+          return;
+        }
+
+        // Attempt reconnection only for transient failures (1001 / 1006) the
+        // consumer has not explicitly requested a teardown for.
         if (
           reconnect &&
           !intentionalClose.current &&
+          shouldReconnect(event.code) &&
           reconnectAttempts.current < maxReconnectAttempts
         ) {
           const delay = reconnectDelay * Math.pow(2, reconnectAttempts.current);
