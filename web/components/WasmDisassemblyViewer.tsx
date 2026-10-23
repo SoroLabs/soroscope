@@ -9,8 +9,16 @@ import {
   type WasmInstruction,
 } from "../lib/wasmDisassembly";
 
-/** Rows rendered at once; large contracts stay responsive and the filter narrows the rest. */
-const MAX_VISIBLE_ROWS = 2000;
+/**
+ * Fixed row height in pixels used for the virtual list calculations.
+ * Each opcode row is a single line of monospace text at text-xs (12px)
+ * with padding → 20px is a safe, consistent value.
+ */
+const ROW_HEIGHT = 20;
+/** Extra rows rendered above and below the visible viewport to reduce flicker during fast scrolls. */
+const OVERSCAN = 10;
+/** Fixed height of the scroll container in pixels, matching the h-[480px] Tailwind class. */
+const CONTAINER_HEIGHT = 480;
 const ALL_FUNCTIONS = -1;
 
 export interface WasmDisassemblyViewerProps {
@@ -51,7 +59,10 @@ export function WasmDisassemblyViewer({ wasmFile = null, rustSource = "" }: Wasm
   const [query, setQuery] = useState("");
   const [selectedFunction, setSelectedFunction] = useState(ALL_FUNCTIONS);
   const [selectedLine, setSelectedLine] = useState<number | null>(null);
-  const firstHighlightRef = useRef<HTMLLIElement | null>(null);
+
+  // Virtual-scroll state for the opcode pane.
+  const scrollContainerRef = useRef<HTMLOListElement | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
 
   const file = localFile ?? wasmFile;
 
@@ -91,6 +102,8 @@ export function WasmDisassemblyViewer({ wasmFile = null, rustSource = "" }: Wasm
       });
     setSelectedFunction(ALL_FUNCTIONS);
     setSelectedLine(null);
+    // Reset scroll when a new file is loaded so the virtual window starts at top.
+    setScrollTop(0);
     return () => {
       cancelled = true;
     };
@@ -120,8 +133,17 @@ export function WasmDisassemblyViewer({ wasmFile = null, rustSource = "" }: Wasm
     return indented.filter((row) => matches.has(row.instruction));
   }, [result, functions, selectedFunction, query]);
 
-  const visibleRows = rows.slice(0, MAX_VISIBLE_ROWS);
-  const firstHighlightId = visibleRows.find((row) => highlighted.has(row.instruction.id))?.instruction.id;
+  // --- Virtual list window ---
+  // Compute which slice of `rows` is visible given the current scrollTop.
+  const totalHeight = rows.length * ROW_HEIGHT;
+  const startIndex = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
+  const endIndex = Math.min(rows.length, startIndex + Math.ceil(CONTAINER_HEIGHT / ROW_HEIGHT) + OVERSCAN * 2);
+  const visibleRows = rows.slice(startIndex, endIndex);
+  const paddingTop = startIndex * ROW_HEIGHT;
+  const paddingBottom = Math.max(0, totalHeight - endIndex * ROW_HEIGHT);
+
+  // The first row in the entire (unsliced) rows array that is highlighted.
+  const firstHighlightId = rows.find((row) => highlighted.has(row.instruction.id))?.instruction.id;
 
   const handleRustLineClick = (line: number) => {
     if (selectedLine === line) {
@@ -137,11 +159,18 @@ export function WasmDisassemblyViewer({ wasmFile = null, rustSource = "" }: Wasm
     setQuery("");
   };
 
+  // When the highlight changes, scroll the virtual container so the highlighted
+  // row is centred. We compute the pixel offset directly instead of calling
+  // scrollIntoView because the <li> element may not yet be in the DOM.
   useEffect(() => {
-    if (firstHighlightId) {
-      firstHighlightRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    if (!firstHighlightId) return;
+    const idx = rows.findIndex((row) => row.instruction.id === firstHighlightId);
+    if (idx === -1) return;
+    const target = idx * ROW_HEIGHT - CONTAINER_HEIGHT / 2 + ROW_HEIGHT / 2;
+    if (scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTop = Math.max(0, target);
     }
-  }, [firstHighlightId]);
+  }, [firstHighlightId, rows]);
 
   const handleWasmPick = (event: ChangeEvent<HTMLInputElement>) => {
     const picked = event.target.files?.[0];
@@ -272,12 +301,19 @@ export function WasmDisassemblyViewer({ wasmFile = null, rustSource = "" }: Wasm
           )}
         </div>
 
-        {/* Disassembly */}
+        {/* Disassembly — virtualized so large contracts (500+ functions, tens of
+            thousands of opcodes) never freeze the browser tab. Only the rows
+            visible inside the 480 px scroll window (plus OVERSCAN on each side)
+            are mounted in the DOM at any time. */}
         <div className="flex min-w-0 flex-col rounded-xl border border-slate-800 bg-slate-950">
           <div className="flex flex-wrap items-center gap-2 border-b border-slate-800 px-3 py-2">
             <select
               value={selectedFunction}
-              onChange={(event) => setSelectedFunction(Number(event.target.value))}
+              onChange={(event) => {
+                setSelectedFunction(Number(event.target.value));
+                setScrollTop(0);
+                if (scrollContainerRef.current) scrollContainerRef.current.scrollTop = 0;
+              }}
               aria-label="Function"
               className="min-w-0 max-w-[45%] rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200"
             >
@@ -293,7 +329,11 @@ export function WasmDisassemblyViewer({ wasmFile = null, rustSource = "" }: Wasm
               <input
                 type="search"
                 value={query}
-                onChange={(event) => setQuery(event.target.value)}
+                onChange={(event) => {
+                  setQuery(event.target.value);
+                  setScrollTop(0);
+                  if (scrollContainerRef.current) scrollContainerRef.current.scrollTop = 0;
+                }}
                 placeholder="Filter opcodes (br_if, call swap, 0x10)"
                 aria-label="Filter opcodes"
                 className="w-full rounded-md border border-slate-700 bg-slate-900 py-1 pl-7 pr-2 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-cyan-500/60"
@@ -301,28 +341,45 @@ export function WasmDisassemblyViewer({ wasmFile = null, rustSource = "" }: Wasm
             </div>
           </div>
 
-          <ol className="h-[480px] overflow-auto py-2 font-mono text-xs" aria-label="WASM opcodes">
+          {/* The outer <ol> is the real scroll container. We listen to onScroll to
+              update scrollTop in state, which recalculates the visible window. Top
+              and bottom spacer <li>s maintain the correct total scrollable height so
+              the scrollbar thumb stays proportional to the full list. */}
+          <ol
+            ref={scrollContainerRef}
+            className="h-[480px] overflow-auto py-2 font-mono text-xs"
+            aria-label="WASM opcodes"
+            onScroll={(e) => setScrollTop((e.currentTarget as HTMLOListElement).scrollTop)}
+          >
             {decoding && <li className="px-3 text-slate-500">Decoding…</li>}
             {!decoding && !file && (
               <li className="px-3 py-8 text-center text-slate-500">No WASM loaded</li>
             )}
             {!decoding && file && rows.length === 0 && (
               <li className="px-3 py-8 text-center text-slate-500">
-                {query ? `No opcodes match “${query}”` : "No instructions decoded"}
+                {query ? `No opcodes match "${query}"` : "No instructions decoded"}
               </li>
             )}
+
+            {/* Top spacer: represents all rows above the virtual window */}
+            {rows.length > 0 && paddingTop > 0 && (
+              <li aria-hidden="true" style={{ height: paddingTop }} />
+            )}
+
             {visibleRows.map(({ instruction, depth }, position) => {
               const isHighlighted = highlighted.has(instruction.id);
+              // Absolute index within all rows, used for function-header detection.
+              const absIndex = startIndex + position;
               const startsFunction =
                 selectedFunction === ALL_FUNCTIONS &&
                 !query.trim() &&
-                (position === 0 || visibleRows[position - 1].instruction.funcIndex !== instruction.funcIndex);
+                (absIndex === 0 || rows[absIndex - 1].instruction.funcIndex !== instruction.funcIndex);
               return (
                 <li
                   key={instruction.id}
-                  ref={instruction.id === firstHighlightId ? firstHighlightRef : undefined}
                   data-id={instruction.id}
                   data-highlighted={isHighlighted || undefined}
+                  style={{ minHeight: ROW_HEIGHT }}
                 >
                   {startsFunction && (
                     <div className="mt-2 px-3 text-cyan-500">
@@ -350,10 +407,10 @@ export function WasmDisassemblyViewer({ wasmFile = null, rustSource = "" }: Wasm
                 </li>
               );
             })}
-            {rows.length > MAX_VISIBLE_ROWS && (
-              <li className="px-3 py-2 text-slate-500">
-                Showing {MAX_VISIBLE_ROWS} of {rows.length} opcodes — pick a function or filter to narrow.
-              </li>
+
+            {/* Bottom spacer: represents all rows below the virtual window */}
+            {rows.length > 0 && paddingBottom > 0 && (
+              <li aria-hidden="true" style={{ height: paddingBottom }} />
             )}
           </ol>
         </div>
