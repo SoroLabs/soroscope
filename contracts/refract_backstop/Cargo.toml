@@ -1,0 +1,17 @@
+[package]
+name = "refract-backstop"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk.workspace = true
+soroscope-error-codes = { path = "../error_codes" }
+emergency_guard = { path = "../emergency_guard", default-features = false }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+emergency_guard = { path = "../emergency_guard", default-features = false, features = ["contract"] }

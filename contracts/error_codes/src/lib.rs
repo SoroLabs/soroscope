@@ -42,6 +42,17 @@ pub enum ContractError {
     DivisionByZero = 16,
     InvalidInput = 17,
     InvalidAmount = 18,
+
+    // ── Rate-limiting / velocity ──────────────────────────────────────────────
+    /// Payout velocity guard rejected the transaction (epoch cap, min spacing,
+    /// or rolling-window cap exceeded).
+    RateLimited = 19,
+    /// Contract pool has insufficient funds to honour a payout.
+    InsufficientFunds = 20,
+    /// Loss exceeds total receipt supply (backstop contracts).
+    LossExceedsSupply = 21,
+    /// Grant has not been approved for this recipient.
+    GrantNotApproved = 22,
 }
 
 impl ContractError {
@@ -71,6 +82,10 @@ impl ContractError {
             16 => Some(Self::DivisionByZero),
             17 => Some(Self::InvalidInput),
             18 => Some(Self::InvalidAmount),
+            19 => Some(Self::RateLimited),
+            20 => Some(Self::InsufficientFunds),
+            21 => Some(Self::LossExceedsSupply),
+            22 => Some(Self::GrantNotApproved),
             _ => None,
         }
     }
@@ -100,7 +115,11 @@ pub const ERROR_SCHEMA_JSON: &str = r#"{
     { "name": "Overflow", "code": 15, "description": "Arithmetic overflow occurred." },
     { "name": "DivisionByZero", "code": 16, "description": "Attempted division by zero." },
     { "name": "InvalidInput", "code": 17, "description": "Input argument provided is invalid." },
-    { "name": "InvalidAmount", "code": 18, "description": "Amount is invalid, negative, or below the minimum required." }
+    { "name": "InvalidAmount", "code": 18, "description": "Amount is invalid, negative, or below the minimum required." },
+    { "name": "RateLimited", "code": 19, "description": "Payout velocity guard rejected the transaction." },
+    { "name": "InsufficientFunds", "code": 20, "description": "Contract pool has insufficient funds to honour a payout." },
+    { "name": "LossExceedsSupply", "code": 21, "description": "Requested loss exceeds total receipt supply." },
+    { "name": "GrantNotApproved", "code": 22, "description": "Grant has not been approved for this recipient." }
   ]
 }"#;
 
@@ -128,16 +147,20 @@ mod test {
         assert_eq!(ContractError::DivisionByZero.as_u32(), 16);
         assert_eq!(ContractError::InvalidInput.as_u32(), 17);
         assert_eq!(ContractError::InvalidAmount.as_u32(), 18);
+        assert_eq!(ContractError::RateLimited.as_u32(), 19);
+        assert_eq!(ContractError::InsufficientFunds.as_u32(), 20);
+        assert_eq!(ContractError::LossExceedsSupply.as_u32(), 21);
+        assert_eq!(ContractError::GrantNotApproved.as_u32(), 22);
     }
 
     #[test]
     fn test_from_u32_conversion() {
-        for code in 1..=18 {
+        for code in 1..=22 {
             let err = ContractError::from_u32(code).expect("Valid discriminant should convert");
             assert_eq!(err.as_u32(), code);
         }
         assert_eq!(ContractError::from_u32(0), None);
-        assert_eq!(ContractError::from_u32(19), None);
+        assert_eq!(ContractError::from_u32(23), None);
     }
 
     #[test]
@@ -147,5 +170,7 @@ mod test {
         assert!(ERROR_SCHEMA_JSON.contains("InvalidAmount"));
         assert!(ERROR_SCHEMA_JSON.contains("\"code\": 1"));
         assert!(ERROR_SCHEMA_JSON.contains("\"code\": 18"));
+        assert!(ERROR_SCHEMA_JSON.contains("RateLimited"));
+        assert!(ERROR_SCHEMA_JSON.contains("GrantNotApproved"));
     }
 }

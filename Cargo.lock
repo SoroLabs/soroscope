@@ -2692,6 +2692,7 @@ dependencies = [
  "emergency_guard",
  "proptest",
  "soroban-sdk",
+ "twap_oracle",
 ]
 
 [[package]]
@@ -2839,7 +2840,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "multi_yield_vault"
+name = "multi-yield-vault"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
@@ -3172,6 +3173,13 @@ name = "pathdiff"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
+name = "payout_velocity"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
 
 [[package]]
 name = "pem"
@@ -3911,6 +3919,35 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "refract-backstop"
+version = "0.1.0"
+dependencies = [
+ "emergency_guard",
+ "soroban-sdk",
+ "soroscope-error-codes",
+]
+
+[[package]]
+name = "refract-bounty"
+version = "0.1.0"
+dependencies = [
+ "emergency_guard",
+ "payout_velocity",
+ "soroban-sdk",
+ "soroscope-error-codes",
+]
+
+[[package]]
+name = "refract-grants"
+version = "0.1.0"
+dependencies = [
+ "emergency_guard",
+ "payout_velocity",
+ "soroban-sdk",
+ "soroscope-error-codes",
 ]
 
 [[package]]
@@ -4872,6 +4909,7 @@ dependencies = [
  "soroban-sdk",
  "sqlx",
  "stellar-strkey",
+ "stellar-xdr",
  "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
