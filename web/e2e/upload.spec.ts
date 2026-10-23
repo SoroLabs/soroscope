@@ -1,16 +1,16 @@
 import { test, expect } from '@playwright/test';
+import { MINIMAL_WASM, mockBackend } from './support/mockBackend';
 
 test('WASM file upload', async ({ page }) => {
+  await mockBackend(page);
   await page.goto('/');
 
-  // Create a fake WASM file in memory
-  const wasmBuffer = Buffer.from('0061736d01000000', 'hex'); // minimal WASM magic
   await page.setInputFiles('input[type="file"]', {
     name: 'module.wasm',
     mimeType: 'application/wasm',
-    buffer: wasmBuffer,
+    buffer: MINIMAL_WASM,
   });
 
-  // Expect a success message or file name to appear
-  await expect(page.locator('text=module.wasm').first()).toBeEvisible();
+  // The uploaded file becomes the active WASM for the explorer.
+  await expect(page.getByText('module.wasm').first()).toBeVisible();
 });
