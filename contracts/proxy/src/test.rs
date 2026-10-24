@@ -1,7 +1,29 @@
 extern crate std;
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env};
+
+#[test]
+fn test_propose_upgrade_rejects_non_contract_addresses() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let proxy_id = env.register(Proxy, ());
+    let impl_v1_id = env.register(ProxyLogicV1, ());
+    let proxy = ProxyClient::new(&env, &proxy_id);
+    proxy.initialize(&admin, &impl_v1_id);
+
+    let eoa = Address::generate(&env);
+    let undeployed_contract = env
+        .deployer()
+        .with_address(admin, BytesN::from_array(&env, &[7; 32]))
+        .deployed_address();
+
+    assert!(proxy.try_propose_upgrade(&eoa).is_err());
+    assert!(proxy.try_propose_upgrade(&undeployed_contract).is_err());
+    assert_eq!(proxy.get_pending_upgrade(), None);
+}
 
 #[test]
 fn test_proxy_upgrade_with_timelock() {

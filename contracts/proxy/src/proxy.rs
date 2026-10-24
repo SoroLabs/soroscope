@@ -1,9 +1,16 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol, Val,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    IntoVal, Symbol, Val, Vec,
 };
 
 pub const TIMELOCK_DELAY: u64 = 172_800; // 48 hours in seconds (48 * 60 * 60)
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Error {
+    InvalidImplementation = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,6 +26,15 @@ pub enum DataKey {
     Counter,
     Storage(BytesN<32>),
     PendingUpgrade,
+}
+
+fn validate_implementation(env: &Env, implementation: &Address) -> Result<(), Error> {
+    let method = Symbol::new(env, "calculate");
+    let args = Vec::from_array(env, [0i32.into_val(env), 0i32.into_val(env)]);
+    match env.try_invoke_contract::<i32, soroban_sdk::InvokeError>(implementation, &method, args) {
+        Ok(Ok(_)) => Ok(()),
+        _ => Err(Error::InvalidImplementation),
+    }
 }
 
 #[contract]
@@ -53,18 +69,11 @@ impl Proxy {
     pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
         env.storage().persistent().get(&DataKey::PendingUpgrade)
     }
-    pub fn upgrade_to(env: Env, implementation: Address) {
-        let admin = Self::get_admin(env.clone());
-        admin.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::Implementation, &implementation);
-    }
-
     /// Step 1: Propose an upgrade with a 48-hour timelock delay
-    pub fn propose_upgrade(env: Env, new_implementation: Address) {
+    pub fn propose_upgrade(env: Env, new_implementation: Address) -> Result<(), Error> {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
+        validate_implementation(&env, &new_implementation)?;
 
         let eta = env.ledger().timestamp() + TIMELOCK_DELAY;
         let proposal = PendingUpgrade {
@@ -78,10 +87,11 @@ impl Proxy {
 
         env.events()
             .publish((symbol_short!("propose"),), (new_implementation, eta));
+        Ok(())
     }
 
     /// Step 2: Execute the pending upgrade once 48 hours have passed
-    pub fn execute_upgrade(env: Env) {
+    pub fn execute_upgrade(env: Env) -> Result<(), Error> {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
 
@@ -95,14 +105,16 @@ impl Proxy {
             panic!("Timelock delay of 48 hours has not elapsed");
         }
 
+        validate_implementation(&env, &proposal.new_implementation)?;
         env.storage()
-            .persistent()
+            .instance()
             .set(&DataKey::Implementation, &proposal.new_implementation);
 
         env.storage().persistent().remove(&DataKey::PendingUpgrade);
 
         env.events()
             .publish((symbol_short!("upgraded"),), proposal.new_implementation);
+        Ok(())
     }
 
     /// Step 3: Admin can cancel a pending upgrade
@@ -116,8 +128,8 @@ impl Proxy {
     }
 
     /// Legacy upgrade method kept for backward compatibility (delegates to proposal flow)
-    pub fn upgrade_to(env: Env, implementation: Address) {
-        Self::propose_upgrade(env, implementation);
+    pub fn upgrade_to(env: Env, implementation: Address) -> Result<(), Error> {
+        Self::propose_upgrade(env, implementation)
     }
 
     /// Execute the pending upgrade (after timelock) and immediately call a method on the new implementation.
@@ -128,7 +140,7 @@ impl Proxy {
         implementation: Address,
         method: Symbol,
         args: Vec<Val>,
-    ) -> Val {
+    ) -> Result<Val, Error> {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
 
@@ -146,13 +158,18 @@ impl Proxy {
             panic!("Timelock delay of 48 hours has not elapsed");
         }
 
+        validate_implementation(&env, &proposal.new_implementation)?;
         env.storage()
-            .persistent()
+            .instance()
             .set(&DataKey::Implementation, &proposal.new_implementation);
         env.storage().persistent().remove(&DataKey::PendingUpgrade);
 
-        env.events()
-            .publish((symbol_short!("upgraded"),), proposal.new_implementation);
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            proposal.new_implementation.clone(),
+        );
+
+        Ok(env.invoke_contract(&implementation, &method, args))
     }
 
     pub fn delegate_call(env: Env, method: Symbol, args: Vec<Val>) -> Val {
