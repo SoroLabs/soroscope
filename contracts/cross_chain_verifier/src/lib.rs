@@ -4,7 +4,6 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, Vec,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -229,6 +228,9 @@ impl CrossChainVerifier {
         proof_flags: Vec<bool>,
     ) -> bool {
         if Self::is_paused(env.clone()) {
+            return false;
+        }
+        if proof.is_empty() {
             return false;
         }
         Self::verify_merkle_proof(&env, &leaf, &block_height, &proof, &proof_flags)
