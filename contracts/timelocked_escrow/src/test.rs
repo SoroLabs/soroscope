@@ -716,3 +716,77 @@ fn test_timelock_cannot_be_shortened() {
     let (_e, client, _, _, _, _, _) = setup();
     client.extend_timelock(&(LOCK_LEDGERS - 1));
 }
+
+#[test]
+fn test_minimum_lock_period_enforced_at_initialization() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register(TimelockEscrow, ());
+    let client = TimelockEscrowClient::new(&e, &contract_id);
+
+    let depositor = Address::generate(&e);
+    let beneficiary = Address::generate(&e);
+    let token = Address::generate(&e);
+    let vault = Address::generate(&e);
+    let mut guardians = Vec::new(&e);
+    for _ in 0..5 {
+        guardians.push_back(Address::generate(&e));
+    }
+
+    // Attempting lock_ledgers = 99 (less than MIN_LOCK_LEDGERS = 100) must fail
+    let res = client.try_initialize(
+        &depositor,
+        &beneficiary,
+        &token,
+        &guardians,
+        &99u32,
+        &100u32,
+        &vault,
+    );
+    assert_eq!(res, Err(Ok(crate::storage_types::Error::LockPeriodTooShort)));
+}
+
+#[test]
+fn test_create_escrow_validates_minimum_lock_period() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register(TimelockEscrow, ());
+    let client = TimelockEscrowClient::new(&e, &contract_id);
+
+    let depositor = Address::generate(&e);
+    let beneficiary = Address::generate(&e);
+    let token = Address::generate(&e);
+    let vault = Address::generate(&e);
+    let mut guardians = Vec::new(&e);
+    for _ in 0..5 {
+        guardians.push_back(Address::generate(&e));
+    }
+
+    let current = e.ledger().sequence();
+
+    // unlock_ledger = current + 1 (less than current + 100) must fail
+    let res = client.try_create_escrow(
+        &depositor,
+        &beneficiary,
+        &token,
+        &guardians,
+        &(current + 1),
+        &100u32,
+        &vault,
+    );
+    assert_eq!(res, Err(Ok(crate::storage_types::Error::LockPeriodTooShort)));
+
+    // unlock_ledger = current + 100 succeeds
+    let res_ok = client.try_create_escrow(
+        &depositor,
+        &beneficiary,
+        &token,
+        &guardians,
+        &(current + 100),
+        &100u32,
+        &vault,
+    );
+    assert!(res_ok.is_ok());
+    assert_eq!(client.get_config().unlock_ledger, current + 100);
+}
+

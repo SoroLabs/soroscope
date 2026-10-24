@@ -15,6 +15,9 @@ pub struct TimelockEscrow;
 
 #[contractimpl]
 impl TimelockEscrow {
+    /// Minimum lock period in ledgers (≈ 8 minutes on Stellar).
+    pub const MIN_LOCK_LEDGERS: u32 = 100;
+
     /// Initializes the escrow with depositor, beneficiary, token, guardians, and lock duration.
     /// The timelock is computed as current ledger sequence + `lock_ledgers`.
     /// `cancellation_fee_bps` is the fee (in basis points) deducted on cancel, capped at 10000.
@@ -32,9 +35,17 @@ impl TimelockEscrow {
         if has_config(&e) {
             return Err(Error::AlreadyInitialized);
         }
+        if lock_ledgers < Self::MIN_LOCK_LEDGERS {
+            return Err(Error::LockPeriodTooShort);
+        }
         validate_guardians(&guardians)?;
         if cancellation_fee_bps > 10_000 {
             return Err(Error::CancellationFeeTooHigh);
+        }
+
+        let unlock_ledger = e.ledger().sequence().saturating_add(lock_ledgers);
+        if unlock_ledger < e.ledger().sequence().saturating_add(Self::MIN_LOCK_LEDGERS) {
+            return Err(Error::LockPeriodTooShort);
         }
 
         let config = EscrowConfig {
@@ -58,6 +69,34 @@ impl TimelockEscrow {
 
         e.storage().instance().extend_ttl(100, 100);
         Ok(())
+    }
+
+    /// Creates the escrow with an absolute unlock ledger sequence, enforcing the minimum lock period.
+    pub fn create_escrow(
+        e: Env,
+        depositor: Address,
+        beneficiary: Address,
+        token: Address,
+        guardians: Vec<Address>,
+        unlock_ledger: u32,
+        cancellation_fee_bps: u32,
+        protocol_vault: Address,
+    ) -> Result<(), Error> {
+        let current_sequence = e.ledger().sequence();
+        if unlock_ledger < current_sequence.saturating_add(Self::MIN_LOCK_LEDGERS) {
+            return Err(Error::LockPeriodTooShort);
+        }
+        let lock_ledgers = unlock_ledger.saturating_sub(current_sequence);
+        Self::initialize(
+            e,
+            depositor,
+            beneficiary,
+            token,
+            guardians,
+            lock_ledgers,
+            cancellation_fee_bps,
+            protocol_vault,
+        )
     }
 
     /// Depositor transfers tokens into the escrow. Single deposit only.

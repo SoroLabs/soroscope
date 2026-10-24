@@ -283,3 +283,61 @@ fn test_parse_payload_rejects_malformed_and_oversized_input() {
         Err(CrossChainError::MalformedPayload)
     );
 }
+
+#[test]
+fn test_replay_protection_records_and_extends_ttl_to_17280_ledgers() {
+    let env = Env::default();
+    let contract_id = env.register(CrossChainPayloadContract, ());
+    let client = CrossChainPayloadContractClient::new(&env, &contract_id);
+
+    let payload_id = BytesN::from_array(&env, &[77u8; 32]);
+    assert_eq!(client.get_replay_ttl(), 17_280);
+    assert!(!client.is_payload_replayed(&payload_id));
+
+    // First recording succeeds
+    let res = client.try_record_payload(&payload_id);
+    assert!(res.is_ok());
+    assert!(client.is_payload_replayed(&payload_id));
+
+    // Second recording of the same payload_id within the window fails with ReplayAttack
+    let duplicate_res = client.try_record_payload(&payload_id);
+    assert_eq!(duplicate_res, Err(Ok(CrossChainError::ReplayAttack)));
+}
+
+#[test]
+fn test_cross_chain_payload_contract_process_payload() {
+    let env = Env::default();
+    let contract_id = env.register(CrossChainPayloadContract, ());
+    let client = CrossChainPayloadContractClient::new(&env, &contract_id);
+
+    let payload_id = BytesN::from_array(&env, &[88u8; 32]);
+    let nonce = BytesN::from_array(&env, &[89u8; 32]);
+    let payload_hash = BytesN::from_array(&env, &[90u8; 32]);
+
+    let payload = CrossChainPayload {
+        payload_id: payload_id.clone(),
+        source_chain_id: 1,
+        destination_chain_id: 2,
+        sender: Bytes::from_slice(&env, b"sender"),
+        recipient: Bytes::from_slice(&env, b"recipient"),
+        data: Bytes::from_slice(&env, b"data"),
+        operation: Symbol::new(&env, "transfer"),
+        metadata: PayloadMetadata {
+            version: 1,
+            timestamp: 1_700_000_000,
+            sequence: 1,
+            expiration_height: 100_000,
+            nonce,
+        },
+        payload_hash,
+        gas_limit: 500_000,
+    };
+
+    assert!(client.process_payload(&payload));
+    assert!(client.is_payload_replayed(&payload_id));
+
+    // Replay attack rejected
+    let replay_res = client.try_process_payload(&payload);
+    assert_eq!(replay_res, Err(Ok(CrossChainError::ReplayAttack)));
+}
+
