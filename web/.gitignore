@@ -24,3 +24,8 @@ ts-debug.log*
 
 # local env files
 .env*.local
+
+# playwright
+/test-results/
+/playwright-report/
+/blob-report/

@@ -3,10 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "next dev --webpack",
+    "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint . --ext .ts,.tsx,.js,.jsx",
+    "e2e": "playwright test --grep-invert \"accessibility violations\"",
     "test:a11y": "playwright test e2e/accessibility.spec.ts",
     "test": "node --test lib/__tests__/*.test.js components/**/*.test.cjs"
   },

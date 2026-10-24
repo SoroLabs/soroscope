@@ -244,7 +244,7 @@ jobs:
       - name: Install Dependencies
         run: npm ci
       - name: Install Playwright Browsers
-        run: nx Playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium
       - name: Run E.E. Tests
         run: npm run e2e
       - name: Upload Playwright Report
