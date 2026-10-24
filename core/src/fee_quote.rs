@@ -858,6 +858,261 @@ impl FeeQuote {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Fee quote cache with a configurable TTL (issue #1259)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Environment variable that controls how long a fetched fee quote is reused.
+///
+/// A value of `0` disables caching: every lookup goes to the node. This is the
+/// setting to use when a caller must see an inclusion bid move immediately.
+pub const FEE_QUOTE_CACHE_TTL_ENV: &str = "FEE_QUOTE_CACHE_TTL_SECS";
+
+/// Default TTL, in seconds.
+///
+/// Long enough to absorb a burst of simulation requests from the same caller,
+/// short enough that a change in inclusion fees shows up within a couple of
+/// ledgers.
+pub const DEFAULT_FEE_QUOTE_CACHE_TTL_SECS: u64 = 30;
+
+/// Upper bound on cached quotes, so a caller that keys by transaction never
+/// grows the cache without limit. moka evicts the least recently used entries.
+const FEE_QUOTE_CACHE_MAX_ENTRIES: u64 = 4_096;
+
+/// Why a live fee quote could not be fetched.
+///
+/// Every variant invalidates the cached entry for its key. That is deliberate:
+/// a quote fetched before an RPC error describes a node that may have been
+/// answering from a stale view, and after a 429 the next request must go back
+/// to the node instead of being served from memory, or the cache would hide the
+/// very throttling the operator needs to see.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FeeQuoteFetchError {
+    /// The RPC call failed (transport error, node error, malformed response).
+    #[error("fee quote RPC request failed: {0}")]
+    Rpc(String),
+
+    /// The RPC answered HTTP 429.
+    #[error("fee quote RPC request was rate limited (HTTP 429)")]
+    RateLimited,
+}
+
+impl FeeQuoteFetchError {
+    /// True when the failure was a 429 rather than a general RPC error.
+    ///
+    /// Callers that back off do not need to re-match the variant, and callers
+    /// that retry immediately can distinguish the two cases.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, Self::RateLimited)
+    }
+
+    /// Classify a non-success HTTP response from the node.
+    ///
+    /// 429 is separated from every other status because it is the one failure
+    /// the node is deliberately asking us to slow down for: a caller can back
+    /// off and retry instead of treating it as a broken endpoint. `detail` is
+    /// the response body, which usually carries the RPC error message.
+    pub fn from_http_status(status: u16, detail: impl Into<String>) -> Self {
+        if status == 429 {
+            Self::RateLimited
+        } else {
+            Self::Rpc(format!("HTTP {status}: {}", detail.into()))
+        }
+    }
+}
+
+/// A quote plus the instant it entered the cache.
+#[derive(Debug, Clone)]
+struct CachedFeeQuote {
+    quote: FeeQuote,
+    stored_at: std::time::Instant,
+}
+
+/// In-memory cache for fee quotes fetched from a node.
+///
+/// A simulation request needs a fee quote for its footprint, and the same
+/// footprint is commonly quoted several times in a row (a UI re-rendering, a
+/// retry, a batch of near-identical calls). Fetching every one of those from
+/// the RPC costs a round trip per request, so quotes are kept for
+/// [`FeeQuoteCache::ttl`] seconds and reused while they are fresh.
+///
+/// The cache is keyed by an opaque string chosen by the caller. Only the caller
+/// knows which inputs make two quotes interchangeable — network, ledger,
+/// footprint — and putting that decision in the key keeps this type from having
+/// to guess. A quote cached under one key is never served for another.
+///
+/// # Invalidation
+///
+/// * [`FeeQuoteCache::get_or_fetch`] drops the entry for its key on *any* fetch
+///   error, including a 429 — see [`FeeQuoteFetchError`].
+/// * [`FeeQuoteCache::invalidate`] drops one key; [`FeeQuoteCache::invalidate_all`]
+///   drops everything (for example when the node being quoted changes).
+///
+/// # Metrics
+///
+/// Every lookup increments `fee_quote_cache_hits_total` or
+/// `fee_quote_cache_misses_total` on [`crate::metrics::AppMetrics`], so the
+/// hit rate is visible on `/metrics` without any extra instrumentation.
+///
+/// # Example
+///
+/// ```ignore
+/// let cache = FeeQuoteCache::from_env(metrics.clone());
+/// let quote = cache
+///     .get_or_fetch(&key, || fetch_quote_from_rpc(&client, &rpc_url))
+///     .await?;
+/// ```
+pub struct FeeQuoteCache {
+    entries: moka::sync::Cache<String, CachedFeeQuote>,
+    ttl: std::time::Duration,
+    metrics: std::sync::Arc<crate::metrics::AppMetrics>,
+}
+
+impl FeeQuoteCache {
+    /// Build a cache whose TTL comes from [`FEE_QUOTE_CACHE_TTL_ENV`].
+    ///
+    /// An unset, empty or unparseable value falls back to
+    /// [`DEFAULT_FEE_QUOTE_CACHE_TTL_SECS`]; a value of `0` disables caching.
+    pub fn from_env(metrics: std::sync::Arc<crate::metrics::AppMetrics>) -> Self {
+        let ttl = ttl_from_env_value(std::env::var(FEE_QUOTE_CACHE_TTL_ENV).ok().as_deref());
+        Self::new(ttl, metrics)
+    }
+
+    /// Build a cache with an explicit TTL.
+    pub fn new(
+        ttl: std::time::Duration,
+        metrics: std::sync::Arc<crate::metrics::AppMetrics>,
+    ) -> Self {
+        Self {
+            entries: moka::sync::Cache::new(FEE_QUOTE_CACHE_MAX_ENTRIES),
+            ttl,
+            metrics,
+        }
+    }
+
+    /// How long a cached quote stays fresh.
+    pub fn ttl(&self) -> std::time::Duration {
+        self.ttl
+    }
+
+    /// `false` when the configured TTL is zero, in which case every lookup
+    /// misses and nothing is stored.
+    pub fn is_enabled(&self) -> bool {
+        !self.ttl.is_zero()
+    }
+
+    /// Return a fresh cached quote for `key`, counting a hit or a miss.
+    ///
+    /// An entry that has outlived [`FeeQuoteCache::ttl`] is removed and counts
+    /// as a miss, so expiry is enforced on read rather than relying on the
+    /// timer resolution of the underlying map.
+    pub fn get(&self, key: &str) -> Option<FeeQuote> {
+        if !self.is_enabled() {
+            self.metrics.fee_quote_cache_misses_total.inc();
+            return None;
+        }
+        match self.fresh_entry(key) {
+            Some(entry) => {
+                self.metrics.fee_quote_cache_hits_total.inc();
+                Some(entry.quote)
+            }
+            None => {
+                self.metrics.fee_quote_cache_misses_total.inc();
+                None
+            }
+        }
+    }
+
+    /// Return a cached quote for `key`, or fetch one and cache it.
+    ///
+    /// `fetch` is only called on a miss. A failed fetch is never cached: it
+    /// invalidates `key` so the next caller retries against the node. The
+    /// returned quote is the one that was cached, not a second fetch, so a
+    /// caller can report exactly what it saw.
+    pub async fn get_or_fetch<F, Fut>(
+        &self,
+        key: &str,
+        fetch: F,
+    ) -> Result<FeeQuote, FeeQuoteFetchError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<FeeQuote, FeeQuoteFetchError>>,
+    {
+        if let Some(quote) = self.get(key) {
+            return Ok(quote);
+        }
+
+        match fetch().await {
+            Ok(quote) => {
+                self.insert(key, quote);
+                Ok(quote)
+            }
+            Err(error) => {
+                // Any RPC error, 429 included, makes the previous entry
+                // untrustworthy: drop it instead of serving it to the next
+                // caller while the node is unhealthy or throttling.
+                self.invalidate(key);
+                Err(error)
+            }
+        }
+    }
+
+    /// Drop the entry for `key`.
+    pub fn invalidate(&self, key: &str) {
+        self.entries.invalidate(key);
+    }
+
+    /// Drop every cached quote.
+    pub fn invalidate_all(&self) {
+        self.entries.invalidate_all();
+    }
+
+    /// Number of entries currently held, for reporting and tests.
+    pub fn len(&self) -> u64 {
+        self.entries.run_pending_tasks();
+        self.entries.entry_count()
+    }
+
+    /// `true` when the cache holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn fresh_entry(&self, key: &str) -> Option<CachedFeeQuote> {
+        let entry = self.entries.get(key)?;
+        if entry.stored_at.elapsed() < self.ttl {
+            Some(entry)
+        } else {
+            self.entries.invalidate(key);
+            None
+        }
+    }
+
+    fn insert(&self, key: &str, quote: FeeQuote) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.entries.insert(
+            key.to_string(),
+            CachedFeeQuote {
+                quote,
+                stored_at: std::time::Instant::now(),
+            },
+        );
+    }
+}
+
+/// Parse [`FEE_QUOTE_CACHE_TTL_ENV`], falling back to the default on anything
+/// that is not a number of seconds.
+fn ttl_from_env_value(raw: Option<&str>) -> std::time::Duration {
+    let seconds = raw
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FEE_QUOTE_CACHE_TTL_SECS);
+    std::time::Duration::from_secs(seconds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1568,165 +1823,228 @@ mod total_quote_tests {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Fee quote cache (issue #1134)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Env var controlling the fee-quote cache TTL in seconds (default 30).
-pub const FEE_QUOTE_CACHE_TTL_ENV: &str = "FEE_QUOTE_CACHE_TTL_SECS";
-/// Default TTL in seconds when the env var is unset or unparsable.
-pub const DEFAULT_FEE_QUOTE_CACHE_TTL_SECS: u64 = 30;
-
-/// Resolve the configured fee-quote cache TTL.
-pub fn fee_quote_cache_ttl() -> std::time::Duration {
-    std::env::var(FEE_QUOTE_CACHE_TTL_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(DEFAULT_FEE_QUOTE_CACHE_TTL_SECS))
-}
-
-fn fee_quote_cache_hit_counter() -> &'static prometheus::IntCounter {
-    static HITS: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
-    HITS.get_or_init(|| {
-        prometheus::register_int_counter!(
-            "fee_quote_cache_hits_total",
-            "Fee quote cache hits"
-        )
-        .expect("fee_quote_cache_hits_total registration is infallible")
-    })
-}
-
-fn fee_quote_cache_miss_counter() -> &'static prometheus::IntCounter {
-    static MISSES: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
-    MISSES.get_or_init(|| {
-        prometheus::register_int_counter!(
-            "fee_quote_cache_misses_total",
-            "Fee quote cache misses"
-        )
-        .expect("fee_quote_cache_misses_total registration is infallible")
-    })
-}
-
-/// In-memory fee-quote cache with a configurable TTL.
-///
-/// Entries are invalidated immediately on any RPC error or `429` via
-/// [`FeeQuoteCache::invalidate_on_rpc_error`]; callers pass the RPC status
-/// (or `None` for transport errors) and the whole cache is dropped so a
-/// degraded upstream can never serve a stale quote.
-pub struct FeeQuoteCache {
-    entries: std::sync::Mutex<std::collections::HashMap<String, (ResourceFeeQuote, std::time::Instant)>>,
-    ttl: std::time::Duration,
-}
-
-impl FeeQuoteCache {
-    pub fn new() -> Self {
-        Self::with_ttl(fee_quote_cache_ttl())
-    }
-
-    pub fn with_ttl(ttl: std::time::Duration) -> Self {
-        Self {
-            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
-            ttl,
-        }
-    }
-
-    /// Look up a cached quote. Records a Prometheus hit/miss counter.
-    pub fn get(&self, key: &str) -> Option<ResourceFeeQuote> {
-        let mut entries = self.entries.lock().ok()?;
-        match entries.get(key) {
-            Some((quote, inserted)) if inserted.elapsed() < self.ttl => {
-                fee_quote_cache_hit_counter().inc();
-                Some(quote.clone())
-            }
-            Some(_) => {
-                entries.remove(key);
-                fee_quote_cache_miss_counter().inc();
-                None
-            }
-            None => {
-                fee_quote_cache_miss_counter().inc();
-                None
-            }
-        }
-    }
-
-    pub fn insert(&self, key: String, quote: ResourceFeeQuote) {
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.insert(key, (quote, std::time::Instant::now()));
-        }
-    }
-
-    pub fn invalidate(&self) {
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.clear();
-        }
-    }
-
-    /// Returns `true` when the cache was invalidated. Any RPC error
-    /// (`None`), `429`, or `5xx` status drops the whole cache.
-    pub fn invalidate_on_rpc_error(&self, status: Option<u16>) -> bool {
-        let should_invalidate = match status {
-            None => true,
-            Some(s) => s == 429 || s >= 500,
-        };
-        if should_invalidate {
-            self.invalidate();
-        }
-        should_invalidate
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.lock().map(|e| e.len()).unwrap_or(0)
-    }
-}
-
-impl Default for FeeQuoteCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod fee_quote_cache_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    #[test]
-    fn cache_hit_before_ttl_miss_after_expiry() {
-        let cache = FeeQuoteCache::with_ttl(std::time::Duration::from_millis(50));
-        let quote = ResourceFeeQuote::estimate(
-            &FeeQuoteInput::default(),
-            DurabilitySplit::unknown(),
-            SorobanFeeConfig::checked_in(),
-        );
-        assert!(cache.get("k").is_none());
-        cache.insert("k".to_string(), quote);
-        assert!(cache.get("k").is_some());
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        assert!(cache.get("k").is_none());
+    /// A fresh registry per test keeps the counter assertions independent.
+    fn metrics() -> Arc<crate::metrics::AppMetrics> {
+        Arc::new(crate::metrics::AppMetrics::new().expect("metrics"))
+    }
+
+    fn quote(resource_fee: u64) -> FeeQuote {
+        FeeQuote {
+            resource_fee,
+            rent: 0,
+            refundable: 0,
+            inclusion_economy: None,
+            inclusion_standard: None,
+            inclusion_priority: None,
+            total_max: None,
+            inclusion: InclusionStatus::Unavailable,
+        }
+    }
+
+    fn ttl(secs: u64) -> Duration {
+        Duration::from_secs(secs)
     }
 
     #[test]
-    fn cache_invalidates_on_rpc_error_and_429() {
-        let cache = FeeQuoteCache::new();
-        let quote = ResourceFeeQuote::estimate(
-            &FeeQuoteInput::default(),
-            DurabilitySplit::unknown(),
-            SorobanFeeConfig::checked_in(),
+    fn ttl_comes_from_the_environment_with_a_documented_default() {
+        assert_eq!(
+            ttl_from_env_value(None),
+            ttl(DEFAULT_FEE_QUOTE_CACHE_TTL_SECS)
         );
-        cache.insert("k".to_string(), quote);
-        assert!(!cache.invalidate_on_rpc_error(Some(200)));
+        assert_eq!(ttl_from_env_value(Some("")), ttl(30));
+        assert_eq!(ttl_from_env_value(Some("not-a-number")), ttl(30));
+        assert_eq!(ttl_from_env_value(Some(" 45 ")), ttl(45));
+        // Zero is a real value: it disables caching rather than falling back.
+        assert_eq!(ttl_from_env_value(Some("0")), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_quote_is_reused_without_a_second_fetch() {
+        let metrics = metrics();
+        let cache = FeeQuoteCache::new(ttl(30), Arc::clone(&metrics));
+        let fetches = AtomicUsize::new(0);
+        let fetch = || {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            async { Ok(quote(100)) }
+        };
+
+        let first = cache
+            .get_or_fetch("network:testnet", fetch)
+            .await
+            .expect("first");
+        let second = cache
+            .get_or_fetch("network:testnet", || async {
+                panic!("must not fetch a fresh entry")
+            })
+            .await
+            .expect("second");
+
+        assert_eq!(first, second);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1, "second lookup must hit");
         assert_eq!(cache.len(), 1);
-        assert!(cache.invalidate_on_rpc_error(Some(429)));
-        assert_eq!(cache.len(), 0);
-        cache.insert("k".to_string(), cache.get("k").unwrap_or_else(|| {
-            ResourceFeeQuote::estimate(
-                &FeeQuoteInput::default(),
-                DurabilitySplit::unknown(),
-                SorobanFeeConfig::checked_in(),
-            )
-        }));
-        assert!(cache.invalidate_on_rpc_error(None));
-        assert_eq!(cache.len(), 0);
+        assert_eq!(metrics.fee_quote_cache_hits_total.get(), 1);
+        assert_eq!(metrics.fee_quote_cache_misses_total.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn different_keys_are_never_shared() {
+        let cache = FeeQuoteCache::new(ttl(30), metrics());
+        let first = cache
+            .get_or_fetch("a", || async { Ok(quote(1)) })
+            .await
+            .expect("a");
+        let second = cache
+            .get_or_fetch("b", || async { Ok(quote(2)) })
+            .await
+            .expect("b");
+
+        assert_eq!(first.resource_fee, 1);
+        assert_eq!(second.resource_fee, 2);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_expired_quote_is_fetched_again() {
+        let metrics = metrics();
+        let cache = FeeQuoteCache::new(Duration::from_millis(20), Arc::clone(&metrics));
+        let fetches = AtomicUsize::new(0);
+
+        cache
+            .get_or_fetch("ledger:1", || async {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                Ok(quote(1))
+            })
+            .await
+            .expect("first");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        cache
+            .get_or_fetch("ledger:1", || async {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                Ok(quote(2))
+            })
+            .await
+            .expect("second");
+
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            2,
+            "TTL must expire the entry"
+        );
+        assert_eq!(metrics.fee_quote_cache_hits_total.get(), 0);
+        assert_eq!(metrics.fee_quote_cache_misses_total.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_rpc_error_is_not_cached_and_drops_the_stale_entry() {
+        let cache = FeeQuoteCache::new(Duration::from_millis(20), metrics());
+
+        cache
+            .get_or_fetch("key", || async { Ok(quote(1)) })
+            .await
+            .expect("warm the cache");
+        assert_eq!(cache.len(), 1);
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let error = cache
+            .get_or_fetch("key", || async {
+                Err(FeeQuoteFetchError::Rpc("boom".into()))
+            })
+            .await
+            .expect_err("error propagates");
+        assert_eq!(error, FeeQuoteFetchError::Rpc("boom".into()));
+        assert!(!error.is_rate_limited());
+        assert!(cache.is_empty(), "a failed fetch must invalidate the entry");
+
+        // The next caller goes back to the node rather than inheriting the
+        // failure from a poisoned entry.
+        let quote = cache
+            .get_or_fetch("key", || async { Ok(quote(3)) })
+            .await
+            .expect("recover");
+        assert_eq!(quote.resource_fee, 3);
+    }
+
+    #[test]
+    fn http_statuses_are_classified_for_invalidation() {
+        assert_eq!(
+            FeeQuoteFetchError::from_http_status(429, "slow down"),
+            FeeQuoteFetchError::RateLimited
+        );
+        assert!(FeeQuoteFetchError::from_http_status(429, "slow down").is_rate_limited());
+
+        let server_error = FeeQuoteFetchError::from_http_status(503, "unavailable");
+        assert!(!server_error.is_rate_limited());
+        assert_eq!(
+            server_error,
+            FeeQuoteFetchError::Rpc("HTTP 503: unavailable".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_is_reported_as_rate_limited_and_invalidates() {
+        let cache = FeeQuoteCache::new(ttl(30), metrics());
+
+        let error = cache
+            .get_or_fetch("key", || async { Err(FeeQuoteFetchError::RateLimited) })
+            .await
+            .expect_err("429 is an error");
+        assert!(error.is_rate_limited());
+        assert!(cache.is_empty());
+
+        // Nothing was stored, so a retry has to reach the node again.
+        let recovered = cache
+            .get_or_fetch("key", || async { Ok(quote(7)) })
+            .await
+            .expect("retry");
+        assert_eq!(recovered.resource_fee, 7);
+    }
+
+    #[tokio::test]
+    async fn a_zero_ttl_disables_caching() {
+        let metrics = metrics();
+        let cache = FeeQuoteCache::new(Duration::ZERO, Arc::clone(&metrics));
+        let fetches = AtomicUsize::new(0);
+
+        for _ in 0..2 {
+            cache
+                .get_or_fetch("key", || async {
+                    fetches.fetch_add(1, Ordering::SeqCst);
+                    Ok(quote(1))
+                })
+                .await
+                .expect("fetch");
+        }
+
+        assert!(!cache.is_enabled());
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert!(cache.is_empty());
+        assert_eq!(metrics.fee_quote_cache_hits_total.get(), 0);
+        assert_eq!(metrics.fee_quote_cache_misses_total.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalidate_and_invalidate_all_drop_entries() {
+        let cache = FeeQuoteCache::new(ttl(30), metrics());
+        for key in ["a", "b", "c"] {
+            cache
+                .get_or_fetch(key, || async { Ok(quote(1)) })
+                .await
+                .expect("fetch");
+        }
+        assert_eq!(cache.len(), 3);
+
+        cache.invalidate("b");
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get("b").is_none());
+
+        cache.invalidate_all();
+        assert!(cache.is_empty());
     }
 }
