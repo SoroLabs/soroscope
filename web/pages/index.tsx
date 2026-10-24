@@ -19,7 +19,7 @@ import { ResourceHeatmap } from "../components/ResourceHeatmap";
 import { ResultViewerSkeleton } from "../components/ResultViewerSkeleton";
 import { FeeEstimationPreview } from "../components/FeeEstimationPreview";
 import { SyntaxHighlighter } from "../components/SyntaxHighlighter";
-import { WasmDisassemblyViewer } from "../components/WasmDisassemblyViewer";
+import { BatchImportPanel } from "../components/BatchImportPanel";
 import { UploadZone } from "../components/upload-zone";
 import { CopyButton } from "../components/CopyButton";
 import { ContractAddressLink } from "../components/ContractAddressLink";
@@ -134,7 +134,8 @@ export default function Home() {
   }, []);
 
   // Keep the active tab in sync with `?tab=` so the Cmd+K palette (and plain
-  // links) can deep-link straight to a panel.
+  // links) can deep-link straight to a panel, including browser back/forward
+  // navigation (fixes #1291).
   useEffect(() => {
     const requested = router.query.tab;
     const value = Array.isArray(requested) ? requested[0] : requested;
@@ -142,6 +143,21 @@ export default function Home() {
       setTab(value as NavTab);
     }
   }, [router.query.tab]);
+
+  /**
+   * Navigate to a tab and write the new value into the URL query string with a
+   * shallow replace so the browser back/forward buttons can restore it. The
+   * `router.query.tab` effect above then picks up the change and calls
+   * `setTab`, which keeps both sources of truth in sync.
+   */
+  const navigateToTab = useCallback(
+    (nextTab: NavTab) => {
+      void router.replace({ query: { ...router.query, tab: nextTab } }, undefined, {
+        shallow: true,
+      });
+    },
+    [router],
+  );
 
   // Non-navigation commands from the global search overlay.
   useEffect(() => {
@@ -156,7 +172,7 @@ export default function Home() {
 
       setSelectedFunction(match);
       setCurrentResult(null);
-      setTab("explorer");
+      navigateToTab("explorer");
     };
 
     window.addEventListener(SEARCH_COMMAND_EVENT, handleCommand);
@@ -311,7 +327,7 @@ export default function Home() {
         <link rel="icon" href="/favicon.ico" />
       </Head>
       <main className="min-h-screen bg-slate-950 text-slate-100">
-        <HeaderNav tab={tab} setTab={setTab} />
+        <HeaderNav tab={tab} setTab={navigateToTab} />
 
         <section className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8">
           {/* WASM Upload Zone */}
@@ -365,6 +381,10 @@ export default function Home() {
             </section>
           )}
 
+          {/* Batch import panel — only shown on the explorer tab (closes #1294). */}
+          {tab === 'explorer' && (
+            <BatchImportPanel />
+          )}
           {/* Gas Golfing Suggestions Table */}
           {gasGolfingLoading ? (
             <div className="mb-6 rounded-lg border border-slate-800 bg-slate-900 p-4 text-sm text-slate-300">

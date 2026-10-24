@@ -45,6 +45,17 @@ pub enum ContractError {
 
     // ── Staking ──────────────────────────────────────────────────────────────
     WithdrawExceedsSurplus = 19,
+
+    // ── Rate-limiting / velocity ──────────────────────────────────────────────
+    /// Payout velocity guard rejected the transaction (epoch cap, min spacing,
+    /// or rolling-window cap exceeded).
+    RateLimited = 20,
+    /// Contract pool has insufficient funds to honour a payout.
+    InsufficientFunds = 21,
+    /// Loss exceeds total receipt supply (backstop contracts).
+    LossExceedsSupply = 22,
+    /// Grant has not been approved for this recipient.
+    GrantNotApproved = 23,
 }
 
 impl ContractError {
@@ -75,6 +86,10 @@ impl ContractError {
             17 => Some(Self::InvalidInput),
             18 => Some(Self::InvalidAmount),
             19 => Some(Self::WithdrawExceedsSurplus),
+            20 => Some(Self::RateLimited),
+            21 => Some(Self::InsufficientFunds),
+            22 => Some(Self::LossExceedsSupply),
+            23 => Some(Self::GrantNotApproved),
             _ => None,
         }
     }
@@ -105,7 +120,11 @@ pub const ERROR_SCHEMA_JSON: &str = r#"{
     { "name": "DivisionByZero", "code": 16, "description": "Attempted division by zero." },
     { "name": "InvalidInput", "code": 17, "description": "Input argument provided is invalid." },
     { "name": "InvalidAmount", "code": 18, "description": "Amount is invalid, negative, or below the minimum required." },
-    { "name": "WithdrawExceedsSurplus", "code": 19, "description": "Admin withdraw amount exceeds surplus reward tokens." }
+    { "name": "WithdrawExceedsSurplus", "code": 19, "description": "Admin withdraw amount exceeds surplus reward tokens." },
+    { "name": "RateLimited", "code": 20, "description": "Payout velocity guard rejected the transaction." },
+    { "name": "InsufficientFunds", "code": 21, "description": "Contract pool has insufficient funds to honour a payout." },
+    { "name": "LossExceedsSupply", "code": 22, "description": "Requested loss exceeds total receipt supply." },
+    { "name": "GrantNotApproved", "code": 23, "description": "Grant has not been approved for this recipient." }
   ]
 }"#;
 
@@ -134,16 +153,20 @@ mod test {
         assert_eq!(ContractError::InvalidInput.as_u32(), 17);
         assert_eq!(ContractError::InvalidAmount.as_u32(), 18);
         assert_eq!(ContractError::WithdrawExceedsSurplus.as_u32(), 19);
+        assert_eq!(ContractError::RateLimited.as_u32(), 20);
+        assert_eq!(ContractError::InsufficientFunds.as_u32(), 21);
+        assert_eq!(ContractError::LossExceedsSupply.as_u32(), 22);
+        assert_eq!(ContractError::GrantNotApproved.as_u32(), 23);
     }
 
     #[test]
     fn test_from_u32_conversion() {
-        for code in 1..=19 {
+        for code in 1..=23 {
             let err = ContractError::from_u32(code).expect("Valid discriminant should convert");
             assert_eq!(err.as_u32(), code);
         }
         assert_eq!(ContractError::from_u32(0), None);
-        assert_eq!(ContractError::from_u32(20), None);
+        assert_eq!(ContractError::from_u32(24), None);
     }
 
     #[test]
@@ -155,5 +178,9 @@ mod test {
         assert!(ERROR_SCHEMA_JSON.contains("\"code\": 1"));
         assert!(ERROR_SCHEMA_JSON.contains("\"code\": 18"));
         assert!(ERROR_SCHEMA_JSON.contains("\"code\": 19"));
+        assert!(ERROR_SCHEMA_JSON.contains("RateLimited"));
+        assert!(ERROR_SCHEMA_JSON.contains("\"code\": 20"));
+        assert!(ERROR_SCHEMA_JSON.contains("GrantNotApproved"));
+        assert!(ERROR_SCHEMA_JSON.contains("\"code\": 23"));
     }
 }
