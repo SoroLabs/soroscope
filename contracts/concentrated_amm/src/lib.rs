@@ -18,11 +18,30 @@ pub enum Error {
     SlippageExceeded = 5,
     InvalidFee = 6,
     MathError = 7,
+    LiquidityUnderflow = 8,
 }
 
 impl From<MathError> for Error {
     fn from(_: MathError) -> Self {
         Error::MathError
+    }
+}
+
+/// Apply a tick's signed liquidity delta using checked arithmetic.
+fn cross_liquidity(liquidity: u128, liquidity_net: i128, zero_for_one: bool) -> Result<u128, Error> {
+    let net = if zero_for_one {
+        liquidity_net.checked_neg().ok_or(Error::MathError)?
+    } else {
+        liquidity_net
+    };
+
+    if net < 0 {
+        let decrease = net.checked_abs().ok_or(Error::MathError)? as u128;
+        liquidity
+            .checked_sub(decrease)
+            .ok_or(Error::LiquidityUnderflow)
+    } else {
+        liquidity.checked_add(net as u128).ok_or(Error::MathError)
     }
 }
 
@@ -563,16 +582,11 @@ impl ConcentratedAmm {
                     tick_info.fee_growth_outside_1 =
                         fg1.wrapping_sub(tick_info.fee_growth_outside_1);
                     e.storage().persistent().set(&tick_key, &tick_info);
-                    let net = if zero_for_one {
-                        -tick_info.liquidity_net
-                    } else {
-                        tick_info.liquidity_net
-                    };
-                    if net < 0 {
-                        liquidity = liquidity.saturating_sub((-net) as u128);
-                    } else {
-                        liquidity = liquidity.saturating_add(net as u128);
-                    }
+                    liquidity = cross_liquidity(
+                        liquidity,
+                        tick_info.liquidity_net,
+                        zero_for_one,
+                    )?;
                 }
                 current_tick = if zero_for_one {
                     next_tick - 1
@@ -668,16 +682,7 @@ impl ConcentratedAmm {
                     .persistent()
                     .set(&DataKey::Tick(next_tick), &tick_info);
 
-                let net = if zero_for_one {
-                    -tick_info.liquidity_net
-                } else {
-                    tick_info.liquidity_net
-                };
-                if net < 0 {
-                    liquidity = liquidity.saturating_sub((-net) as u128);
-                } else {
-                    liquidity = liquidity.saturating_add(net as u128);
-                }
+                liquidity = cross_liquidity(liquidity, tick_info.liquidity_net, zero_for_one)?;
             } else {
                 current_sqrt_price = get_next_sqrt_price_from_input(
                     current_sqrt_price,

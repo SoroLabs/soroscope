@@ -8,6 +8,8 @@ const DEFAULT_TWAP_WINDOW_SECONDS: u64 = 3_600;
 const STDDEV_MULTIPLIER: i128 = 2;
 /// Secondary cap: reject prices that deviate more than 5% from the median.
 const MAX_DEVIATION_PERCENT: i128 = 5;
+/// Maximum number of price observations retained for any asset (about two hours).
+const MAX_TWAP_OBSERVATIONS: u32 = 1_440;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -45,11 +47,22 @@ pub struct TwapSample {
     pub timestamp: u64,
 }
 
+/// Price observation indexed by the ledger in which it was recorded.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LedgerObservation {
+    pub price: i128,
+    pub ledger: u32,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     TwapWindowSeconds,
     TwapSamples,
+    AssetTwapNextIndex(Address),
+    AssetTwapLen(Address),
+    AssetTwapObservation(Address, u32),
 }
 
 /// Oracle interface that returns only a price (legacy / simple sources).
@@ -166,7 +179,7 @@ impl OracleAggregator {
     ///
     /// Each sample is weighted by the seconds it remained in effect, including
     /// the open interval from the latest sample until the current ledger time.
-    pub fn get_twap(env: Env) -> i128 {
+    pub fn get_rolling_twap(env: Env) -> i128 {
         let now = env.ledger().timestamp();
         let window: u64 = env
             .storage()
@@ -180,6 +193,88 @@ impl OracleAggregator {
             .unwrap_or(Vec::new(&env));
 
         Self::compute_twap(&samples, now, window)
+    }
+
+    /// Records an asset price for ledger-window TWAP queries.
+    /// A second update in the same ledger replaces that ledger's observation.
+    pub fn record_asset_price(env: Env, asset: Address, price: i128) -> Result<(), Error> {
+        if price <= 0 {
+            return Err(Error::InvalidPrice);
+        }
+        let ledger = env.ledger().sequence();
+        let len: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetTwapLen(asset.clone()))
+            .unwrap_or(0);
+        let next: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetTwapNextIndex(asset.clone()))
+            .unwrap_or(0);
+
+        if len > 0 {
+            let last_idx = (next + MAX_TWAP_OBSERVATIONS - 1) % MAX_TWAP_OBSERVATIONS;
+            let key = DataKey::AssetTwapObservation(asset.clone(), last_idx);
+            let last: LedgerObservation = env.storage().persistent().get(&key).unwrap();
+            if last.ledger == ledger {
+                env.storage()
+                    .persistent()
+                    .set(&key, &LedgerObservation { price, ledger });
+                return Ok(());
+            }
+        }
+
+        env.storage().persistent().set(
+            &DataKey::AssetTwapObservation(asset.clone(), next),
+            &LedgerObservation { price, ledger },
+        );
+        env.storage().persistent().set(
+            &DataKey::AssetTwapNextIndex(asset.clone()),
+            &((next + 1) % MAX_TWAP_OBSERVATIONS),
+        );
+        env.storage().persistent().set(
+            &DataKey::AssetTwapLen(asset),
+            &core::cmp::min(len + 1, MAX_TWAP_OBSERVATIONS),
+        );
+        Ok(())
+    }
+
+    /// Returns the time-weighted average asset price over the last N ledgers.
+    /// The observation in effect at the window boundary is included.
+    pub fn get_twap(env: Env, asset: Address, window_ledgers: u32) -> i128 {
+        let len: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetTwapLen(asset.clone()))
+            .unwrap_or(0);
+        if len == 0 || window_ledgers == 0 {
+            return 0;
+        }
+        let next: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetTwapNextIndex(asset.clone()))
+            .unwrap_or(0);
+        let oldest = (next + MAX_TWAP_OBSERVATIONS - len) % MAX_TWAP_OBSERVATIONS;
+        let mut samples = Vec::new(&env);
+        for offset in 0..len {
+            let idx = (oldest + offset) % MAX_TWAP_OBSERVATIONS;
+            let observation: LedgerObservation = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AssetTwapObservation(asset.clone(), idx))
+                .unwrap();
+            samples.push_back(TwapSample {
+                price: observation.price,
+                timestamp: observation.ledger as u64,
+            });
+        }
+        Self::compute_twap(
+            &samples,
+            env.ledger().sequence() as u64,
+            window_ledgers as u64,
+        )
     }
 
     fn record_sample(env: &Env, price: i128) {

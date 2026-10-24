@@ -405,7 +405,7 @@ fn test_twap_equals_snapshot_when_no_time_elapsed() {
     let aggregator_id = env.register(OracleAggregator, ());
     let client = OracleAggregatorClient::new(&env, &aggregator_id);
 
-    assert_eq!(client.get_twap(), 0);
+    assert_eq!(client.get_rolling_twap(), 0);
     assert_eq!(
         client.aggregate_price(
             &Vec::from_array(&env, [fresh_100, fresh_101, fresh_99]),
@@ -414,7 +414,7 @@ fn test_twap_equals_snapshot_when_no_time_elapsed() {
         100
     );
     // Single observation with dt = 0 falls back to the latest snapshot.
-    assert_eq!(client.get_twap(), 100);
+    assert_eq!(client.get_rolling_twap(), 100);
 }
 
 #[test]
@@ -439,11 +439,11 @@ fn test_rolling_twap_weights_prices_by_elapsed_time() {
 
     // Immediately after the 200 snapshot the 200 price has zero duration, so
     // TWAP is still 100 (100 * 100s / 100s).
-    assert_eq!(client.get_twap(), 100);
+    assert_eq!(client.get_rolling_twap(), 100);
 
     // Hold 200 for another 200 seconds: TWAP = (100*100 + 200*200) / 300 = 166.
     env.ledger().with_mut(|li| li.timestamp = 1_300);
-    assert_eq!(client.get_twap(), 166);
+    assert_eq!(client.get_rolling_twap(), 166);
 }
 
 #[test]
@@ -469,12 +469,12 @@ fn test_twap_window_drops_expired_samples() {
     // Window start = 1250 - 200 = 1050. The 50-price sample at t=1000 is kept
     // as the pre-window boundary price and weighted only from 1050 → 1250
     // (200s), then 150 is open until now (dt = 0) → TWAP = 50.
-    assert_eq!(client.get_twap(), 50);
+    assert_eq!(client.get_rolling_twap(), 50);
 
     env.ledger().with_mut(|li| li.timestamp = 1_500);
     // Window start = 1300. The 50-price interval (1000→1250) no longer
     // overlaps the window, so only 150 (1300→1500) is weighted → TWAP = 150.
-    assert_eq!(client.get_twap(), 150);
+    assert_eq!(client.get_rolling_twap(), 150);
 }
 
 #[test]
