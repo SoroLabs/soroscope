@@ -79,14 +79,16 @@ pub enum DataKey {
     VolatilityConfig,
     Position(Address),
     StableBalance(Address),
+    /// Stability fee rate in basis points per 1,000 ledgers (bpm).
+    /// E.g. 5 means 0.05 % per 1,000 ledgers.  Zero means no stability fee.
+    StabilityFeeRate,
 }
 
+#[soroban_sdk::contractclient(name = "PriceOracleClient")]
 pub trait PriceOracle {
     fn latest_price(e: Env) -> i128;
     fn volatility_bps(e: Env) -> i128;
 }
-
-soroban_sdk::contractclient!(name = "PriceOracleClient", trait = PriceOracle);
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,6 +97,17 @@ pub struct VolatilityConfig {
     pub high_volatility_threshold_bps: i128,
     pub base_collateral_floor_bps: i128,
     pub max_collateral_floor_bps: i128,
+}
+
+/// Parameters passed to `initialize`.  Grouping avoids the 10-argument limit
+/// imposed by the Soroban contract ABI.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitParams {
+    pub min_collateral_ratio_bps: i128,
+    pub liquidation_incentive_bps: i128,
+    pub interest_rate_model: InterestRateModel,
+    pub volatility_config: VolatilityConfig,
 }
 
 fn checked_add(a: i128, b: i128) -> Result<i128, Error> {
@@ -134,6 +147,7 @@ fn read_interest_model(env: &Env) -> Result<InterestRateModel, Error> {
 }
 
 fn read_position(env: &Env, user: Address) -> Position {
+    env.storage().instance().extend_ttl(5_000_000, 5_000_000);
     env.storage()
         .persistent()
         .get(&DataKey::Position(user))
@@ -147,7 +161,7 @@ fn read_position(env: &Env, user: Address) -> Position {
 fn write_position(env: &Env, user: Address, position: &Position) {
     let key = DataKey::Position(user);
     env.storage().persistent().set(&key, position);
-    env.storage().persistent().extend_ttl(&key, 100, 100);
+    env.storage().persistent().extend_ttl(&key, 5_000_000, 5_000_000);
 }
 
 fn read_stable_balance(env: &Env, user: Address) -> i128 {
@@ -160,7 +174,7 @@ fn read_stable_balance(env: &Env, user: Address) -> i128 {
 fn write_stable_balance(env: &Env, user: Address, amount: i128) {
     let key = DataKey::StableBalance(user);
     env.storage().persistent().set(&key, &amount);
-    env.storage().persistent().extend_ttl(&key, 100, 100);
+    env.storage().persistent().extend_ttl(&key, 5_000_000, 5_000_000);
 }
 
 fn oracle_price(env: &Env) -> Result<i128, Error> {
@@ -253,6 +267,9 @@ fn borrow_rate_bps(model: &InterestRateModel, utilization: i128) -> Result<i128,
 }
 
 fn accrue_position(env: &Env, user: Address) -> Result<Position, Error> {
+    // Keep the contract instance alive for a generous period on every access.
+    env.storage().instance().extend_ttl(5_000_000, 5_000_000);
+
     let mut position = read_position(env, user.clone());
     let now = env.ledger().sequence();
     if position.debt_amount <= 0 || position.last_accrual_ledger >= now {
@@ -291,9 +308,107 @@ fn accrue_position(env: &Env, user: Address) -> Result<Position, Error> {
             .set(&DataKey::TotalStableSupply, &new_supply);
     }
 
+    // Apply stability fee on top of (already-updated) debt.
+    position = apply_stability_fee(env, position)?;
+
     position.last_accrual_ledger = now;
     write_position(env, user, &position);
     Ok(position)
+}
+
+/// Reads the configured stability fee rate (bpm).  Returns 0 if not set.
+fn read_stability_fee_rate(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::StabilityFeeRate)
+        .unwrap_or(0)
+}
+
+/// Computes the stability fee that would accrue on `position` up to `now`
+/// without mutating any state.  Returns the fee amount (may be 0).
+fn compute_stability_fee(env: &Env, position: &Position) -> Result<i128, Error> {
+    let rate_bpm = read_stability_fee_rate(env);
+    if rate_bpm <= 0 || position.debt_amount <= 0 {
+        return Ok(0);
+    }
+    let now = env.ledger().sequence();
+    if position.last_accrual_ledger >= now {
+        return Ok(0);
+    }
+    let elapsed = (now - position.last_accrual_ledger) as i128;
+    // fee = debt * rate_bpm * elapsed / (BPS * 1_000)
+    // Using integer arithmetic; division last to preserve precision.
+    position
+        .debt_amount
+        .checked_mul(rate_bpm)
+        .and_then(|v| v.checked_mul(elapsed))
+        .map(|v| v / BPS / 1_000)
+        .ok_or(Error::MathOverflow)
+}
+
+/// Accrues the stability fee onto `position.debt_amount` and updates global
+/// TotalDebt / TotalStableSupply.  Returns the updated position (not written
+/// to storage — callers are responsible for persisting it).
+fn apply_stability_fee(env: &Env, mut position: Position) -> Result<Position, Error> {
+    let fee = compute_stability_fee(env, &position)?;
+    if fee > 0 {
+        position.debt_amount = checked_add(position.debt_amount, fee)?;
+        let new_total_debt = checked_add(total_debt(env), fee)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalDebt, &new_total_debt);
+        let new_supply: i128 = checked_add(
+            env.storage()
+                .instance()
+                .get(&DataKey::TotalStableSupply)
+                .unwrap_or(0),
+            fee,
+        )?;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalStableSupply, &new_supply);
+    }
+    Ok(position)
+}
+
+fn quote_liquidation_for_position(
+    env: &Env,
+    position: &Position,
+    requested_repay_amount: i128,
+) -> Result<LiquidationQuote, Error> {
+    if requested_repay_amount <= 0 {
+        return Err(Error::InvalidAmount);
+    }
+
+    let params = read_risk_params(env)?;
+    let price = oracle_price(env)?;
+    let ratio = collateral_ratio_bps(price, position.collateral_amount, position.debt_amount)?;
+    if ratio >= params.min_collateral_ratio_bps {
+        return Err(Error::PositionHealthy);
+    }
+
+    let collateral_value_total = collateral_value(price, position.collateral_amount)?;
+    let max_coverable_repay =
+        checked_mul(collateral_value_total, BPS)? / (BPS + params.liquidation_incentive_bps);
+    let repay_amount = requested_repay_amount
+        .min(position.debt_amount)
+        .min(max_coverable_repay);
+    if repay_amount <= 0 {
+        return Err(Error::LiquidationUnavailable);
+    }
+
+    let seize_value = checked_mul(repay_amount, BPS + params.liquidation_incentive_bps)? / BPS;
+    let mut collateral_to_seize = checked_mul(seize_value, PRICE_SCALE)? / price;
+    if collateral_to_seize > position.collateral_amount {
+        collateral_to_seize = position.collateral_amount;
+    }
+    let incentive_amount = checked_sub(seize_value, repay_amount)?;
+
+    Ok(LiquidationQuote {
+        repay_amount,
+        collateral_to_seize,
+        incentive_amount,
+    })
 }
 
 fn dynamic_collateral_floor(env: &Env) -> Result<i128, Error> {
@@ -350,29 +465,24 @@ impl CdpContract {
         admin: Address,
         collateral_token: Address,
         oracle: Address,
-        min_collateral_ratio_bps: i128,
-        liquidation_incentive_bps: i128,
-        base_rate_bps: i128,
-        slope1_bps: i128,
-        slope2_bps: i128,
-        optimal_utilization_bps: i128,
-        low_volatility_threshold_bps: i128,
-        high_volatility_threshold_bps: i128,
-        base_collateral_floor_bps: i128,
-        max_collateral_floor_bps: i128,
+        params: InitParams,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
+        let min_collateral_ratio_bps = params.min_collateral_ratio_bps;
+        let liquidation_incentive_bps = params.liquidation_incentive_bps;
+        let model = &params.interest_rate_model;
+        let vc = &params.volatility_config;
         if min_collateral_ratio_bps <= BPS
             || liquidation_incentive_bps < 0
-            || optimal_utilization_bps <= 0
-            || optimal_utilization_bps >= BPS
-            || low_volatility_threshold_bps < 0
-            || high_volatility_threshold_bps <= low_volatility_threshold_bps
-            || base_collateral_floor_bps < BPS
-            || max_collateral_floor_bps < base_collateral_floor_bps
-            || max_collateral_floor_bps > BPS * 3
+            || model.optimal_utilization_bps <= 0
+            || model.optimal_utilization_bps >= BPS
+            || vc.low_volatility_threshold_bps < 0
+            || vc.high_volatility_threshold_bps <= vc.low_volatility_threshold_bps
+            || vc.base_collateral_floor_bps < BPS
+            || vc.max_collateral_floor_bps < vc.base_collateral_floor_bps
+            || vc.max_collateral_floor_bps > BPS * 3
         {
             return Err(Error::InvalidConfig);
         }
@@ -387,23 +497,12 @@ impl CdpContract {
             &RiskParams {
                 min_collateral_ratio_bps,
                 liquidation_incentive_bps,
-                volatility_config: VolatilityConfig {
-                    low_volatility_threshold_bps,
-                    high_volatility_threshold_bps,
-                    base_collateral_floor_bps,
-                    max_collateral_floor_bps,
-                },
+                volatility_config: params.volatility_config,
             },
         );
-        env.storage().instance().set(
-            &DataKey::InterestRateModel,
-            &InterestRateModel {
-                base_rate_bps,
-                slope1_bps,
-                slope2_bps,
-                optimal_utilization_bps,
-            },
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::InterestRateModel, &params.interest_rate_model);
         env.storage()
             .instance()
             .set(&DataKey::TotalCollateral, &0i128);
@@ -422,6 +521,33 @@ impl CdpContract {
         require_admin(&env)?;
         env.storage().instance().set(&DataKey::Oracle, &oracle);
         Ok(())
+    }
+
+    /// Admin: set the per-position stability fee rate in basis points per 1,000 ledgers.
+    /// Pass 0 to disable the stability fee.
+    pub fn set_stability_fee_rate(env: Env, rate_bpm: i128) -> Result<(), Error> {
+        require_admin(&env)?;
+        if rate_bpm < 0 {
+            return Err(Error::InvalidConfig);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::StabilityFeeRate, &rate_bpm);
+        Ok(())
+    }
+
+    /// Explicitly accrue outstanding stability fees (and borrow-rate interest) on
+    /// a CDP position.  Can be called by anyone; useful for keepers.
+    pub fn accrue_fees(env: Env, cdp_id: Address) -> Result<Position, Error> {
+        accrue_position(&env, cdp_id)
+    }
+
+    /// Read-only preview of the stability fee that would accrue on `cdp_id`
+    /// up to the current ledger without modifying state.  Returns 0 if the
+    /// position has no debt or the fee rate is zero.
+    pub fn stability_fee_preview(env: Env, cdp_id: Address) -> i128 {
+        let position = read_position(&env, cdp_id);
+        compute_stability_fee(&env, &position).expect("stability fee preview calculation overflow")
     }
 
     pub fn get_position(env: Env, user: Address) -> Position {
@@ -625,40 +751,8 @@ impl CdpContract {
         borrower: Address,
         requested_repay_amount: i128,
     ) -> Result<LiquidationQuote, Error> {
-        if requested_repay_amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
         let position = accrue_position(&env, borrower)?;
-        let params = read_risk_params(&env)?;
-        let price = oracle_price(&env)?;
-        let ratio = collateral_ratio_bps(price, position.collateral_amount, position.debt_amount)?;
-        if ratio >= params.min_collateral_ratio_bps {
-            return Err(Error::PositionHealthy);
-        }
-
-        let collateral_value_total = collateral_value(price, position.collateral_amount)?;
-        let max_coverable_repay =
-            checked_mul(collateral_value_total, BPS)? / (BPS + params.liquidation_incentive_bps);
-        let repay_amount = requested_repay_amount
-            .min(position.debt_amount)
-            .min(max_coverable_repay);
-        if repay_amount <= 0 {
-            return Err(Error::LiquidationUnavailable);
-        }
-
-        let seize_value = checked_mul(repay_amount, BPS + params.liquidation_incentive_bps)? / BPS;
-        let mut collateral_to_seize = checked_mul(seize_value, PRICE_SCALE)? / price;
-        if collateral_to_seize > position.collateral_amount {
-            collateral_to_seize = position.collateral_amount;
-        }
-        let incentive_amount = checked_sub(seize_value, repay_amount)?;
-
-        Ok(LiquidationQuote {
-            repay_amount,
-            collateral_to_seize,
-            incentive_amount,
-        })
+        quote_liquidation_for_position(&env, &position, requested_repay_amount)
     }
 
     pub fn liquidate(
@@ -668,7 +762,8 @@ impl CdpContract {
         requested_repay_amount: i128,
     ) -> Result<LiquidationQuote, Error> {
         liquidator.require_auth();
-        let quote = Self::quote_liquidation(env.clone(), borrower.clone(), requested_repay_amount)?;
+        let mut position = accrue_position(&env, borrower.clone())?;
+        let quote = quote_liquidation_for_position(&env, &position, requested_repay_amount)?;
         let liquidator_balance = read_stable_balance(&env, liquidator.clone());
         if liquidator_balance < quote.repay_amount {
             return Err(Error::InsufficientStableBalance);
@@ -679,7 +774,6 @@ impl CdpContract {
             .instance()
             .get(&DataKey::CollateralToken)
             .ok_or(Error::NotInitialized)?;
-        let mut position = read_position(&env, borrower.clone());
         position.debt_amount = checked_sub(position.debt_amount, quote.repay_amount)?;
         position.collateral_amount =
             checked_sub(position.collateral_amount, quote.collateral_to_seize)?;
