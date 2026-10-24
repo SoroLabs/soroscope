@@ -7,76 +7,60 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-// ── Inline fee estimation logic (mirrors src/lib/stellarRpc.ts) ──────────────
 
-const FeeBumpLevel = Object.freeze({
-  LOW: 'low',
-  MEDIUM: 'medium',
-  HIGH: 'high',
+// Exercise the production helper instead of a separate copy of its calculations.
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const ts = require('typescript');
+const sourcePath = path.join(__dirname, '../lib/stellarRpc.ts');
+const { outputText } = ts.transpileModule(fs.readFileSync(sourcePath, 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
 });
+const production = { exports: {} };
+vm.runInNewContext(outputText, {
+  exports: production.exports,
+  AbortController,
+  setTimeout,
+  clearTimeout,
+  fetch: (...args) => globalThis.fetch(...args),
+}, { filename: sourcePath });
+const { estimateFees, fetchFeeStats } = production.exports;
 
-const BUMP_CONFIG = Object.freeze({
-  [FeeBumpLevel.LOW]: {
-    label: 'Low (Min)',
-    multiplier: 1.0,
-    description: 'Minimum fee, slower confirmation',
-  },
-  [FeeBumpLevel.MEDIUM]: {
-    label: 'Medium',
-    multiplier: 1.5,
-    description: 'Balanced speed and cost',
-  },
-  [FeeBumpLevel.HIGH]: {
-    label: 'High',
-    multiplier: 2.0,
-    description: 'Priority processing',
-  },
-});
-
-function stroopsToXlm(stroops) {
-  const xlm = stroops / 10_000_000;
-  if (xlm === 0) return '0';
-  if (xlm < 0.000001) return xlm.toFixed(9);
-  if (xlm < 0.001) return xlm.toFixed(7);
-  return xlm.toFixed(5);
-}
-
-function estimateFees(resourceCostStroops, feeStats) {
-  const baseClassicFee = (feeStats && feeStats.min_ledger_fee) || 100;
-  const surge = (feeStats && feeStats.surge_multiplier) || 1;
-  const sorobanRate = (feeStats && feeStats.soroban_fee_rate) || 1;
-
-  const minResourceFeeStroops = resourceCostStroops;
-  const classicFeeStroops = baseClassicFee;
-  const baseTotal = minResourceFeeStroops + classicFeeStroops;
-
-  const feeBumps = Object.values(BUMP_CONFIG).map((cfg) => {
-    const feeStroops = Math.ceil(baseTotal * cfg.multiplier * sorobanRate);
-    return {
-      label: cfg.label,
-      multiplier: cfg.multiplier,
-      feeStroops,
-      feeXlm: stroopsToXlm(feeStroops),
-      description: cfg.description,
-    };
+for (const baseFee of [0, undefined]) {
+  test(`FeeEstimationPreview: defaults ${baseFee} base fee to 100 stroops`, () => {
+    const estimate = estimateFees(500_000, {
+      min_ledger_fee: baseFee, surge_multiplier: 1, soroban_fee_rate: 1,
+    });
+    assert.equal(estimate.classicFeeStroops, 100);
+    assert.equal(estimate.totalFeeStroops, 500_100);
+    assert.equal(estimate.totalFeeXlm, '0.05001');
+    assert.equal(estimate.surgeMultiplier, 1);
+    assert.deepEqual(Array.from(estimate.feeBumps, bump => bump.feeStroops), [500_100, 750_150, 1_000_200]);
+    for (const bump of estimate.feeBumps) {
+      assert.ok(Number.isFinite(bump.feeStroops));
+      assert.ok(Number.isFinite(Number(bump.feeXlm)));
+    }
   });
-
-  return {
-    minResourceFeeStroops,
-    classicFeeStroops,
-    totalFeeStroops: baseTotal,
-    totalFeeXlm: stroopsToXlm(baseTotal),
-    feeBumps,
-    networkFees: {
-      low: feeBumps[0].feeStroops,
-      medium: feeBumps[1].feeStroops,
-      high: feeBumps[2].feeStroops,
-    },
-    surgeMultiplier: surge,
-  };
 }
 
-// ── FeeEstimationPreview state machine ────────────────────────────────────────
+test('FeeEstimationPreview: preserves a nonzero network base fee', () => {
+  const estimate = estimateFees(500_000, { min_ledger_fee: 250, surge_multiplier: 2, soroban_fee_rate: 1 });
+  assert.equal(estimate.classicFeeStroops, 250);
+  assert.equal(estimate.totalFeeStroops, 500_250);
+  assert.equal(estimate.surgeMultiplier, 2);
+});
+
+test('FeeEstimationPreview: zero RPC ledger fee uses the fallback in the estimate', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => ({
+    ok: true,
+    json: async () => ({ result: { last_ledger_base_fee: '0', surge_multiplier: '1', soroban_fee_rate: '1' } }),
+  }));
+  const stats = await fetchFeeStats('https://rpc.example');
+  const estimate = estimateFees(500_000, stats);
+  assert.equal(estimate.classicFeeStroops, 100);
+  assert.equal(estimate.totalFeeXlm, '0.05001');
+});
 
 function createFeeEstimationState(options = {}) {
   const {
