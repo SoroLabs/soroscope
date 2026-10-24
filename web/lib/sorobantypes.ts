@@ -62,6 +62,8 @@ export interface InvocationResult {
   callGraph?: CallGraph;
   callGraphMermaid?: string;
   stateSnapshot?: SimulationStateSnapshot;
+  /** Server-side id of the persisted simulation; enables share links (#1286). */
+  simulationId?: string;
   timestamp: number;
   success: boolean;
 }
@@ -184,6 +186,8 @@ export interface ResourceReport extends SorobanResources {
   call_graph_mermaid: string | null;
   state_snapshot: SimulationStateSnapshot | null;
   protocol_version: number;
+  /** Id of the persisted simulation, when the server stores results (#1286). */
+  simulation_id?: string | null;
 }
 
 export interface DurabilityByteCounts {
