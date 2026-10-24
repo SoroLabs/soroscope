@@ -169,12 +169,45 @@ impl Proxy {
             proposal.new_implementation.clone(),
         );
 
-        Ok(env.invoke_contract(&implementation, &method, args))
+        Ok(Self::invoke_implementation(&env, &implementation, &method, args, None))
     }
 
-    pub fn delegate_call(env: Env, method: Symbol, args: Vec<Val>) -> Val {
+    /// Call `method` on the current implementation on behalf of `caller`.
+    ///
+    /// Soroban always reports the immediate calling contract as the invoker of a
+    /// cross-contract call, so the implementation cannot recover the original
+    /// user from the host. To keep authorization checks meaningful, the proxy
+    /// requires the caller's authorization and forwards it to the implementation
+    /// as the **first** argument of the call. Implementation entry points invoked
+    /// through the proxy must therefore accept `caller: Address` as their first
+    /// parameter and call `caller.require_auth()` themselves.
+    pub fn delegate_call(env: Env, caller: Address, method: Symbol, args: Vec<Val>) -> Val {
+        caller.require_auth();
         let implementation = Self::get_implementation(env.clone());
-        env.invoke_contract(&implementation, &method, args)
+        Self::invoke_implementation(&env, &implementation, &method, args, Some(caller))
+    }
+
+    /// Invoke `method` on `implementation`, optionally prepending `caller` to the
+    /// argument list so the implementation can authenticate the original user.
+    fn invoke_implementation(
+        env: &Env,
+        implementation: &Address,
+        method: &Symbol,
+        args: Vec<Val>,
+        caller: Option<Address>,
+    ) -> Val {
+        let forwarded: Vec<Val> = match caller {
+            Some(caller) => {
+                let mut forwarded = Vec::new(env);
+                forwarded.push_back(caller.into_val(env));
+                for arg in args.iter() {
+                    forwarded.push_back(arg);
+                }
+                forwarded
+            }
+            None => args,
+        };
+        env.invoke_contract(implementation, method, forwarded)
     }
 
     pub fn increment(env: Env, amount: i32) -> i32 {
