@@ -31,17 +31,19 @@ module.exports = {
         },
         skeleton: 'var(--skeleton)',
         // Kept for backward compatibility with existing `slate-*` usage.
-        // 400/500 are overridden to lighter shades for WCAG 2AA
-        // contrast against `bg-slate-950`.
+        // 400/500/600 are overridden to lighter shades for WCAG 2.1 AA
+        // contrast (>= 4.5:1) against dark backgrounds like `bg-slate-950`.
         slate: {
           ...colors.slate,
           400: colors.slate[300], // #cbd5e1
-          500: colors.slate[400], // #94a3a8
+          500: colors.slate[300], // #cbd5e1 (>= 4.5:1 on dark backgrounds)
+          600: colors.slate[400], // #94a3b8 (>= 4.5:1 on bg-slate-950)
         },
         gray: {
           ...colors.gray,
           400: colors.gray[300], // #d1d5db
-          500: colors.gray[400], // #9ca3af
+          500: colors.gray[300], // #d1d5db (>= 4.5:1 on dark backgrounds)
+          600: colors.gray[400], // #9ca3af
         },
       },
       spacing: {
