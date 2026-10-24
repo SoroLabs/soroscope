@@ -30,6 +30,7 @@ pub enum Error {
     DuplicateAdmin = 17,
     InsufficientApprovals = 18,
     DelegationLoop = 19,
+    Overflow = 20,
 }
 
 #[contracttype]
@@ -519,7 +520,21 @@ impl GovernanceContract {
         if votes < 0 {
             return Err(Error::InvalidCredits);
         }
-        Ok(votes.checked_mul(votes).ok_or(Error::InvalidCredits)?)
+        votes.checked_mul(votes).ok_or(Error::InvalidCredits)
+    }
+
+    /// Computes vote weight as balance * multiplier with checked math to protect against overflow.
+    pub fn compute_vote_weight(_env: Env, balance: i128, multiplier: i128) -> Result<i128, Error> {
+        let weight = balance.checked_mul(multiplier).ok_or(Error::Overflow)?;
+        Ok(weight)
+    }
+
+    pub fn calculate_vote_weight(env: Env, balance: i128, multiplier: i128) -> Result<i128, Error> {
+        Self::compute_vote_weight(env, balance, multiplier)
+    }
+
+    pub fn vote_weight(env: Env, balance: i128, multiplier: i128) -> Result<i128, Error> {
+        Self::compute_vote_weight(env, balance, multiplier)
     }
 
     pub fn get_vote_receipt(env: Env, proposal_id: u32, voter: Address) -> Option<VoteReceipt> {

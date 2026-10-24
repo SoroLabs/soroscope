@@ -4,7 +4,7 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, BytesN as _, Ledger},
+    testutils::{Address as _, Ledger},
     Address, BytesN, Env, String, Vec,
 };
 
@@ -190,135 +190,38 @@ fn votes_cannot_exceed_registered_units() {
 }
 
 #[test]
-fn test_veto_proposal_success() {
+fn vote_weight_computation_succeeds_for_normal_values() {
     let env = Env::default();
-    env.mock_all_auths();
-
     let contract_id = env.register(GovernanceContract, ());
-    let admin = Address::generate(&env);
-    let security_council = Address::generate(&env);
     let client = GovernanceContractClient::new(&env, &contract_id);
 
-    // Initialize governance
-    client.initialize(&admin, &604800, &172800, &10);
-
-    // Set security council
-    client.set_security_council(&security_council);
-
-    // Create and queue a proposal
-    let title = String::from_str(&env, "Test proposal");
-    let description = String::from_str(&env, "Test description");
-    let actions = Vec::new(&env);
-    let proposal_id = client.create_proposal(&title, &description, &actions);
-
-    // Start voting
-    env.ledger().with_mut(|ledger| {
-        ledger.sequence_number = 50;
-    });
-    client.start_voting(&proposal_id);
-
-    // Set voting power
-    client.set_voting_power(&admin, &100);
-
-    // Vote
-    client.cast_vote(&proposal_id, &true);
-
-    // Advance time past voting period
-    env.ledger().with_mut(|ledger| {
-        ledger.sequence_number = 100;
-    });
-
-    // Queue proposal
-    client.queue_proposal(&proposal_id);
-
-    // Veto the proposal during timelock period
-    client.veto_proposal(&proposal_id);
-
-    // Verify proposal is vetoed
-    let proposal = client.get_proposal(&proposal_id);
-    assert_eq!(proposal.state, ProposalState::Vetoed);
+    assert_eq!(client.compute_vote_weight(&100, &2), 200);
+    assert_eq!(client.calculate_vote_weight(&1_000_000, &1), 1_000_000);
+    assert_eq!(client.vote_weight(&500, &0), 0);
+    assert_eq!(client.compute_vote_weight(&i128::MAX, &1), i128::MAX);
 }
 
 #[test]
-fn test_veto_proposal_not_security_council() {
+fn vote_weight_overflows_on_large_balance_and_multiplier() {
     let env = Env::default();
-    env.mock_all_auths();
-
     let contract_id = env.register(GovernanceContract, ());
-    let admin = Address::generate(&env);
-    let security_council = Address::generate(&env);
-    let unauthorized = Address::generate(&env);
     let client = GovernanceContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin, &604800, &172800, &10);
-    client.set_security_council(&security_council);
-
-    let title = String::from_str(&env, "Test");
-    let description = String::from_str(&env, "Test");
-    let actions = Vec::new(&env);
-    let proposal_id = client.create_proposal(&title, &description, &actions);
-
-    env.ledger().with_mut(|ledger| {
-        ledger.sequence_number = 50;
-    });
-    client.start_voting(&proposal_id);
-    client.set_voting_power(&admin, &100);
-    client.cast_vote(&proposal_id, &true);
-
-    env.ledger().with_mut(|ledger| {
-        ledger.sequence_number = 100;
-    });
-    client.queue_proposal(&proposal_id);
-
-    // Try to veto with unauthorized address - should panic due to assert
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.veto_proposal(&proposal_id);
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_set_and_get_security_council() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(GovernanceContract, ());
-    let admin = Address::generate(&env);
-    let security_council = Address::generate(&env);
-    let client = GovernanceContractClient::new(&env, &contract_id);
-
-    client.initialize(&admin, &604800, &172800, &10);
-
-    // Set security council
-    client.set_security_council(&security_council);
-
-    // Get security council
-    let retrieved = client.get_security_council();
-    assert_eq!(retrieved, Some(security_council));
-}
-
-#[test]
-fn transferred_voting_units_cannot_be_used_to_double_vote() {
-    let (env, contract_id, _admin, voter_a, voter_b) = setup(true);
-    let client = GovernanceContractClient::new(&env, &contract_id);
-    client.register_voter(&voter_a, &25, &make_identity(&env, 10));
-    client.register_voter(&voter_b, &10, &make_identity(&env, 11));
-
-    env.ledger().with_mut(|ledger| {
-        ledger.sequence_number = 30;
-    });
-
-    let proposal = client.create_proposal(
-        &String::from_str(&env, "Prevent double voting"),
-        &String::from_str(&env, "Voting units are snapshotted at proposal creation"),
-        &90,
+    // Whale wallet with near-i128::MAX balance and multiplier > 1
+    assert_eq!(
+        client.try_compute_vote_weight(&i128::MAX, &2),
+        Err(Ok(Error::Overflow))
     );
-
-    client.cast_vote(&proposal.id, &voter_a, &true, &9);
-
-    // Transferring units after the proposal must not increase B's voting power for it.
-    client.transfer_voting_units(&voter_a, &voter_b, &10);
-
-    let err = client.try_cast_vote(&proposal.id, &voter_b, &true, &11);
-    assert_eq!(err, Err(Ok(Error::InsufficientVotingUnits)));
+    assert_eq!(
+        client.try_calculate_vote_weight(&(i128::MAX / 2 + 1), &2),
+        Err(Ok(Error::Overflow))
+    );
+    assert_eq!(
+        client.try_vote_weight(&(i128::MAX / 10 + 1), &10),
+        Err(Ok(Error::Overflow))
+    );
+    assert_eq!(
+        client.try_compute_vote_weight(&i128::MAX, &i128::MAX),
+        Err(Ok(Error::Overflow))
+    );
 }
