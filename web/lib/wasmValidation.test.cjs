@@ -9,13 +9,13 @@ const assert = require('node:assert/strict');
 
 const {
   hasWasmMagic,
+  hasWasmFileMagic,
   readVarUint32,
   parseWasmSections,
   validateWasmModule,
   validateWasmFileMagic,
   extractContractFunctions,
 } = require('./wasmValidation');
-
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
 const HEADER = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
@@ -188,4 +188,42 @@ test('validateWasmFileMagic: rejects a renamed non-WASM file', async () => {
 test('validateWasmFileMagic: rejects files smaller than 4 bytes', async () => {
   const result = await validateWasmFileMagic(fakeFile([0x00, 0x61]));
   assert.equal(result.valid, false);
+});
+test('hasWasmFileMagic: rejects an executable renamed to .wasm', async () => {
+  const file = new Blob([
+    Buffer.from('MZ\x90\x00\x03\x00\x00\x00'),
+  ]);
+
+  Object.defineProperty(file, 'name', { value: 'evil.wasm' });
+
+  assert.equal(file.name.endsWith('.wasm'), true);
+  assert.equal(await hasWasmFileMagic(file), false);
+});
+
+test('hasWasmFileMagic: accepts a file with valid WASM magic bytes', async () => {
+  const file = new Blob([
+    Uint8Array.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]),
+  ]);
+
+  assert.equal(await hasWasmFileMagic(file), true);
+});
+
+test('hasWasmFileMagic: rejects files shorter than four bytes', async () => {
+  const file = new Blob([Uint8Array.from([0x00, 0x61, 0x73])]);
+
+  assert.equal(await hasWasmFileMagic(file), false);
+});
+
+test('hasWasmFileMagic: rejects files that cannot be read', async () => {
+  const file = {
+    slice() {
+      return {
+        arrayBuffer: async () => {
+          throw new Error('Read failed');
+        },
+      };
+    },
+  };
+
+  assert.equal(await hasWasmFileMagic(file), false);
 });

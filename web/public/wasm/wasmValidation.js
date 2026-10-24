@@ -367,12 +367,32 @@ function extractContractFunctions(report) {
     .sort((a, b) => a.localeCompare(b));
 }
 
+  /**
+   * Check the WASM magic number directly from a File or Blob.
+   *
+   * Reads only the first four bytes, avoiding loading the entire file.
+   * Returns false when the file cannot be read or has an invalid signature.
+   */
+  async function hasWasmFileMagic(file) {
+    try {
+      if (!file || typeof file.slice !== "function") {
+        return false;
+      }
+
+      const header = await file.slice(0, 4).arrayBuffer();
+      return hasWasmMagic(new Uint8Array(header));
+    } catch {
+      return false;
+    }
+  }
+
   return {
     WASM_MAGIC,
     WASM_VERSION,
     SECTION_NAMES,
     WasmDecodeError,
     hasWasmMagic,
+    hasWasmFileMagic,
     readVarUint32,
     parseWasmSections,
     validateWasmModule,

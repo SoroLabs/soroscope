@@ -215,6 +215,24 @@ export function GlobalSearchModal() {
       </div>
     </div>
   );
+  const [highlightedIndex, setHighlightedIndex] = useState(0);
+
+const filteredResults = useMemo(() => {
+  const normalizedQuery = debouncedQuery.trim().toLowerCase();
+
+  if (!normalizedQuery) {
+    return searchItems;
+  }
+
+  return searchItems.filter((item) =>
+    item.label.toLowerCase().includes(normalizedQuery),
+  );
+}, [debouncedQuery, searchItems]);
+
+// Reset keyboard selection whenever the result list changes.
+useEffect(() => {
+  setHighlightedIndex(0);
+}, [filteredResults]);
 }
 
 export default GlobalSearchModal;
