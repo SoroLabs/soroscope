@@ -12,6 +12,7 @@ const {
   readVarUint32,
   parseWasmSections,
   validateWasmModule,
+  validateWasmFileMagic,
   extractContractFunctions,
 } = require('./wasmValidation');
 
@@ -156,4 +157,35 @@ test('extractContractFunctions: returns sorted public function exports only', ()
 test('extractContractFunctions: tolerates a missing report', () => {
   assert.deepEqual(extractContractFunctions(null), []);
   assert.deepEqual(extractContractFunctions({}), []);
+});
+
+// ── File magic-bytes guard (Issue #1146) ────────────────────────────────────
+// A renamed non-WASM file (evil.exe → evil.wasm) must be rejected by reading
+// the first 4 bytes and comparing against 0x00 0x61 0x73 0x6D.
+
+function fakeFile(bytes) {
+  const data = Uint8Array.from(bytes);
+  return {
+    slice: (start, end) => ({
+      arrayBuffer: async () => data.slice(start, end).buffer.slice(0),
+    }),
+  };
+}
+
+test('validateWasmFileMagic: accepts a File starting with \\0asm', async () => {
+  const file = fakeFile([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+  const result = await validateWasmFileMagic(file);
+  assert.equal(result.valid, true);
+});
+
+test('validateWasmFileMagic: rejects a renamed non-WASM file', async () => {
+  const file = fakeFile(Array.from(Buffer.from('MZ evil.exe contents')));
+  const result = await validateWasmFileMagic(file);
+  assert.equal(result.valid, false);
+  assert.match(result.error, /magic bytes/i);
+});
+
+test('validateWasmFileMagic: rejects files smaller than 4 bytes', async () => {
+  const result = await validateWasmFileMagic(fakeFile([0x00, 0x61]));
+  assert.equal(result.valid, false);
 });

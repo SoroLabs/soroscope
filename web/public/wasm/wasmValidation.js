@@ -322,6 +322,41 @@
   };
 }
 
+/**
+ * Front-end guard against renamed non-WASM files (e.g. `evil.exe` renamed to
+ * `evil.wasm`): reads the first 4 bytes of a File/Blob and rejects anything
+ * whose magic bytes are not 0x00 0x61 0x73 0x6D (`\0asm`).
+ *
+ * Resolves to `{ valid: true }` or `{ valid: false, error }`. Never throws.
+ */
+function validateWasmFileMagic(file) {
+  if (!file || typeof file.slice !== 'function') {
+    return Promise.resolve({ valid: false, error: 'Invalid file object' });
+  }
+  return file
+    .slice(0, 4)
+    .arrayBuffer()
+    .then((buffer) => {
+      const bytes = new Uint8Array(buffer);
+      if (bytes.length < 4) {
+        return { valid: false, error: 'File is too small to be a valid WebAssembly module' };
+      }
+      const isWasm =
+        bytes[0] === WASM_MAGIC[0] &&
+        bytes[1] === WASM_MAGIC[1] &&
+        bytes[2] === WASM_MAGIC[2] &&
+        bytes[3] === WASM_MAGIC[3];
+      if (!isWasm) {
+        return {
+          valid: false,
+          error: 'Invalid WASM magic bytes — file is not WebAssembly bytecode',
+        };
+      }
+      return { valid: true, error: null };
+    })
+    .catch(() => ({ valid: false, error: 'Could not read file header for WASM validation' }));
+}
+
 /** Contract-facing summary: the exported functions a user can invoke. */
 function extractContractFunctions(report) {
   if (!report || !Array.isArray(report.exports)) return [];
@@ -341,6 +376,7 @@ function extractContractFunctions(report) {
     readVarUint32,
     parseWasmSections,
     validateWasmModule,
+    validateWasmFileMagic,
     extractContractFunctions,
   };
 });

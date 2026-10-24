@@ -30,6 +30,7 @@ import {
   validateEndpointUrl,
   validateSettings,
 } from '../lib/userSettings';
+import { validateRpcUrl } from '../lib/validationSchemas';
 import type { UserSettings } from '../lib/userSettings';
 
 type TestState = { status: 'idle' | 'testing' | 'ok' | 'fail'; message?: string; latencyMs?: number };
@@ -189,6 +190,12 @@ export default function SettingsPage() {
 
   const handleSave = useCallback(() => {
     const result = validateSettings(settings);
+    const rpcCheck = validateRpcUrl(settings.rpcUrl);
+    if (!rpcCheck.valid) {
+      setErrors({ ...result.errors, rpcUrl: rpcCheck.error });
+      setSaved(false);
+      return;
+    }
     if (!result.valid) {
       setErrors(result.errors);
       setSaved(false);
