@@ -32,3 +32,15 @@ name = "merkle_hex"
 path = "fuzz_targets/merkle_hex.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_xdr_decoder"
+path = "fuzz_targets/fuzz_xdr_decoder.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_wasm_parser"
+path = "fuzz_targets/fuzz_wasm_parser.rs"
+test = false
+doc = false

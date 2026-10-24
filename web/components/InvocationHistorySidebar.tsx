@@ -1,8 +1,9 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ChevronLeft, ChevronRight, Clock, CheckCircle, XCircle, Trash2 } from 'lucide-react';
 import { useInvocationHistory } from './InnovocationHistory';
+import { paginate } from '../lib/paginationUtils';
 import type { InvocationResult } from '../lib/sorobantypes';
 
 interface InvocationHistorySidebarProps {
@@ -26,6 +27,15 @@ function formatDate(timestamp: number): string {
 export function InvocationHistorySidebar({ onSelectResult }: InvocationHistorySidebarProps) {
   const [isOpen, setIsOpen] = useState(true);
   const { history, clearHistory } = useInvocationHistory();
+  const [page, setPage] = useState(1);
+  const PER_PAGE = 20;
+  const pagination = useMemo(() => paginate(history, page, PER_PAGE), [history, page]);
+  const currentPage = pagination.page;
+  const totalPages = pagination.totalPages;
+  const pageItems = pagination.items;
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
 
   return (
     <div style={{ position: 'relative', display: 'flex', alignItems: 'flex-start' }}>
@@ -136,7 +146,7 @@ export function InvocationHistorySidebar({ onSelectResult }: InvocationHistorySi
                 No analyses yet
               </div>
             ) : (
-              history.map((item, index) => {
+              pageItems.map((item, index) => {
                 const report = item.analysisReport ?? (item as any).resourceCost;
 
                 return (
@@ -148,7 +158,7 @@ export function InvocationHistorySidebar({ onSelectResult }: InvocationHistorySi
                       padding: '10px 14px',
                       backgroundColor: 'transparent',
                       border: 'none',
-                      borderBottom: index < history.length - 1 ? '1px solid #21262d' : 'none',
+                      borderBottom: index < pageItems.length - 1 ? '1px solid #21262d' : 'none',
                       textAlign: 'left',
                       cursor: 'pointer',
                       display: 'block',
@@ -221,6 +231,50 @@ export function InvocationHistorySidebar({ onSelectResult }: InvocationHistorySi
               })
             )}
           </div>
+
+          {/* Pagination */}
+          {history.length > 20 && (
+            <div
+              style={{
+                padding: '8px 14px',
+                borderTop: '1px solid #30363d',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexShrink: 0,
+              }}
+            >
+              <button
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={currentPage <= 1}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: currentPage <= 1 ? 'default' : 'pointer',
+                  color: currentPage <= 1 ? '#484f58' : 'var(--text-secondary)',
+                  fontSize: '12px',
+                }}
+              >
+                Previous
+              </button>
+              <span style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+                Page {currentPage} of {totalPages}
+              </span>
+              <button
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                disabled={currentPage >= totalPages}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: currentPage >= totalPages ? 'default' : 'pointer',
+                  color: currentPage >= totalPages ? '#484f58' : 'var(--text-secondary)',
+                  fontSize: '12px',
+                }}
+              >
+                Next
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>
