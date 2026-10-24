@@ -285,6 +285,8 @@ fn map_guard_err(err: GuardError) -> Error {
         | GuardError::AdminNotFound
         | GuardError::InvalidThreshold => Error::Unauthorized,
         GuardError::AlreadyInitialized => Error::AlreadyInitialized,
+        GuardError::GuardianNotFound => Error::Unauthorized,
+        GuardError::TimelockNotElapsed => Error::TimelockNotElapsed,
     }
 }
 fn require_not_paused(e: &Env, operation: u32) -> Result<(), Error> {

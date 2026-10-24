@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+node-id = "multi-yield-vault"
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

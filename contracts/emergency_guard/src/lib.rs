@@ -1,7 +1,9 @@
 #![no_std]
 
+#[cfg(feature = "contract")]
+use soroban_sdk::{contract, contractimpl};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, Address, Env, String, Vec,
+    contracterror, contracttype, log, Address, Env, String, Vec,
 };
 
 /// Overall state of the emergency circuit breaker.

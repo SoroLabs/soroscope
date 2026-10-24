@@ -506,7 +506,10 @@ mod tests {
         assert_eq!(outer.cpu_instructions, Some(100));
         assert_eq!(inner.cpu_instructions, Some(50));
         assert_eq!(outer.exclusive_cpu_instructions, Some(50));
-        assert_eq!(outer.exclusive_cpu_instructions.unwrap() + inner.cpu_instructions.unwrap(), outer.cpu_instructions.unwrap());
+        assert_eq!(
+            outer.exclusive_cpu_instructions.unwrap() + inner.cpu_instructions.unwrap(),
+            outer.cpu_instructions.unwrap()
+        );
         assert_eq!(outer.ram_bytes, Some(200));
         assert_eq!(outer.exclusive_ram_bytes, Some(150));
         assert_eq!(outer.ledger_read_bytes, Some(25));
