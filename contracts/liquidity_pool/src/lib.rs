@@ -8,6 +8,8 @@ use soroban_sdk::{
 #[cfg(test)]
 mod fuzz_test;
 #[cfg(test)]
+mod reentrancy_test;
+#[cfg(test)]
 mod test;
 
 // Errors
@@ -283,9 +285,10 @@ fn map_guard_err(err: GuardError) -> Error {
         GuardError::Unauthorized
         | GuardError::InsufficientSignatures
         | GuardError::AdminNotFound
+        | GuardError::GuardianNotFound
         | GuardError::InvalidThreshold => Error::Unauthorized,
         GuardError::AlreadyInitialized => Error::AlreadyInitialized,
-        GuardError::GuardianNotFound => Error::Unauthorized,
+
         GuardError::TimelockNotElapsed => Error::TimelockNotElapsed,
     }
 }
@@ -1298,18 +1301,29 @@ impl LiquidityPool {
         let net_amount_a = gross_amount_a - fee_a - penalty_a;
         let net_amount_b = gross_amount_b - fee_b - penalty_b;
 
+        // ── Checks-Effects-Interactions ───────────────────────────────────────
+        // All state mutations MUST be committed before any external token call.
+        // A malicious token contract could re-enter `withdraw` during the
+        // transfer; because the caller's share balance and the pool reserves are
+        // saved first, a re-entrant call sees the reduced balance and cannot
+        // withdraw the same shares twice.
+
+        // Effects: deduct the caller's share balance first.
         e.storage()
             .persistent()
             .set(&user_key, &(current - share_amount));
         e.storage().persistent().extend_ttl(&user_key, 100, 100);
 
+        // Effects: update pool totals and reserves.
         pool.total_shares -= share_amount;
+        // Only the net amounts leave the pool; fees and penalties stay in reserves.
         pool.reserve_a -= net_amount_a;
         pool.reserve_b -= net_amount_b;
         let token_a = pool.token_a.clone();
         let token_b = pool.token_b.clone();
         save_pool(&e, &pool);
 
+        // Interactions: external token transfers happen only after all state is saved.
         soroban_sdk::token::Client::new(&e, &token_a).transfer(
             &e.current_contract_address(),
             &to,

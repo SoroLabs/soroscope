@@ -37,19 +37,25 @@ fn setup_multisig() -> (Env, Address, Address, Address, Address) {
     admins.push_back(admin_a.clone());
     admins.push_back(admin_b.clone());
     GovernanceContractClient::new(&env, &contract_id)
-        .initialize_with_admins(&admin_a, &admins, &2, &9, &false);
+        .initialize_with_admins(&admin_a, &admins, &2, &9, &false, &2);
     (env, contract_id, admin_a, admin_b, outsider)
 }
 
 fn expired_proposal(client: &GovernanceContractClient<'_>, env: &Env) -> Proposal {
+    // Register the voter before the proposal so they are in its voting snapshot.
+    let voter = Address::generate(env);
+    client.register_voter(&voter, &9, &BytesN::from_array(env, &[42u8; 32]));
     env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
     let proposal = client.create_proposal(
         &String::from_str(env, "Execute approved decision"),
         &String::from_str(env, "Requires M-of-N authorization"),
         &11,
     );
+    // Cast 2 votes (4 credits) to meet the quorum of 2 configured in setup_multisig.
+    client.cast_vote(&proposal.id, &voter, &true, &4);
     env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
-    proposal
+    // Re-fetch so the returned proposal carries the updated vote counts.
+    client.get_proposal(&proposal.id)
 }
 
 #[test]
@@ -223,5 +229,90 @@ fn vote_weight_overflows_on_large_balance_and_multiplier() {
     assert_eq!(
         client.try_compute_vote_weight(&i128::MAX, &i128::MAX),
         Err(Ok(Error::Overflow))
+    );
+}
+
+#[test]
+fn execute_proposal_fails_without_quorum() {
+    // setup_multisig initialises with min_quorum = 2, so a proposal with
+    // only 1 total vote (sqrt(1) = 1) must be rejected by execute_proposal.
+    let (env, contract_id, admin_a, admin_b, _) = setup_multisig();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+
+    // Register a voter with 9 units and cast just 1 credit (= 1 vote).
+    let voter = Address::generate(&env);
+    client.register_voter(&voter, &9, &BytesN::from_array(&env, &[99u8; 32]));
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
+    let proposal = client.create_proposal(
+        &String::from_str(&env, "Low turnout proposal"),
+        &String::from_str(&env, "Should fail quorum"),
+        &11,
+    );
+    // Cast only 1 vote — below the quorum of 2.
+    client.cast_vote(&proposal.id, &voter, &true, &1);
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
+
+    let mut approvals = Vec::new(&env);
+    approvals.push_back(admin_a);
+    approvals.push_back(admin_b);
+
+    // Must fail because total_votes (1) < min_quorum (2).
+    assert_eq!(
+        client.try_execute_proposal(&proposal.id, &approvals),
+        Err(Ok(Error::QuorumNotMet))
+    );
+}
+
+#[test]
+fn transferred_voting_units_snapshot_prevents_double_vote() {
+    let (env, contract_id, _admin, voter_a, voter_b) = setup(true);
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    client.register_voter(&voter_a, &25, &make_identity(&env, 10));
+    client.register_voter(&voter_b, &10, &make_identity(&env, 11));
+
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = 30;
+    });
+
+    let proposal = client.create_proposal(
+        &String::from_str(&env, "Prevent double voting"),
+        &String::from_str(&env, "Voting units are snapshotted at proposal creation"),
+        &90,
+    );
+
+    // voter_b's snapshot is 10 units; they cannot spend 11 credits.
+    let err = client.try_cast_vote(&proposal.id, &voter_b, &true, &11);
+    assert_eq!(err, Err(Ok(Error::InsufficientVotingUnits)));
+}
+
+#[test]
+fn execute_proposal_fails_when_quorum_met_but_majority_against() {
+    let (env, contract_id, admin_a, admin_b, _) = setup_multisig();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+
+    let voter_for = Address::generate(&env);
+    let voter_against = Address::generate(&env);
+    client.register_voter(&voter_for, &9, &BytesN::from_array(&env, &[1u8; 32]));
+    client.register_voter(&voter_against, &9, &BytesN::from_array(&env, &[2u8; 32]));
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
+    let proposal = client.create_proposal(
+        &String::from_str(&env, "Contested proposal"),
+        &String::from_str(&env, "Quorum reached but rejected"),
+        &11,
+    );
+    client.cast_vote(&proposal.id, &voter_for, &true, &4);
+    client.cast_vote(&proposal.id, &voter_against, &false, &9);
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
+
+    let mut approvals = Vec::new(&env);
+    approvals.push_back(admin_a);
+    approvals.push_back(admin_b);
+    assert_eq!(
+        client.try_execute_proposal(&proposal.id, &approvals),
+        Err(Ok(Error::ProposalNotPassed))
     );
 }
