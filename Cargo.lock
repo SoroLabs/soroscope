@@ -4808,7 +4808,6 @@ name = "soroscope-batch-transfer-contract"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
- "soroban-token-contract",
 ]
 
 [[package]]
