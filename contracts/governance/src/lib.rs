@@ -26,9 +26,10 @@ pub enum Error {
     NotSecurityCouncil = 13,
     CannotVeto = 14,
     SecurityCouncilNotSet = 15,
-    InvalidExecutionThreshold = 13,
-    DuplicateAdmin = 14,
-    InsufficientApprovals = 15,
+    InvalidExecutionThreshold = 16,
+    DuplicateAdmin = 17,
+    InsufficientApprovals = 18,
+    DelegationLoop = 19,
 }
 
 #[contracttype]
@@ -85,6 +86,7 @@ pub enum DataKey {
     Receipt(u32, Address),
     ExecutionAdmins,
     ExecutionThreshold,
+    Delegation(Address),
 }
 
 fn sqrt(x: i128) -> i128 {
@@ -194,6 +196,52 @@ fn write_proposal(env: &Env, proposal: &Proposal) {
     env.storage()
         .persistent()
         .set(&DataKey::Proposal(proposal.id), proposal);
+}
+
+fn resolve_delegate(env: &Env, voter: Address) -> Result<Address, Error> {
+    let mut current = voter;
+    let mut visited = Vec::new(env);
+
+    loop {
+        if visited.iter().any(|address| address == current) {
+            return Err(Error::DelegationLoop);
+        }
+        visited.push_back(current.clone());
+
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::Delegation(current.clone()))
+        {
+            Some(delegate) => current = delegate,
+            None => return Ok(current),
+        }
+    }
+}
+
+fn ensure_no_delegation_loop(
+    env: &Env,
+    delegator: &Address,
+    delegate: &Address,
+) -> Result<(), Error> {
+    let mut current = delegate.clone();
+    let mut visited = Vec::new(env);
+
+    loop {
+        if current == *delegator || visited.iter().any(|address| address == current) {
+            return Err(Error::DelegationLoop);
+        }
+        visited.push_back(current.clone());
+
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::Delegation(current.clone()))
+        {
+            Some(next) => current = next,
+            None => return Ok(()),
+        }
+    }
 }
 
 #[contract]
@@ -336,9 +384,7 @@ impl GovernanceContract {
                 .get(&DataKey::VoterList)
                 .unwrap_or_else(|| Vec::new(&env));
             voters.push_back(voter.clone());
-            env.storage()
-                .persistent()
-                .set(&DataKey::VoterList, &voters);
+            env.storage().persistent().set(&DataKey::VoterList, &voters);
         }
         env.storage().persistent().set(&voter_key, &profile);
         Ok(profile)
@@ -349,6 +395,29 @@ impl GovernanceContract {
             .persistent()
             .get(&DataKey::Voter(voter))
             .ok_or(Error::VoterNotRegistered)
+    }
+
+    pub fn delegate(env: Env, delegator: Address, to: Address) -> Result<(), Error> {
+        delegator.require_auth();
+
+        if delegator == to {
+            return Err(Error::DelegationLoop);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Voter(delegator.clone()))
+            || !env.storage().persistent().has(&DataKey::Voter(to.clone()))
+        {
+            return Err(Error::VoterNotRegistered);
+        }
+
+        ensure_no_delegation_loop(&env, &delegator, &to)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(delegator), &to);
+        Ok(())
     }
 
     pub fn create_proposal(
@@ -379,12 +448,18 @@ impl GovernanceContract {
                 .persistent()
                 .get::<_, VoterProfile>(&DataKey::Voter(voter.clone()))
             {
-                voting_units_snapshot.set(voter.clone(), profile.voting_units);
+                let delegate = resolve_delegate(&env, voter)?;
+                let delegated_units = voting_units_snapshot.get(delegate.clone()).unwrap_or(0i128);
+                let total_units = delegated_units
+                    .checked_add(profile.voting_units)
+                    .ok_or(Error::InvalidCredits)?;
+                voting_units_snapshot.set(delegate, total_units);
             }
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::ProposalSnapshot(proposal_id), &voting_units_snapshot);
+        env.storage().persistent().set(
+            &DataKey::ProposalSnapshot(proposal_id),
+            &voting_units_snapshot,
+        );
         let proposal = Proposal {
             id: proposal_id,
             creator: admin,

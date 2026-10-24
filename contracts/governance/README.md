@@ -64,7 +64,7 @@ fn cancel_proposal_admin(e: Env, proposal_id: u32)  // Admin only
 ### Voting
 ```rust
 fn cast_vote(e: Env, proposal_id: u32, support: bool)
-fn delegate(e: Env, delegate: Address)
+fn delegate(e: Env, delegator: Address, delegate: Address) -> Result<(), Error>
 fn set_voting_power(e: Env, user: Address, power: i128)  // Admin only
 ```
 
@@ -101,7 +101,7 @@ client.start_voting(&proposal_id);
 client.cast_vote(&proposal_id, &true);
 
 // Or delegate
-client.delegate(&trusted_delegate);
+client.delegate(&user1, &trusted_delegate);
 
 // Queue successful proposal
 client.queue_proposal(&proposal_id);
@@ -115,7 +115,7 @@ client.execute_proposal(&proposal_id);
 - **Timelock**: Prevents flash loan attacks on governance
 - **Quorum Requirements**: Ensures sufficient participation
 - **Admin Oversight**: Emergency cancellation capabilities
-- **Delegation Safety**: Secure voting power delegation
+- **Delegation Safety**: Registered voters can delegate to other registered voters; cycles are rejected and delegated voting units are aggregated at the final delegate when a proposal is created.
 - **State Validation**: Strict state transitions
 
 ## Building
