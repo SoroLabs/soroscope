@@ -1,33 +1,37 @@
-use proc_macro::TokenStream;
-use quote::quote;
-use syn::{parse_macro_input, spanned::Spanned, ItemFn};
+#![no_std]
 
-#[proc_macro_attribute]
-pub fn gas_monitored(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let mut function = parse_macro_input!(item as ItemFn);
+use soroban_sdk::{contract, contractimpl, Env};
 
-    if function.sig.asyncness.is_some() {
-        return syn::Error::new(function.sig.span(), "gas_monitored does not support async functions")
-            .to_compile_error()
-            .into();
+#[contract]
+pub struct GasGolfingContract;
+
+#[contractimpl]
+impl GasGolfingContract {
+    pub fn standard_loop(_env: Env, n: u32) -> u64 {
+        let mut accumulator = 0u64;
+        for i in 0..n {
+            accumulator += i as u64;
+        }
+        accumulator
     }
 
-    let fn_name = function.sig.ident.clone();
-    let original_block = function.block.clone();
+    pub fn unrolled_loop(_env: Env, n: u32) -> u64 {
+        let mut accumulator = 0u64;
+        let mut i = 0u32;
 
-    function.block = syn::parse_quote!({
-        let __gas_golfing_start = std::time::Instant::now();
-        let __gas_golfing_result = (|| #original_block)();
-        let __gas_golfing_elapsed = __gas_golfing_start.elapsed();
+        while n - i >= 4 {
+            accumulator += i as u64;
+            accumulator += (i + 1) as u64;
+            accumulator += (i + 2) as u64;
+            accumulator += (i + 3) as u64;
+            i += 4;
+        }
 
-        println!(
-            "[gas-golfing] {} elapsed={:?}",
-            stringify!(#fn_name),
-            __gas_golfing_elapsed
-        );
+        while i < n {
+            accumulator += i as u64;
+            i += 1;
+        }
 
-        __gas_golfing_result
-    });
-
-    quote!(#function).into()
+        accumulator
+    }
 }
