@@ -341,93 +341,365 @@ fn load_config() -> Result<AppConfig, ConfigError> {
     settings.try_deserialize()
 }
 
-impl AppConfig {
-    /// Validate required startup config before the server starts (issue #1132).
-    ///
-    /// Prints a table of required values and returns the names of any that
-    /// are missing or invalid, so operators see one clear error instead of a
-    /// panic deep inside a request handler.
-    pub fn validate(&self) -> Result<(), Vec<String>> {
-        let required: &[(&str, &str)] = &[
-            ("SOROBAN_RPC_URL", &self.soroban_rpc_url),
-            ("NETWORK_PASSPHRASE", &self.network_passphrase),
-            ("DATABASE_URL", &self.database_url),
-            ("REDIS_URL", &self.redis_url),
-        ];
-        eprintln!("{:<20} {:<10} VALUE", "VAR", "STATUS");
-        let mut problems = Vec::new();
-        for (name, value) in required {
-            if value.trim().is_empty() {
-                eprintln!("{name:<20} {:<10} <missing>", "MISSING");
-                problems.push((*name).to_string());
-            } else {
-                eprintln!("{name:<20} {:<10} {value}", "OK");
-            }
+// ── Startup configuration validation (issue #1257) ───────────────────────
+
+/// One row of the startup configuration report.
+///
+/// Every checked variable gets a row, not just the broken ones, so an operator
+/// can see the whole effective configuration at a glance. `problem` is `None`
+/// when the value is usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigCheck {
+    /// Environment variable the effective value came from.
+    variable: &'static str,
+    /// Effective value, rendered for the report.
+    value: String,
+    /// Why the value cannot be used, when it cannot.
+    problem: Option<String>,
+}
+
+impl ConfigCheck {
+    fn ok(variable: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            variable,
+            value: value.into(),
+            problem: None,
         }
-        if self.server_port == 0 {
-            eprintln!("{:<20} {:<10} <invalid: port 0>", "SERVER_PORT", "INVALID");
-            problems.push("SERVER_PORT".to_string());
+    }
+
+    fn invalid(
+        variable: &'static str,
+        value: impl Into<String>,
+        problem: impl Into<String>,
+    ) -> Self {
+        Self {
+            variable,
+            value: value.into(),
+            problem: Some(problem.into()),
         }
-        if problems.is_empty() {
-            Ok(())
-        } else {
-            Err(problems)
-        }
+    }
+
+    fn is_problem(&self) -> bool {
+        self.problem.is_some()
     }
 }
 
-#[cfg(test)]
-mod config_validation_tests {
-    use super::*;
+/// Render a value for the report, showing empty values as `<unset>`.
+fn render_value(value: &str) -> String {
+    if value.trim().is_empty() {
+        "<unset>".to_string()
+    } else {
+        value.trim().to_string()
+    }
+}
 
-    fn valid_config() -> AppConfig {
-        AppConfig {
-            server_port: 8080,
-            rust_log: "info".to_string(),
-            soroban_rpc_url: "https://soroban-testnet.stellar.org".to_string(),
-            jwt_private_key: None,
-            network_passphrase: "Test SDF Network ; September 2015".to_string(),
-            redis_url: "redis://127.0.0.1:6379".to_string(),
-            rpc_providers: String::new(),
-            registry_instance_id: String::new(),
-            registry_public_url: String::new(),
-            registry_seed_peers: String::new(),
-            health_check_interval_secs: 30,
-            gossip_interval_secs: 30,
-            simulation_timeout_secs: 30,
-            simulation_mode: "failover".to_string(),
-            database_url: "sqlite://soroscope.db".to_string(),
-            inbound_webhook_secret: String::new(),
-            job_timeout_secs: 300,
-            max_concurrent_jobs: 10,
-            event_worker_threads: 4,
-            fee_collection_interval_secs: 5,
-            fee_retention_days: 30,
-            fee_analysis_enabled: true,
-            emergency_verification_paused: false,
-            disk_cache_path: String::new(),
-            max_ledger_age: 100,
-            cors_allowed_origins: String::new(),
-            event_bus_capacity: 256,
-            log_format_json: false,
-            allowed_origins: String::new(),
+/// Render a secret for the report without disclosing it.
+fn render_secret(value: &str) -> String {
+    if value.trim().is_empty() {
+        "<unset>".to_string()
+    } else {
+        "<set>".to_string()
+    }
+}
+
+fn is_http_url(raw: &str) -> bool {
+    url::Url::parse(raw.trim())
+        .map(|parsed| matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some())
+        .unwrap_or(false)
+}
+
+/// Validate an `http(s)` URL, reporting an unset and a malformed value apart.
+fn check_url(variable: &'static str, raw: &str) -> ConfigCheck {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return ConfigCheck::invalid(variable, "<unset>", "required but empty");
+    }
+    match url::Url::parse(trimmed) {
+        Ok(parsed)
+            if matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some() =>
+        {
+            ConfigCheck::ok(variable, trimmed)
+        }
+        Ok(parsed) => ConfigCheck::invalid(
+            variable,
+            trimmed,
+            format!(
+                "unsupported scheme '{}': expected an http:// or https:// URL",
+                parsed.scheme()
+            ),
+        ),
+        Err(error) => ConfigCheck::invalid(variable, trimmed, format!("not a valid URL: {error}")),
+    }
+}
+
+impl AppConfig {
+    /// Validate the effective configuration before anything is bound or
+    /// contacted.
+    ///
+    /// `APP_ENV` is read here so production-only requirements do not have to
+    /// be duplicated into the deserialised struct.
+    fn validate(&self) -> Vec<ConfigCheck> {
+        let app_env = env::var("APP_ENV").unwrap_or_default();
+        self.validate_for_env(&app_env, env::var("GRPC_PORT").ok().as_deref())
+    }
+
+    /// Validate every value the server depends on.
+    ///
+    /// Returns one [`ConfigCheck`] per variable in a stable order and reports
+    /// *all* problems rather than stopping at the first, so a misconfigured
+    /// deployment can be fixed in one pass instead of one restart per typo.
+    /// A value that still has a workable compiled-in default is reported as
+    /// `ok`; only values that would make the server fail, misbehave or panic
+    /// are `problem`s.
+    fn validate_for_env(&self, app_env: &str, grpc_port: Option<&str>) -> Vec<ConfigCheck> {
+        let is_production = app_env.eq_ignore_ascii_case("production");
+        let mut checks = Vec::new();
+
+        // --- Database -------------------------------------------------
+        let database_url = self.database_url.trim();
+        checks.push(if database_url.is_empty() {
+            ConfigCheck::invalid("DATABASE_URL", "<unset>", "required but empty")
+        } else if !["postgres://", "postgresql://", "sqlite:"]
+            .iter()
+            .any(|scheme| database_url.starts_with(scheme))
+        {
+            ConfigCheck::invalid(
+                "DATABASE_URL",
+                database_url,
+                "unsupported scheme: expected postgres://, postgresql:// or sqlite:",
+            )
+        } else if is_production && database_url.starts_with("sqlite:") {
+            ConfigCheck::invalid(
+                "DATABASE_URL",
+                database_url,
+                "SQLite is not suitable for production; set a PostgreSQL connection string",
+            )
+        } else {
+            ConfigCheck::ok("DATABASE_URL", database_url)
+        });
+
+        // --- Soroban RPC -------------------------------------------------
+        checks.push(check_url("SOROBAN_RPC_URL", &self.soroban_rpc_url));
+        checks.push(if self.network_passphrase.trim().is_empty() {
+            ConfigCheck::invalid("NETWORK_PASSPHRASE", "<unset>", "required but empty")
+        } else {
+            ConfigCheck::ok("NETWORK_PASSPHRASE", self.network_passphrase.trim())
+        });
+
+        // `RPC_PROVIDERS` is one JSON blob rather than a URL, and a bad blob
+        // silently falls back to `SOROBAN_RPC_URL` at runtime, so it has to be
+        // checked explicitly.
+        let providers_raw = self.rpc_providers.trim();
+        checks.push(if providers_raw.is_empty() {
+            ConfigCheck::ok("RPC_PROVIDERS", "<unset> (using SOROBAN_RPC_URL)")
+        } else {
+            match serde_json::from_str::<Vec<RpcProvider>>(providers_raw) {
+                Ok(providers) if providers.is_empty() => ConfigCheck::invalid(
+                    "RPC_PROVIDERS",
+                    "<empty array>",
+                    "must list at least one provider, or be unset",
+                ),
+                Ok(providers) => {
+                    let bad = providers.iter().find(|provider| {
+                        provider.name.trim().is_empty() || !is_http_url(&provider.url)
+                    });
+                    match bad {
+                        Some(provider) => ConfigCheck::invalid(
+                            "RPC_PROVIDERS",
+                            format!("{} provider(s)", providers.len()),
+                            format!(
+                                "provider '{}' needs a name and an http(s) url",
+                                provider.name
+                            ),
+                        ),
+                        None => ConfigCheck::ok(
+                            "RPC_PROVIDERS",
+                            format!("{} provider(s)", providers.len()),
+                        ),
+                    }
+                }
+                Err(error) => ConfigCheck::invalid(
+                    "RPC_PROVIDERS",
+                    "<unparseable>",
+                    format!("not a JSON array of providers: {error}"),
+                ),
+            }
+        });
+
+        // --- Simulation ----------------------------------------------
+        let mode = self.simulation_mode.trim().to_ascii_lowercase();
+        checks.push(if matches!(mode.as_str(), "failover" | "consensus") {
+            ConfigCheck::ok("SIMULATION_MODE", mode)
+        } else {
+            ConfigCheck::invalid(
+                "SIMULATION_MODE",
+                render_value(&self.simulation_mode),
+                format!("unknown mode '{mode}': expected 'failover' or 'consensus'"),
+            )
+        });
+
+        // --- Intervals ------------------------------------------------
+        // Every one of these drives a `tokio::time::interval`, which panics on
+        // a zero period. Checking here turns a mid-run panic into a startup
+        // message.
+        for (variable, value) in [
+            ("SIMULATION_TIMEOUT_SECS", self.simulation_timeout_secs),
+            (
+                "HEALTH_CHECK_INTERVAL_SECS",
+                self.health_check_interval_secs,
+            ),
+            ("GOSSIP_INTERVAL_SECS", self.gossip_interval_secs),
+            (
+                "FEE_COLLECTION_INTERVAL_SECS",
+                self.fee_collection_interval_secs,
+            ),
+        ] {
+            checks.push(if value == 0 {
+                ConfigCheck::invalid(variable, "0", "must be greater than zero seconds")
+            } else {
+                ConfigCheck::ok(variable, value.to_string())
+            });
+        }
+
+        // --- Worker pool ----------------------------------------------
+        checks.push(if self.event_worker_threads == 0 {
+            ConfigCheck::invalid("EVENT_WORKER_THREADS", "0", "must be at least 1")
+        } else {
+            ConfigCheck::ok(
+                "EVENT_WORKER_THREADS",
+                self.event_worker_threads.to_string(),
+            )
+        });
+
+        // --- CORS ------------------------------------------------------
+        for (variable, raw) in [
+            ("CORS_ALLOWED_ORIGINS", self.cors_allowed_origins.as_str()),
+            ("ALLOWED_ORIGINS", self.allowed_origins.as_str()),
+        ] {
+            let origins: Vec<&str> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|origin| !origin.is_empty())
+                .collect();
+            checks.push(if origins.is_empty() {
+                ConfigCheck::ok(variable, "<unset> (all origins allowed)")
+            } else if let Some(origin) = origins.iter().find(|origin| !is_http_url(origin)) {
+                ConfigCheck::invalid(
+                    variable,
+                    raw.trim(),
+                    format!("'{origin}' is not an http(s) origin"),
+                )
+            } else {
+                ConfigCheck::ok(variable, origins.join(","))
+            });
+        }
+
+        // --- Registry ---------------------------------------------------
+        if self.registry_public_url.trim().is_empty() {
+            checks.push(ConfigCheck::ok("REGISTRY_PUBLIC_URL", "<unset>"));
+        } else {
+            checks.push(check_url("REGISTRY_PUBLIC_URL", &self.registry_public_url));
+        }
+
+        // --- gRPC -------------------------------------------------------
+        // `GRPC_PORT` is read straight from the environment later on and
+        // silently replaced by 50051 when it does not parse, so a typo would
+        // otherwise bind the wrong port without telling anyone.
+        checks.push(match grpc_port {
+            None => ConfigCheck::ok("GRPC_PORT", "<unset> (default 50051)"),
+            Some(raw) if raw.trim().parse::<u16>().is_ok() => {
+                ConfigCheck::ok("GRPC_PORT", raw.trim())
+            }
+            Some(raw) => ConfigCheck::invalid(
+                "GRPC_PORT",
+                raw.trim(),
+                "must be a port number between 0 and 65535",
+            ),
+        });
+
+        // --- Secrets ----------------------------------------------------
+        checks.push(match self.jwt_private_key.as_deref() {
+            Some(key) if !key.trim().is_empty() => {
+                ConfigCheck::ok("JWT_PRIVATE_KEY", render_secret(key))
+            }
+            _ if is_production => ConfigCheck::invalid(
+                "JWT_PRIVATE_KEY",
+                "<unset>",
+                "required in production; dev keys do not survive a restart",
+            ),
+            _ => ConfigCheck::ok("JWT_PRIVATE_KEY", "<unset> (dev key will be generated)"),
+        });
+        checks.push(if self.inbound_webhook_secret.trim().is_empty() {
+            if is_production {
+                ConfigCheck::invalid(
+                    "INBOUND_WEBHOOK_SECRET",
+                    "<unset>",
+                    "required in production; inbound webhooks would be rejected",
+                )
+            } else {
+                ConfigCheck::ok("INBOUND_WEBHOOK_SECRET", "<unset>")
+            }
+        } else {
+            ConfigCheck::ok(
+                "INBOUND_WEBHOOK_SECRET",
+                render_secret(&self.inbound_webhook_secret),
+            )
+        });
+
+        checks
+    }
+}
+
+/// Print the startup configuration table and a one-line summary.
+///
+/// The whole table goes to stderr: the tracing subscriber is not initialised
+/// yet when validation runs, and a failed startup must be visible even when
+/// logs are redirected.
+fn print_config_report(checks: &[ConfigCheck]) {
+    let failures = checks.iter().filter(|check| check.is_problem()).count();
+    let variable_width = checks
+        .iter()
+        .map(|check| check.variable.len())
+        .max()
+        .unwrap_or(0)
+        .max("VARIABLE".len());
+    let value_width = checks
+        .iter()
+        .map(|check| check.value.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("VALUE".len())
+        .min(48);
+
+    eprintln!();
+    eprintln!("SoroScope startup configuration check");
+    eprintln!();
+    eprintln!(
+        "{:<variable_width$}  {:<value_width$}  STATUS",
+        "VARIABLE", "VALUE"
+    );
+    eprintln!(
+        "{}",
+        "-".repeat(variable_width + value_width + "STATUS".len() + 4)
+    );
+    for check in checks {
+        let value: String = check.value.chars().take(value_width).collect();
+        match &check.problem {
+            None => eprintln!(
+                "{:<variable_width$}  {value:<value_width$}  ok",
+                check.variable
+            ),
+            Some(problem) => eprintln!(
+                "{:<variable_width$}  {value:<value_width$}  INVALID: {problem}",
+                check.variable
+            ),
         }
     }
-
-    #[test]
-    fn complete_config_passes_validation() {
-        assert!(valid_config().validate().is_ok());
-    }
-
-    #[test]
-    fn missing_required_values_fail_validation() {
-        let mut config = valid_config();
-        config.database_url = String::new();
-        config.server_port = 0;
-        let err = config.validate().expect_err("should fail");
-        assert!(err.contains(&"DATABASE_URL".to_string()));
-        assert!(err.contains(&"SERVER_PORT".to_string()));
-    }
+    eprintln!();
+    eprintln!(
+        "{failures} configuration error(s) found. Fix the variables marked INVALID and restart "
+    );
+    eprintln!();
 }
 
 /// Build the tracing `EnvFilter` from the configured log directive
@@ -2465,17 +2737,31 @@ async fn main() {
     // Config is loaded before the tracing subscriber so `rust_log` (sourced
     // from the `RUST_LOG` env var, defaulting to "info") can drive log level
     // filtering without recompiling the binary.
-    let config = load_config().expect("Failed to load configuration");
+    // Issue #1257: never panic on configuration. A malformed value used to
+    // abort with a bare `expect` message, and a missing one surfaced the first
+    // time a request handler touched it. Both now produce a readable report
+    // and exit code 1 before anything is bound.
+    let config = match load_config() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!();
+            eprintln!("SoroScope startup configuration check");
+            eprintln!();
+            eprintln!("INVALID: {error}");
+            eprintln!();
+            eprintln!("1 configuration error(s) found. Fix the variables above and restart.");
+            eprintln!();
+            std::process::exit(1);
+        }
+    };
 
-    // Fail fast on missing/invalid config (issue #1132): exit 1 with a clear
-    // table instead of panicking on first use deep inside a handler.
-    if let Err(problems) = config.validate() {
-        eprintln!(
-            "Invalid startup configuration: {}. Set the env vars above and restart.",
-            problems.join(", ")
-        );
+    let checks = config.validate();
+    if checks.iter().any(ConfigCheck::is_problem) {
+        print_config_report(&checks);
         std::process::exit(1);
     }
+
+
 
     // ── Tracing init (#572: JSON format + x-request-id correlation) ────
     let log_json = env::var("LOG_FORMAT").map(|v| v.to_lowercase() == "json").unwrap_or(false);
@@ -3671,4 +3957,231 @@ async fn analyze_simulation(
 ) -> Result<Json<AnalysisResult>, AppError> {
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))
+}
+
+#[cfg(test)]
+mod config_validation_tests {
+    use super::{AppConfig, ConfigCheck};
+
+    fn valid_config() -> AppConfig {
+        AppConfig {
+            server_port: 8080,
+            rust_log: "info".to_string(),
+            soroban_rpc_url: "https://soroban-testnet.stellar.org".to_string(),
+            jwt_private_key: None,
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            rpc_providers: String::new(),
+            registry_instance_id: String::new(),
+            registry_public_url: String::new(),
+            registry_seed_peers: String::new(),
+            health_check_interval_secs: 30,
+            gossip_interval_secs: 30,
+            simulation_timeout_secs: 30,
+            simulation_mode: "failover".to_string(),
+            database_url: "sqlite://soroscope.db".to_string(),
+            inbound_webhook_secret: String::new(),
+            job_timeout_secs: 300,
+            max_concurrent_jobs: 10,
+            event_worker_threads: 4,
+            fee_collection_interval_secs: 5,
+            fee_retention_days: 30,
+            fee_analysis_enabled: true,
+            emergency_verification_paused: false,
+            disk_cache_path: String::new(),
+            max_ledger_age: 100,
+            cors_allowed_origins: String::new(),
+            event_bus_capacity: 256,
+            log_format_json: false,
+            allowed_origins: String::new(),
+        }
+    }
+
+    /// Variables reported as invalid, with the reason attached.
+    fn problems(checks: &[ConfigCheck]) -> Vec<(&'static str, String)> {
+        checks
+            .iter()
+            .filter_map(|check| {
+                check
+                    .problem
+                    .clone()
+                    .map(|problem| (check.variable, problem))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn development_defaults_are_accepted() {
+        let checks = valid_config().validate_for_env("development", None);
+        assert_eq!(problems(&checks), vec![], "defaults must be usable");
+        // Every checked variable appears exactly once, so the report can be
+        // read as the complete startup configuration.
+        let mut names: Vec<&str> = checks.iter().map(|check| check.variable).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "report rows must be unique");
+    }
+
+    #[test]
+    fn missing_database_url_is_reported_by_name() {
+        let mut config = valid_config();
+        config.database_url = "   ".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported.len(), 1, "expected a single problem: {reported:?}");
+        assert_eq!(reported[0].0, "DATABASE_URL");
+        assert!(reported[0].1.contains("required"));
+    }
+
+    #[test]
+    fn database_url_with_unknown_scheme_is_reported() {
+        let mut config = valid_config();
+        config.database_url = "mysql://user:pass@db/app".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "DATABASE_URL");
+        assert!(reported[0].1.contains("unsupported scheme"));
+    }
+
+    #[test]
+    fn malformed_and_non_http_rpc_urls_are_reported() {
+        let mut config = valid_config();
+        config.soroban_rpc_url = "not a url".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "SOROBAN_RPC_URL");
+
+        config.soroban_rpc_url = "ftp://rpc.example.com".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "SOROBAN_RPC_URL");
+        assert!(reported[0].1.contains("http") || reported[0].1.contains("scheme"));
+    }
+
+    #[test]
+    fn empty_network_passphrase_is_reported() {
+        let mut config = valid_config();
+        config.network_passphrase = String::new();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "NETWORK_PASSPHRASE");
+    }
+
+    #[test]
+    fn unknown_simulation_mode_is_reported() {
+        let mut config = valid_config();
+        config.simulation_mode = "races".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "SIMULATION_MODE");
+        assert!(reported[0].1.contains("failover"));
+    }
+
+    #[test]
+    fn zero_length_intervals_are_reported_before_tokio_can_panic() {
+        let mut config = valid_config();
+        config.simulation_timeout_secs = 0;
+        config.health_check_interval_secs = 0;
+        config.gossip_interval_secs = 0;
+        config.fee_collection_interval_secs = 0;
+        let reported = problems(&config.validate_for_env("development", None));
+        let variables: Vec<&str> = reported.iter().map(|(variable, _)| *variable).collect();
+        assert_eq!(
+            variables,
+            vec![
+                "SIMULATION_TIMEOUT_SECS",
+                "HEALTH_CHECK_INTERVAL_SECS",
+                "GOSSIP_INTERVAL_SECS",
+                "FEE_COLLECTION_INTERVAL_SECS"
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_event_worker_pool_is_reported() {
+        let mut config = valid_config();
+        config.event_worker_threads = 0;
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "EVENT_WORKER_THREADS");
+    }
+
+    #[test]
+    fn unparseable_rpc_providers_are_reported_instead_of_silently_falling_back() {
+        let mut config = valid_config();
+        config.rpc_providers = "{not json}".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "RPC_PROVIDERS");
+        assert!(reported[0].1.contains("JSON"));
+
+        config.rpc_providers = r#"[{"name":"node-a","url":"https://a.example.com"}]"#.to_string();
+        assert!(problems(&config.validate_for_env("development", None)).is_empty());
+    }
+
+    #[test]
+    fn rpc_provider_without_a_url_is_reported() {
+        let mut config = valid_config();
+        config.rpc_providers = r#"[{"name":"node-a","url":""}]"#.to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "RPC_PROVIDERS");
+        assert!(reported[0].1.contains("node-a"));
+    }
+
+    #[test]
+    fn bad_cors_origin_is_reported() {
+        let mut config = valid_config();
+        config.allowed_origins = "https://app.example.com,not-a-url".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "ALLOWED_ORIGINS");
+        assert!(reported[0].1.contains("not-a-url"));
+    }
+
+    #[test]
+    fn non_numeric_grpc_port_is_reported_instead_of_defaulting() {
+        let config = valid_config();
+        let reported = problems(&config.validate_for_env("development", Some("fifty")));
+        assert_eq!(reported[0].0, "GRPC_PORT");
+        assert!(config
+            .validate_for_env("development", Some("50051"))
+            .iter()
+            .all(|check| !check.is_problem()));
+    }
+
+    #[test]
+    fn production_requires_an_explicit_jwt_key_and_webhook_secret() {
+        let config = valid_config();
+        let reported = problems(&config.validate_for_env("production", None));
+        let variables: Vec<&str> = reported.iter().map(|(variable, _)| *variable).collect();
+        assert!(variables.contains(&"JWT_PRIVATE_KEY"), "{variables:?}");
+        assert!(
+            variables.contains(&"INBOUND_WEBHOOK_SECRET"),
+            "{variables:?}"
+        );
+        // SQLite is a dev-only choice in production.
+        assert!(variables.contains(&"DATABASE_URL"), "{variables:?}");
+    }
+
+    #[test]
+    fn every_problem_is_reported_not_just_the_first() {
+        let mut config = valid_config();
+        config.database_url = String::new();
+        config.soroban_rpc_url = "nope".to_string();
+        config.simulation_mode = "fastest".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(
+            reported.len(),
+            3,
+            "expected all three problems: {reported:?}"
+        );
+    }
+
+    #[test]
+    fn secret_values_are_masked_in_the_report() {
+        let mut config = valid_config();
+        config.jwt_private_key = Some("-----BEGIN RSA PRIVATE KEY-----".to_string());
+        config.inbound_webhook_secret = "super-secret".to_string();
+        let checks = config.validate_for_env("development", None);
+        for name in ["JWT_PRIVATE_KEY", "INBOUND_WEBHOOK_SECRET"] {
+            let row = checks
+                .iter()
+                .find(|check| check.variable == name)
+                .expect("row must exist");
+            assert_eq!(row.value, "<set>", "secret leaked into the report table");
+            assert!(!row.value.contains("BEGIN RSA"));
+        }
+    }
 }
