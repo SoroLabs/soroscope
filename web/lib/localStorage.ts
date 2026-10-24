@@ -11,6 +11,9 @@ const ENCRYPTION_KEY_STORAGE = 'soroban_rpc_enc_key';
 const RPC_ENDPOINTS_STORAGE = 'soroban_rpc_endpoints';
 const RPC_SECRET_STORAGE = 'soroban_rpc_secret';
 
+export const NETWORK_STORAGE_KEY = 'soroscope_selected_network';
+export const STORAGE_KEY = NETWORK_STORAGE_KEY;
+
 interface EncryptedEnvelope {
   __enc: true;
   iv: string;
@@ -140,4 +143,57 @@ export async function getRpcSecret(): Promise<string | null> {
 export function clearAllStoredEndpoints(): void {
   localStorage.removeItem(RPC_ENDPOINTS_STORAGE);
   localStorage.removeItem(RPC_SECRET_STORAGE);
+}
+
+function getStorage(): Storage | null {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    return window.localStorage;
+  }
+  if (typeof localStorage !== 'undefined') {
+    return localStorage;
+  }
+  return null;
+}
+
+/**
+ * Persist the selected Stellar network ID to LocalStorage.
+ */
+export function saveSelectedNetwork(networkId: string): void {
+  try {
+    const storage = getStorage();
+    if (storage) {
+      storage.setItem(NETWORK_STORAGE_KEY, networkId);
+    }
+  } catch (e) {
+    console.warn('Failed to persist selected network preference', e);
+  }
+}
+
+/**
+ * Read the persisted Stellar network ID from LocalStorage.
+ */
+export function getSelectedNetwork(): string | null {
+  try {
+    const storage = getStorage();
+    if (storage) {
+      return storage.getItem(NETWORK_STORAGE_KEY);
+    }
+  } catch (e) {
+    console.warn('Failed to load selected network preference', e);
+  }
+  return null;
+}
+
+/**
+ * Clear the selected Stellar network ID from LocalStorage.
+ */
+export function clearSelectedNetwork(): void {
+  try {
+    const storage = getStorage();
+    if (storage) {
+      storage.removeItem(NETWORK_STORAGE_KEY);
+    }
+  } catch (e) {
+    console.warn('Failed to clear selected network preference', e);
+  }
 }

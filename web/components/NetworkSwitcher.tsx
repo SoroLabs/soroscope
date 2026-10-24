@@ -1,6 +1,13 @@
 import React, { useState, useRef, useEffect } from "react";
 import { ChevronDown, Check, Globe, Server } from "lucide-react";
-import { useNetwork, NetworkId, NetworkConfig } from "../context/NetworkContext";
+import {
+  useOptionalNetwork,
+  NETWORKS,
+  ALL_NETWORKS,
+  NetworkId,
+  NetworkConfig,
+} from "../context/NetworkContext";
+import { getSelectedNetwork, saveSelectedNetwork } from "../lib/localStorage";
 
 interface NetworkSwitcherProps {
   className?: string;
@@ -8,10 +15,29 @@ interface NetworkSwitcherProps {
 }
 
 export function NetworkSwitcher({ className = "", isMobile = false }: NetworkSwitcherProps) {
-  const { network, networkId, setNetworkId, networks } = useNetwork();
+  const context = useOptionalNetwork();
+  const [localNetworkId, setLocalNetworkId] = useState<NetworkId>("testnet");
   const [isOpen, setIsOpen] = useState(false);
   const [latencies, setLatencies] = useState<Record<string, number>>({});
   const dropdownRef = useRef<HTMLDivElement>(null);
+
+  const networkId = context ? context.networkId : localNetworkId;
+  const networks = context ? context.networks : ALL_NETWORKS;
+  const network = context ? context.network : (NETWORKS[localNetworkId] || NETWORKS.testnet);
+
+  // Read persisted network on mount
+  useEffect(() => {
+    const saved = getSelectedNetwork() as NetworkId | null;
+    if (saved && NETWORKS[saved]) {
+      if (context) {
+        if (context.networkId !== saved) {
+          context.setNetworkId(saved);
+        }
+      } else {
+        setLocalNetworkId(saved);
+      }
+    }
+  }, [context]);
 
   useEffect(() => {
     if (isOpen) {
@@ -46,7 +72,12 @@ export function NetworkSwitcher({ className = "", isMobile = false }: NetworkSwi
   }, [isOpen]);
 
   const handleSelect = (id: NetworkId) => {
-    setNetworkId(id);
+    saveSelectedNetwork(id);
+    if (context) {
+      context.setNetworkId(id);
+    } else {
+      setLocalNetworkId(id);
+    }
     setIsOpen(false);
   };
 

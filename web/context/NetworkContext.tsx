@@ -1,6 +1,11 @@
 "use client";
 
 import React, { createContext, useContext, useEffect, useState } from "react";
+import {
+  getSelectedNetwork,
+  saveSelectedNetwork,
+  NETWORK_STORAGE_KEY,
+} from "../lib/localStorage";
 
 export type NetworkId = "mainnet" | "testnet" | "futurenet" | "localhost";
 
@@ -103,15 +108,14 @@ export const useNetwork = () => {
  * the app shell (e.g. storybook, isolated tests).
  */
 export const useOptionalNetwork = () => useContext(NetworkContext);
-
-export const STORAGE_KEY = "soroscope_selected_network";
+export const STORAGE_KEY = NETWORK_STORAGE_KEY;
 
 export const NetworkProvider = ({ children }: { children: React.ReactNode }) => {
   const [networkId, setNetworkIdState] = useState<NetworkId>("testnet");
 
   useEffect(() => {
     try {
-      const savedNetwork = localStorage.getItem(STORAGE_KEY) as NetworkId | null;
+      const savedNetwork = getSelectedNetwork() as NetworkId | null;
       if (savedNetwork && NETWORKS[savedNetwork]) {
         setNetworkIdState(savedNetwork);
       }
@@ -124,7 +128,7 @@ export const NetworkProvider = ({ children }: { children: React.ReactNode }) => 
     if (!NETWORKS[id]) return;
     setNetworkIdState(id);
     try {
-      localStorage.setItem(STORAGE_KEY, id);
+      saveSelectedNetwork(id);
     } catch (e) {
       console.warn("Failed to persist network preference", e);
     }
