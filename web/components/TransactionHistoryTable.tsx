@@ -9,6 +9,7 @@ import { DEFAULT_TRANSACTION_FILTER, filterTransactions, type TransactionFilter 
 import { CopyButton } from './CopyButton';
 import { exportTransactionsToCsv } from '../lib/exportReport';
 import { useInfiniteScroll } from '../hooks/useInfiniteScroll';
+import { exportReport } from '../lib/exportReport';
 
 const PER_PAGE = 10;
 const PAGE_SIZE_OPTIONS = [10, 25, 50] as const;
@@ -246,30 +247,23 @@ export function TransactionHistoryTable({
     process.env.NEXT_PUBLIC_STELLAR_EXPLORER_URL ?? 'https://stellar.expert/explorer/testnet';
 
   const exportToCSV = useCallback(() => {
-    if (!transactions.length) return;
-    const headers = ['Transaction Hash', 'Function', 'Status', 'Timestamp', 'Fee (XLM)'];
-    const escape = (val: string) => {
-      const clean = val.replace(/"/g, '""');
-      return `"${clean}"`;
-    };
-    const rows = transactions.map((tx) => [
-      escape(tx.hash),
-      escape(tx.functionName),
-      escape(tx.status),
-      escape(new Date(tx.timestamp).toISOString()),
-      escape(tx.fee ? `${tx.fee}` : '0'),
-    ]);
-    const csvContent = [headers.join(','), ...rows.map((row) => row.join(','))].join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.setAttribute('href', url);
-    link.setAttribute('download', `telemetry_events_${Date.now()}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  }, [transactions]);
+    if (!sortedTransactions.length) return;
+    const columns = [
+      { key: 'hash', header: 'Hash' },
+      { key: 'ledger', header: 'Ledger' },
+      { key: 'functionName', header: 'Function' },
+      { key: 'cpu', header: 'CPU' },
+      { key: 'ram', header: 'RAM' },
+      { key: 'fee', header: 'Fee' },
+    ];
+    const date = new Date().toISOString().slice(0, 10);
+    exportReport({
+      filename: `soroscope-txns-${date}.csv`,
+      format: 'csv',
+      columns,
+      rows: sortedTransactions as unknown as Record<string, unknown>[],
+    });
+  }, [sortedTransactions]);
 
   const exportFilteredToCSV = useCallback(() => {
     if (!sortedTransactions.length) return;
@@ -390,6 +384,15 @@ export function TransactionHistoryTable({
       </div>
       {filterControls}
       {searchControls}
+      <div className="flex items-center justify-end border-b border-[#30363d] px-4 py-3">
+        <button
+          type="button"
+          onClick={exportToCSV}
+          className="inline-flex items-center gap-1 rounded border border-[#30363d] bg-[#161b22] px-2.5 py-1.5 text-xs text-[#8b949e] hover:border-[#8b949e] hover:text-[#c9d1d9]"
+        >
+          <Download className="h-3 w-3" /> Export CSV
+        </button>
+      </div>
       <div className="overflow-x-auto">
         <table className="w-full border-collapse text-sm">
           <thead className="border-b border-[#30363d] bg-[#161b22]">
@@ -489,13 +492,6 @@ export function TransactionHistoryTable({
             className="rounded border border-[#30363d] bg-[#161b22] px-2.5 py-1.5 text-xs text-[#8b949e] hover:border-[#8b949e] hover:text-[#c9d1d9]"
           >
             {isInfiniteMode ? 'Paginate' : 'Infinite scroll'}
-          </button>
-          <button
-            type="button"
-            onClick={exportToCSV}
-            className="inline-flex items-center gap-1 rounded border border-[#30363d] bg-[#161b22] px-2.5 py-1.5 text-xs text-[#8b949e] hover:border-[#8b949e] hover:text-[#c9d1d9]"
-          >
-            <Download className="h-3 w-3" /> CSV
           </button>
           <button
             type="button"
