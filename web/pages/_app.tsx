@@ -7,6 +7,7 @@ import { TelemetryProvider } from "../context/TelemetryContext";
 import { WalletProvider } from "../context/WalletContext";
 import { ErrorBoundary } from "../components/ErrorBoundary";
 import { GlobalSearchModal } from "../components/GlobalSearchModal";
+import { KeyboardShortcutsModal } from "../components/KeyboardShortcutsModal";
 import { OfflineBanner } from "../components/OfflineBanner";
 import { ToastHost } from "../components/Toast";
 
@@ -34,6 +35,8 @@ export default function App({ Component, pageProps }: AppProps) {
                 <Component {...pageProps} />
                 {/* Mounted app-wide so Cmd+K / Ctrl+K works on every page. */}
                 <GlobalSearchModal />
+                {/* Mounted app-wide so ? opens the shortcuts cheat sheet on every page. */}
+                <KeyboardShortcutsModal />
                 <ToastHost />
               </WalletProvider>
             </NetworkProvider>
