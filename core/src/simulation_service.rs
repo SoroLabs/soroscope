@@ -698,3 +698,81 @@ mod tests {
         assert_eq!(alert_count(&db_path.0), 0);
     }
 }
+
+// ── Concurrent batch simulation (issue #1131) ─────────────────────────────
+
+/// Env var bounding how many batch simulations run concurrently (default 4).
+pub const BATCH_PARALLELISM_ENV: &str = "SIM_PARALLELISM";
+/// Default bound for concurrent batch simulations.
+pub const DEFAULT_BATCH_PARALLELISM: usize = 4;
+
+/// Resolve the configured bound for concurrent batch simulations.
+pub fn batch_parallelism_limit() -> usize {
+    std::env::var(BATCH_PARALLELISM_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&limit| limit > 0)
+        .unwrap_or(DEFAULT_BATCH_PARALLELISM)
+}
+
+/// Run one closure per contract function concurrently, bounded by a semaphore.
+///
+/// Independent simulations share no state, so a batch of functions costs
+/// `O(latency)` instead of `O(n x latency)`. The bound comes from
+/// [`batch_parallelism_limit`] (`SIM_PARALLELISM`, default 4).
+pub async fn simulate_batch_concurrent<F, Fut, T>(functions: Vec<String>, f: F) -> Vec<T>
+where
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let worker = std::sync::Arc::new(f);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(batch_parallelism_limit()));
+    let mut pending = tokio::task::JoinSet::new();
+    for function in functions {
+        let worker = worker.clone();
+        let semaphore = semaphore.clone();
+        pending.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("batch simulation semaphore is never closed");
+            (*worker)(function).await
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(completed) = pending.join_next().await {
+        if let Ok(output) = completed {
+            results.push(output);
+        }
+    }
+    results
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn concurrent_batch_runs_every_function_once() {
+        let functions: Vec<String> = (0..8).map(|i| format!("fn{i}")).collect();
+        let mut results = simulate_batch_concurrent(functions, |name| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            name
+        })
+        .await;
+        results.sort();
+        assert_eq!(results.len(), 8);
+        assert_eq!(results[0], "fn0");
+        assert_eq!(results[7], "fn7");
+    }
+
+    #[test]
+    fn parallelism_limit_defaults_to_four_and_rejects_zero() {
+        std::env::remove_var(BATCH_PARALLELISM_ENV);
+        assert_eq!(batch_parallelism_limit(), DEFAULT_BATCH_PARALLELISM);
+        std::env::set_var(BATCH_PARALLELISM_ENV, "0");
+        assert_eq!(batch_parallelism_limit(), DEFAULT_BATCH_PARALLELISM);
+        std::env::remove_var(BATCH_PARALLELISM_ENV);
+    }
+}

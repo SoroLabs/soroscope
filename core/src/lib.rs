@@ -37,6 +37,7 @@ pub mod runner;
 pub mod resource_fixtures;
 pub mod sac_transfer;
 pub mod simulation;
+pub mod simulation_service;
 pub mod xdr_decoder;
 pub mod wasm_branch_analysis;
 pub mod webhook_validation;

@@ -7,8 +7,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-const CIRCUIT_BREAKER_THRESHOLD: u64 = 3;
-const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+/// Consecutive failures before the circuit opens (issue #1141).
+const CIRCUIT_BREAKER_THRESHOLD: u64 = 5;
+/// Cooldown before a single half-open probe request is allowed (issue #1141).
+const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+/// Interval between half-open probe requests (issue #1141).
+pub const CIRCUIT_BREAKER_HALF_OPEN_PROBE_INTERVAL: Duration = CIRCUIT_BREAKER_COOLDOWN;
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_OBSERVATION_TTL: Duration = Duration::from_secs(5 * 60);
 const PEER_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
@@ -27,6 +31,21 @@ const MIN_PROVIDER_SCORE: i64 = 25;
 const MAX_GOSSIP_PROVIDERS: usize = 64;
 const MAX_GOSSIP_PEERS: usize = 64;
 pub const MIN_SAMPLES_FOR_EMA: u64 = 5;
+
+/// Three-state circuit breaker for Soroban RPC upstream calls (issue #1141).
+///
+/// * `Closed` — requests flow normally.
+/// * `Open` — 5 consecutive failures tripped the breaker; callers must
+///   fast-fail with `503 Service Unavailable` + `Retry-After`.
+/// * `HalfOpen` — the 30 s cooldown elapsed; one probe request may go
+///   through. A successful probe closes the circuit, a failed probe
+///   re-opens it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitBreakerState {
+    Closed,
+    Open,
+    HalfOpen,
+}
 
 #[derive(Debug)]
 pub struct ProviderStats {
@@ -478,6 +497,43 @@ impl ProviderRegistry {
         healthy
             .into_iter()
             .find(|p| exclude_url.map_or(true, |ex| p.url != ex))
+    }
+
+    /// Current three-state circuit breaker status for one provider URL.
+    ///
+    /// Unknown URLs report [`CircuitBreakerState::Closed`]. Once the
+    /// cooldown elapses the breaker reports [`CircuitBreakerState::HalfOpen`]
+    /// and the next request is the single probe: [`report_success`] closes
+    /// the circuit, [`report_failure`] re-opens it.
+    ///
+    /// [`report_success`]: ProviderRegistry::report_success
+    /// [`report_failure`]: ProviderRegistry::report_failure
+    pub async fn circuit_state(&self, url: &str) -> CircuitBreakerState {
+        let Some(state) = self.find_by_url(url).await else {
+            return CircuitBreakerState::Closed;
+        };
+        if state.consecutive_failures.load(Ordering::Relaxed) < CIRCUIT_BREAKER_THRESHOLD {
+            return CircuitBreakerState::Closed;
+        }
+        match *state.tripped_at.read().await {
+            None => CircuitBreakerState::Closed,
+            Some(tripped) if tripped.elapsed() < CIRCUIT_BREAKER_COOLDOWN => {
+                CircuitBreakerState::Open
+            }
+            Some(_) => CircuitBreakerState::HalfOpen,
+        }
+    }
+
+    /// Value for the `Retry-After` header when the circuit is open.
+    pub fn circuit_open_retry_after_secs() -> u64 {
+        CIRCUIT_BREAKER_COOLDOWN.as_secs()
+    }
+
+    /// HTTP status + `Retry-After` seconds to return when the circuit is open:
+    /// `503 Service Unavailable` so clients back off instead of queueing
+    /// behind a degraded upstream.
+    pub fn circuit_open_response() -> (u16, u64) {
+        (503, Self::circuit_open_retry_after_secs())
     }
 
     pub fn is_retryable_status(status: u16) -> bool {
@@ -1062,6 +1118,31 @@ mod tests {
         }
 
         assert!(registry.healthy_providers().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_reports_open_and_retry_after() {
+        let registry = ProviderRegistry::new(vec![make_provider("a", "http://a.test")]);
+        assert_eq!(
+            registry.circuit_state("http://a.test").await,
+            CircuitBreakerState::Closed
+        );
+
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            registry.report_failure("http://a.test").await;
+        }
+
+        assert_eq!(
+            registry.circuit_state("http://a.test").await,
+            CircuitBreakerState::Open
+        );
+        assert_eq!(ProviderRegistry::circuit_open_response(), (503, 30));
+
+        registry.report_success("http://a.test").await;
+        assert_eq!(
+            registry.circuit_state("http://a.test").await,
+            CircuitBreakerState::Closed
+        );
     }
 
     #[tokio::test]

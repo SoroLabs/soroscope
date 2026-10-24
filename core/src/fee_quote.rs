@@ -1567,3 +1567,166 @@ mod total_quote_tests {
         assert_eq!(quote.resource_fee, 100);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fee quote cache (issue #1134)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Env var controlling the fee-quote cache TTL in seconds (default 30).
+pub const FEE_QUOTE_CACHE_TTL_ENV: &str = "FEE_QUOTE_CACHE_TTL_SECS";
+/// Default TTL in seconds when the env var is unset or unparsable.
+pub const DEFAULT_FEE_QUOTE_CACHE_TTL_SECS: u64 = 30;
+
+/// Resolve the configured fee-quote cache TTL.
+pub fn fee_quote_cache_ttl() -> std::time::Duration {
+    std::env::var(FEE_QUOTE_CACHE_TTL_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(DEFAULT_FEE_QUOTE_CACHE_TTL_SECS))
+}
+
+fn fee_quote_cache_hit_counter() -> &'static prometheus::IntCounter {
+    static HITS: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
+    HITS.get_or_init(|| {
+        prometheus::register_int_counter!(
+            "fee_quote_cache_hits_total",
+            "Fee quote cache hits"
+        )
+        .expect("fee_quote_cache_hits_total registration is infallible")
+    })
+}
+
+fn fee_quote_cache_miss_counter() -> &'static prometheus::IntCounter {
+    static MISSES: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
+    MISSES.get_or_init(|| {
+        prometheus::register_int_counter!(
+            "fee_quote_cache_misses_total",
+            "Fee quote cache misses"
+        )
+        .expect("fee_quote_cache_misses_total registration is infallible")
+    })
+}
+
+/// In-memory fee-quote cache with a configurable TTL.
+///
+/// Entries are invalidated immediately on any RPC error or `429` via
+/// [`FeeQuoteCache::invalidate_on_rpc_error`]; callers pass the RPC status
+/// (or `None` for transport errors) and the whole cache is dropped so a
+/// degraded upstream can never serve a stale quote.
+pub struct FeeQuoteCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, (ResourceFeeQuote, std::time::Instant)>>,
+    ttl: std::time::Duration,
+}
+
+impl FeeQuoteCache {
+    pub fn new() -> Self {
+        Self::with_ttl(fee_quote_cache_ttl())
+    }
+
+    pub fn with_ttl(ttl: std::time::Duration) -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// Look up a cached quote. Records a Prometheus hit/miss counter.
+    pub fn get(&self, key: &str) -> Option<ResourceFeeQuote> {
+        let mut entries = self.entries.lock().ok()?;
+        match entries.get(key) {
+            Some((quote, inserted)) if inserted.elapsed() < self.ttl => {
+                fee_quote_cache_hit_counter().inc();
+                Some(quote.clone())
+            }
+            Some(_) => {
+                entries.remove(key);
+                fee_quote_cache_miss_counter().inc();
+                None
+            }
+            None => {
+                fee_quote_cache_miss_counter().inc();
+                None
+            }
+        }
+    }
+
+    pub fn insert(&self, key: String, quote: ResourceFeeQuote) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(key, (quote, std::time::Instant::now()));
+        }
+    }
+
+    pub fn invalidate(&self) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.clear();
+        }
+    }
+
+    /// Returns `true` when the cache was invalidated. Any RPC error
+    /// (`None`), `429`, or `5xx` status drops the whole cache.
+    pub fn invalidate_on_rpc_error(&self, status: Option<u16>) -> bool {
+        let should_invalidate = match status {
+            None => true,
+            Some(s) => s == 429 || s >= 500,
+        };
+        if should_invalidate {
+            self.invalidate();
+        }
+        should_invalidate
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.lock().map(|e| e.len()).unwrap_or(0)
+    }
+}
+
+impl Default for FeeQuoteCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod fee_quote_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_hit_before_ttl_miss_after_expiry() {
+        let cache = FeeQuoteCache::with_ttl(std::time::Duration::from_millis(50));
+        let quote = ResourceFeeQuote::estimate(
+            &FeeQuoteInput::default(),
+            DurabilitySplit::unknown(),
+            SorobanFeeConfig::checked_in(),
+        );
+        assert!(cache.get("k").is_none());
+        cache.insert("k".to_string(), quote);
+        assert!(cache.get("k").is_some());
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(cache.get("k").is_none());
+    }
+
+    #[test]
+    fn cache_invalidates_on_rpc_error_and_429() {
+        let cache = FeeQuoteCache::new();
+        let quote = ResourceFeeQuote::estimate(
+            &FeeQuoteInput::default(),
+            DurabilitySplit::unknown(),
+            SorobanFeeConfig::checked_in(),
+        );
+        cache.insert("k".to_string(), quote);
+        assert!(!cache.invalidate_on_rpc_error(Some(200)));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.invalidate_on_rpc_error(Some(429)));
+        assert_eq!(cache.len(), 0);
+        cache.insert("k".to_string(), cache.get("k").unwrap_or_else(|| {
+            ResourceFeeQuote::estimate(
+                &FeeQuoteInput::default(),
+                DurabilitySplit::unknown(),
+                SorobanFeeConfig::checked_in(),
+            )
+        }));
+        assert!(cache.invalidate_on_rpc_error(None));
+        assert_eq!(cache.len(), 0);
+    }
+}
