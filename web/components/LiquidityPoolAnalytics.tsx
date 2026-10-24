@@ -548,7 +548,7 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
         <ResponsiveContainer width="100%" height="100%">
           <ComposedChart
             data={filteredData}
-            margin={{ top: 10, right: 20, left: 10, bottom: 0 }}
+            margin={{ top: 10, right: 20, left: 10, bottom: 20 }}
           >
             <defs>
               <linearGradient id="colorApy" x1="0" y1="0" x2="0" y2="1">
@@ -569,6 +569,14 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
               fontSize={11}
               tickLine={false}
               axisLine={{ stroke: '#334155' }}
+              label={{
+                value: 'Date',
+                position: 'insideBottom',
+                offset: -2,
+                fill: '#94a3b8',
+                fontSize: 12,
+                fontWeight: 600,
+              }}
             />
 
             {/* Left Y Axis for APY (%) */}
@@ -581,6 +589,14 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
                 axisLine={false}
                 tickFormatter={(v: number) => `${v}%`}
                 domain={['auto', 'auto']}
+                label={{
+                  value: 'APY (%)',
+                  angle: -90,
+                  position: 'insideLeft',
+                  fill: '#06b6d4',
+                  fontSize: 12,
+                  fontWeight: 600,
+                }}
               />
             )}
 
@@ -595,6 +611,14 @@ export const LiquidityPoolAnalytics: React.FC<LiquidityPoolAnalyticsProps> = ({
                 axisLine={false}
                 tickFormatter={(v: number) => formatCurrency(v)}
                 domain={['auto', 'auto']}
+                label={{
+                  value: 'Value (USD)',
+                  angle: 90,
+                  position: 'insideRight',
+                  fill: '#10b981',
+                  fontSize: 12,
+                  fontWeight: 600,
+                }}
               />
             )}
 

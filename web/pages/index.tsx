@@ -34,13 +34,13 @@ import { ToastStack, type ToastItem } from "../components/Toast";
 import { dismissToast, enqueueToast } from "../lib/toastQueue.cjs";
 import { useNetwork } from "../context/NetworkContext";
 import { clearLatestAnalysis, loadLatestAnalysis, saveLatestAnalysis } from "../lib/analysisStorage";
+import { cacheAnalysis } from "../lib/offlineStorage";
+import { CachedResults } from "../components/CachedResults";
 import { ApiError, analyzeService, apiUrl } from "../lib/api";
 import { createUserFriendlyMessage, extractErrorDetails, formatError } from "../lib/errorHandling";
 import { normalizeGasGolfingSuggestions, type GasGolfingSuggestion } from "../lib/gasGolfingSort";
-import { NutritionLabelSkeleton } from "../components/NutritionLabelSkeleton";
 import { ResourceHeatmapSkeleton } from "../components/ResourceHeatmapSkeleton";
 import { GasUsageChartSkeleton } from "../components/GasUsageChartSkeleton";
-import { ResultViewerSkeleton } from "../components/ResultViewerSkeleton";
 import {
   MOCK_CONTRACT_FUNCTIONS,
   generateMockResult,
@@ -213,6 +213,7 @@ export default function Home() {
       setCurrentResult(result);
       addToHistory(result);
       saveLatestAnalysis(result);
+      cacheAnalysis(result, wasmFile?.name);
       if (typeof window !== "undefined" && (window as any).triggerConfetti) {
         (window as any).triggerConfetti();
       }
@@ -481,7 +482,6 @@ export default function Home() {
                           />
                         </Suspense>
                       </div>
-                    )
                     )}
                     {analysisReport && (
                       <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -543,12 +543,22 @@ export default function Home() {
               ) : tab === "analytics" ? (
                 <LiquidityPoolAnalytics />
               ) : (
-                <InvocationHistory
-                  onSelectResult={(result) => {
-                    setCurrentResult(result);
-                    setTab("explorer");
-                  }}
-                />
+                <>
+                  <InvocationHistory
+                    onSelectResult={(result) => {
+                      setCurrentResult(result);
+                      setTab("explorer");
+                    }}
+                  />
+                  <div className="mt-4">
+                    <CachedResults
+                      onSelectResult={(result) => {
+                        setCurrentResult(result);
+                        setTab("explorer");
+                      }}
+                    />
+                  </div>
+                </>
               )}
             </div>
           </div>
