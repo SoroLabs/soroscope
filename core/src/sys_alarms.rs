@@ -544,6 +544,310 @@ pub async fn dispatch_fee_spike_webhook(
     }
 }
 
+// ── Resource exhaustion alarms (issue #1411) ────────────────────────────────
+//
+// Proactive thresholds for process RSS memory, open file descriptors and free
+// space on the data volume, so the server degrades gracefully (pauses
+// non-essential jobs, fails `/readyz`) before an OOM kill or disk-full panic.
+
+/// Usage percentage at which a resource enters [`AlarmSeverity::Warning`].
+pub const WARNING_THRESHOLD_PERCENT: f64 = 80.0;
+/// Usage percentage at which a resource enters [`AlarmSeverity::Critical`].
+pub const CRITICAL_THRESHOLD_PERCENT: f64 = 92.0;
+/// Volume whose free space is watched; defaults to the working directory.
+pub const ENV_DATA_DIR: &str = "SOROSCOPE_DATA_DIR";
+
+/// Alarm level for one resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlarmSeverity {
+    Normal,
+    Warning,
+    Critical,
+}
+
+impl AlarmSeverity {
+    /// Severity for a usage percentage.
+    pub fn from_percent(percent: f64) -> Self {
+        if percent >= CRITICAL_THRESHOLD_PERCENT {
+            AlarmSeverity::Critical
+        } else if percent >= WARNING_THRESHOLD_PERCENT {
+            AlarmSeverity::Warning
+        } else {
+            AlarmSeverity::Normal
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            2 => AlarmSeverity::Critical,
+            1 => AlarmSeverity::Warning,
+            _ => AlarmSeverity::Normal,
+        }
+    }
+}
+
+/// The resources watched for exhaustion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlarmResource {
+    Memory,
+    FileDescriptors,
+    Disk,
+}
+
+impl AlarmResource {
+    pub const ALL: [AlarmResource; 3] =
+        [AlarmResource::Memory, AlarmResource::FileDescriptors, AlarmResource::Disk];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AlarmResource::Memory => "memory",
+            AlarmResource::FileDescriptors => "file_descriptors",
+            AlarmResource::Disk => "disk",
+        }
+    }
+}
+
+/// One sample of the watched resources. `None` means the platform could not
+/// report that resource; it is then treated as [`AlarmSeverity::Normal`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ResourceStats {
+    pub process_rss_bytes: u64,
+    pub total_memory_bytes: u64,
+    pub open_fds: Option<u64>,
+    pub fd_limit: Option<u64>,
+    pub disk_free_bytes: Option<u64>,
+    pub disk_total_bytes: Option<u64>,
+}
+
+impl ResourceStats {
+    /// Usage percentage (0–100) for `resource`, if it can be computed.
+    pub fn usage_percent(&self, resource: AlarmResource) -> Option<f64> {
+        let ratio = |used: u64, total: u64| {
+            (total > 0).then(|| (used as f64 / total as f64) * 100.0)
+        };
+        match resource {
+            AlarmResource::Memory => ratio(self.process_rss_bytes, self.total_memory_bytes),
+            AlarmResource::FileDescriptors => ratio(self.open_fds?, self.fd_limit?),
+            AlarmResource::Disk => {
+                let total = self.disk_total_bytes?;
+                ratio(total.saturating_sub(self.disk_free_bytes?), total)
+            }
+        }
+    }
+}
+
+/// Source of [`ResourceStats`]; injectable so tests can supply mock stats.
+pub trait SystemStatsSource: Send {
+    fn sample(&mut self) -> ResourceStats;
+}
+
+/// Reads real process and host stats via `sysinfo` (and `/proc` on Linux for
+/// file descriptors).
+pub struct HostStatsSource {
+    system: System,
+    pid: Pid,
+    data_dir: std::path::PathBuf,
+}
+
+impl HostStatsSource {
+    pub fn new() -> Self {
+        let data_dir = std::env::var(ENV_DATA_DIR)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        Self {
+            system: System::new_all(),
+            pid: Pid::from_u32(std::process::id()),
+            data_dir: std::fs::canonicalize(&data_dir).unwrap_or(data_dir),
+        }
+    }
+
+    fn file_descriptors() -> (Option<u64>, Option<u64>) {
+        let open = std::fs::read_dir("/proc/self/fd").ok().map(|d| d.count() as u64);
+        let limit = std::fs::read_to_string("/proc/self/limits").ok().and_then(|limits| {
+            limits
+                .lines()
+                .find(|l| l.starts_with("Max open files"))
+                .and_then(|l| l.split_whitespace().nth(3))
+                .and_then(|soft| soft.parse().ok())
+        });
+        (open, limit)
+    }
+
+    fn disk_space(&self) -> (Option<u64>, Option<u64>) {
+        let disks = sysinfo::Disks::new_with_refreshed_list();
+        disks
+            .list()
+            .iter()
+            .filter(|d| self.data_dir.starts_with(d.mount_point()))
+            .max_by_key(|d| d.mount_point().as_os_str().len())
+            .map(|d| (Some(d.available_space()), Some(d.total_space())))
+            .unwrap_or((None, None))
+    }
+}
+
+impl Default for HostStatsSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SystemStatsSource for HostStatsSource {
+    fn sample(&mut self) -> ResourceStats {
+        self.system.refresh_memory();
+        self.system
+            .refresh_processes(sysinfo::ProcessesToUpdate::Some(&[self.pid]), true);
+        let (open_fds, fd_limit) = Self::file_descriptors();
+        let (disk_free_bytes, disk_total_bytes) = self.disk_space();
+        ResourceStats {
+            process_rss_bytes: self.system.process(self.pid).map(|p| p.memory()).unwrap_or(0),
+            total_memory_bytes: self.system.total_memory(),
+            open_fds,
+            fd_limit,
+            disk_free_bytes,
+            disk_total_bytes,
+        }
+    }
+}
+
+/// Latest alarm severity per resource, shared with `/readyz` and the
+/// background jobs.
+#[derive(Debug, Default)]
+pub struct ResourceAlarmState {
+    memory: std::sync::atomic::AtomicU8,
+    file_descriptors: std::sync::atomic::AtomicU8,
+    disk: std::sync::atomic::AtomicU8,
+}
+
+impl ResourceAlarmState {
+    fn slot(&self, resource: AlarmResource) -> &std::sync::atomic::AtomicU8 {
+        match resource {
+            AlarmResource::Memory => &self.memory,
+            AlarmResource::FileDescriptors => &self.file_descriptors,
+            AlarmResource::Disk => &self.disk,
+        }
+    }
+
+    pub fn severity(&self, resource: AlarmResource) -> AlarmSeverity {
+        AlarmSeverity::from_u8(self.slot(resource).load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Store `severity`, returning the previous value.
+    pub fn set(&self, resource: AlarmResource, severity: AlarmSeverity) -> AlarmSeverity {
+        AlarmSeverity::from_u8(
+            self.slot(resource)
+                .swap(severity.as_u8(), std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Resources currently in [`AlarmSeverity::Critical`].
+    pub fn critical_resources(&self) -> Vec<AlarmResource> {
+        AlarmResource::ALL
+            .into_iter()
+            .filter(|r| self.severity(*r) == AlarmSeverity::Critical)
+            .collect()
+    }
+
+    /// True while a critical memory or disk alarm is active; non-essential
+    /// background jobs skip their work until it clears.
+    pub fn should_pause_background_jobs(&self) -> bool {
+        self.severity(AlarmResource::Memory) == AlarmSeverity::Critical
+            || self.severity(AlarmResource::Disk) == AlarmSeverity::Critical
+    }
+
+    /// `{"memory": "normal", ...}` for `/readyz`.
+    pub fn snapshot(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for resource in AlarmResource::ALL {
+            map.insert(
+                resource.as_str().to_string(),
+                serde_json::to_value(self.severity(resource)).unwrap_or_default(),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+}
+
+static RESOURCE_ALARMS: std::sync::OnceLock<ResourceAlarmState> = std::sync::OnceLock::new();
+
+/// Process-wide alarm state updated by [`ResourceAlarmMonitor`].
+pub fn resource_alarm_state() -> &'static ResourceAlarmState {
+    RESOURCE_ALARMS.get_or_init(ResourceAlarmState::default)
+}
+
+/// Polls a [`SystemStatsSource`], updates a [`ResourceAlarmState`], logs
+/// severity transitions and publishes the `resource_alarm_severity` gauge.
+pub struct ResourceAlarmMonitor<S: SystemStatsSource> {
+    source: S,
+    state: &'static ResourceAlarmState,
+    interval: Duration,
+    gauge: Option<prometheus::IntGaugeVec>,
+}
+
+impl<S: SystemStatsSource + 'static> ResourceAlarmMonitor<S> {
+    pub fn new(source: S, state: &'static ResourceAlarmState, interval: Duration) -> Self {
+        Self { source, state, interval, gauge: None }
+    }
+
+    /// Publish severity (0 normal, 1 warning, 2 critical) per resource.
+    pub fn with_gauge(mut self, gauge: prometheus::IntGaugeVec) -> Self {
+        self.gauge = Some(gauge);
+        self
+    }
+
+    /// Take one sample and update the alarm state.
+    pub fn poll_once(&mut self) -> ResourceStats {
+        let stats = self.source.sample();
+        for resource in AlarmResource::ALL {
+            let percent = stats.usage_percent(resource);
+            let severity = percent.map(AlarmSeverity::from_percent).unwrap_or(AlarmSeverity::Normal);
+            let previous = self.state.set(resource, severity);
+
+            if let Some(gauge) = &self.gauge {
+                gauge.with_label_values(&[resource.as_str()]).set(severity.as_u8() as i64);
+            }
+
+            if severity != previous {
+                if severity > AlarmSeverity::Normal {
+                    warn!(
+                        resource = resource.as_str(),
+                        severity = ?severity,
+                        previous = ?previous,
+                        usage_percent = percent.unwrap_or_default(),
+                        "resource alarm raised"
+                    );
+                } else {
+                    info!(
+                        resource = resource.as_str(),
+                        previous = ?previous,
+                        usage_percent = percent.unwrap_or_default(),
+                        "resource alarm cleared"
+                    );
+                }
+            }
+        }
+        stats
+    }
+
+    /// Poll every `interval` on a background task.
+    pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(self.interval);
+            loop {
+                interval.tick().await;
+                self.poll_once();
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(deprecated)] // `std::env::set_var`/`remove_var` are deprecated in 1.74+; tests serialise via ENV_LOCK.
 mod tests {
@@ -791,5 +1095,121 @@ mod tests {
         std::env::remove_var(ENV_WEBHOOK);
         let cfg = SysAlarmConfig::from_env();
         assert!(cfg.webhook_url.is_none());
+    }
+
+
+    // ── Resource exhaustion alarms (issue #1411) ────────────────────────────
+
+    struct MockStats(Vec<ResourceStats>);
+
+    impl SystemStatsSource for MockStats {
+        fn sample(&mut self) -> ResourceStats {
+            if self.0.len() > 1 {
+                self.0.remove(0)
+            } else {
+                self.0[0]
+            }
+        }
+    }
+
+    fn stats(memory_pct: u64, fd_pct: u64, disk_used_pct: u64) -> ResourceStats {
+        ResourceStats {
+            process_rss_bytes: memory_pct,
+            total_memory_bytes: 100,
+            open_fds: Some(fd_pct),
+            fd_limit: Some(100),
+            disk_free_bytes: Some(100 - disk_used_pct),
+            disk_total_bytes: Some(100),
+        }
+    }
+
+    fn leaked_state() -> &'static ResourceAlarmState {
+        Box::leak(Box::new(ResourceAlarmState::default()))
+    }
+
+    #[test]
+    fn sys_alarms_severity_thresholds_are_80_and_92_percent() {
+        assert_eq!(AlarmSeverity::from_percent(79.9), AlarmSeverity::Normal);
+        assert_eq!(AlarmSeverity::from_percent(80.0), AlarmSeverity::Warning);
+        assert_eq!(AlarmSeverity::from_percent(91.9), AlarmSeverity::Warning);
+        assert_eq!(AlarmSeverity::from_percent(92.0), AlarmSeverity::Critical);
+    }
+
+    #[test]
+    fn sys_alarms_mock_stats_drive_each_resource_severity() {
+        let state = leaked_state();
+        let mut monitor =
+            ResourceAlarmMonitor::new(MockStats(vec![stats(50, 85, 95)]), state, Duration::from_secs(1));
+
+        monitor.poll_once();
+
+        assert_eq!(state.severity(AlarmResource::Memory), AlarmSeverity::Normal);
+        assert_eq!(state.severity(AlarmResource::FileDescriptors), AlarmSeverity::Warning);
+        assert_eq!(state.severity(AlarmResource::Disk), AlarmSeverity::Critical);
+        assert_eq!(state.critical_resources(), vec![AlarmResource::Disk]);
+        assert!(state.should_pause_background_jobs());
+        assert_eq!(state.snapshot()["disk"], "critical");
+    }
+
+    #[test]
+    fn sys_alarms_critical_fds_alone_do_not_pause_background_jobs() {
+        let state = leaked_state();
+        let mut monitor =
+            ResourceAlarmMonitor::new(MockStats(vec![stats(10, 99, 10)]), state, Duration::from_secs(1));
+
+        monitor.poll_once();
+
+        assert_eq!(state.critical_resources(), vec![AlarmResource::FileDescriptors]);
+        assert!(!state.should_pause_background_jobs());
+    }
+
+    #[test]
+    fn sys_alarms_clear_when_usage_recovers() {
+        let state = leaked_state();
+        let mut monitor = ResourceAlarmMonitor::new(
+            MockStats(vec![stats(95, 10, 10), stats(40, 10, 10)]),
+            state,
+            Duration::from_secs(1),
+        );
+
+        monitor.poll_once();
+        assert!(state.should_pause_background_jobs());
+
+        monitor.poll_once();
+        assert_eq!(state.severity(AlarmResource::Memory), AlarmSeverity::Normal);
+        assert!(state.critical_resources().is_empty());
+    }
+
+    #[test]
+    fn sys_alarms_unreported_resources_stay_normal() {
+        let state = leaked_state();
+        let unknown = ResourceStats {
+            process_rss_bytes: 10,
+            total_memory_bytes: 100,
+            ..ResourceStats::default()
+        };
+        let mut monitor = ResourceAlarmMonitor::new(MockStats(vec![unknown]), state, Duration::from_secs(1));
+
+        monitor.poll_once();
+
+        assert_eq!(state.severity(AlarmResource::FileDescriptors), AlarmSeverity::Normal);
+        assert_eq!(state.severity(AlarmResource::Disk), AlarmSeverity::Normal);
+    }
+
+    #[test]
+    fn sys_alarms_publish_severity_gauges() {
+        let gauge = crate::metrics::resource_alarm_severity_gauge().expect("gauge");
+        let mut monitor = ResourceAlarmMonitor::new(
+            MockStats(vec![stats(85, 95, 10)]),
+            leaked_state(),
+            Duration::from_secs(1),
+        )
+        .with_gauge(gauge.clone());
+
+        monitor.poll_once();
+
+        assert_eq!(gauge.with_label_values(&["memory"]).get(), 1);
+        assert_eq!(gauge.with_label_values(&["file_descriptors"]).get(), 2);
+        assert_eq!(gauge.with_label_values(&["disk"]).get(), 0);
     }
 }
