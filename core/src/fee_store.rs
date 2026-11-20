@@ -48,6 +48,21 @@ pub struct TransactionFeeRecord {
     pub recorded_at: DateTime<Utc>,
 }
 
+/// Rows deleted per statement by [`FeeStore::run_maintenance`] (Issue #1407).
+pub const MAINTENANCE_BATCH_SIZE: i64 = 1000;
+
+/// Outcome of one [`FeeStore::run_maintenance`] pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaintenanceReport {
+    /// Ledger fee samples deleted.
+    pub samples_deleted: u64,
+    /// Transaction fee records deleted.
+    pub records_deleted: u64,
+    /// `true` when the WAL checkpoint could not complete because readers or
+    /// writers were active (it is retried on the next pass).
+    pub checkpoint_busy: bool,
+}
+
 /// Thread-safe fee data store backed by SQLite
 pub struct FeeStore {
     pool: SqlitePool,
@@ -252,6 +267,106 @@ impl FeeStore {
         Ok(deleted)
     }
 
+    /// Retention maintenance (Issue #1407).
+    ///
+    /// Deletes ledger samples and transaction records older than
+    /// `retention_days` in bounded batches of `batch_size` rows (one short
+    /// transaction per batch, yielding between batches so concurrent readers
+    /// and writers are never starved), then truncates the WAL with
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` and refreshes query planner stats with
+    /// `PRAGMA optimize`.
+    ///
+    /// Transaction records are pruned first, including any that still point at
+    /// an expiring sample, so the foreign key never blocks the sample delete.
+    pub async fn run_maintenance(
+        &self,
+        retention_days: u32,
+        batch_size: i64,
+    ) -> Result<MaintenanceReport, FeeStoreError> {
+        let cutoff = Utc::now() - chrono::Duration::days(i64::from(retention_days));
+        let batch_size = batch_size.max(1);
+        let mut report = MaintenanceReport::default();
+
+        report.records_deleted = self
+            .delete_in_batches(
+                r#"
+                DELETE FROM transaction_fee_records
+                WHERE rowid IN (
+                    SELECT rowid FROM transaction_fee_records
+                    WHERE recorded_at < ?1
+                       OR ledger_sequence IN (
+                           SELECT ledger_sequence FROM ledger_fee_samples
+                           WHERE ledger_close_time < ?1
+                       )
+                    LIMIT ?2
+                )
+                "#,
+                cutoff,
+                batch_size,
+            )
+            .await?;
+
+        report.samples_deleted = self
+            .delete_in_batches(
+                r#"
+                DELETE FROM ledger_fee_samples
+                WHERE rowid IN (
+                    SELECT rowid FROM ledger_fee_samples
+                    WHERE ledger_close_time < ?1
+                    LIMIT ?2
+                )
+                "#,
+                cutoff,
+                batch_size,
+            )
+            .await?;
+
+        // TRUNCATE resets the WAL file to zero bytes. Readers keep reading
+        // throughout; if one is still using the WAL the checkpoint reports
+        // busy instead of blocking, and the next pass retries.
+        let (busy, _log_frames, _checkpointed) =
+            sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_one(&self.pool)
+                .await?;
+        report.checkpoint_busy = busy != 0;
+
+        sqlx::query("PRAGMA optimize").execute(&self.pool).await?;
+
+        tracing::info!(
+            samples_deleted = report.samples_deleted,
+            records_deleted = report.records_deleted,
+            checkpoint_busy = report.checkpoint_busy,
+            retention_days,
+            "Fee store maintenance completed"
+        );
+
+        Ok(report)
+    }
+
+    /// Run a `DELETE ... LIMIT ?2` statement repeatedly until a batch deletes
+    /// fewer than `batch_size` rows. Returns the total rows deleted.
+    async fn delete_in_batches(
+        &self,
+        sql: &str,
+        cutoff: DateTime<Utc>,
+        batch_size: i64,
+    ) -> Result<u64, FeeStoreError> {
+        let mut total = 0u64;
+        loop {
+            let deleted = sqlx::query(sql)
+                .bind(cutoff)
+                .bind(batch_size)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+            total += deleted;
+            if deleted < batch_size as u64 {
+                return Ok(total);
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Get count of stored samples
     pub async fn get_sample_count(&self) -> Result<i64, FeeStoreError> {
         let count = sqlx::query_scalar::<_, i64>(
@@ -411,5 +526,157 @@ mod tests {
         }
 
         assert_eq!(errors, 0, "expected zero DatabaseLocked errors under concurrent writes");
+    }
+
+    // ── Retention maintenance (Issue #1407) ───────────────────────────────
+
+    async fn maintenance_store() -> FeeStore {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("in-memory sqlite pool");
+
+        sqlx::query(
+            "CREATE TABLE ledger_fee_samples (
+                ledger_sequence BIGINT PRIMARY KEY,
+                collected_at TEXT NOT NULL,
+                base_reserve BIGINT NOT NULL,
+                base_fee BIGINT NOT NULL,
+                max_fee BIGINT NOT NULL,
+                fee_charged BIGINT NOT NULL,
+                transaction_count INTEGER NOT NULL,
+                ledger_close_time TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create samples table");
+        sqlx::query(
+            "CREATE TABLE transaction_fee_records (
+                id TEXT PRIMARY KEY,
+                ledger_sequence BIGINT NOT NULL,
+                tx_hash VARCHAR(64) NOT NULL,
+                fee_bid BIGINT NOT NULL,
+                fee_charged BIGINT NOT NULL,
+                resource_fee BIGINT NOT NULL,
+                inclusion_success BOOLEAN NOT NULL,
+                recorded_at TIMESTAMP NOT NULL,
+                FOREIGN KEY (ledger_sequence) REFERENCES ledger_fee_samples(ledger_sequence)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create records table");
+
+        FeeStore::new(pool)
+    }
+
+    fn sample_at(ledger_sequence: i64, closed_at: DateTime<Utc>) -> LedgerFeeSample {
+        LedgerFeeSample {
+            ledger_sequence,
+            collected_at: closed_at,
+            base_reserve: 100,
+            base_fee: 100,
+            max_fee: 1000,
+            fee_charged: 100,
+            transaction_count: 1,
+            ledger_close_time: closed_at,
+        }
+    }
+
+    fn record_at(ledger_sequence: i64, recorded_at: DateTime<Utc>) -> TransactionFeeRecord {
+        TransactionFeeRecord {
+            recorded_at,
+            ..TransactionFeeRecord::new(
+                ledger_sequence,
+                format!("tx{ledger_sequence}"),
+                100,
+                100,
+                50,
+                true,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_purges_old_rows_and_keeps_recent_ones() {
+        let store = maintenance_store().await;
+        let old = Utc::now() - chrono::Duration::days(40);
+        let recent = Utc::now() - chrono::Duration::days(1);
+
+        // Five expired ledgers (with records) and two recent ones.
+        for seq in 0..5 {
+            store
+                .upsert_ledger_sample(&sample_at(seq, old))
+                .await
+                .unwrap();
+            store.insert_tx_record(&record_at(seq, old)).await.unwrap();
+        }
+        for seq in 100..102 {
+            store
+                .upsert_ledger_sample(&sample_at(seq, recent))
+                .await
+                .unwrap();
+            store
+                .insert_tx_record(&record_at(seq, recent))
+                .await
+                .unwrap();
+        }
+
+        // A batch size of 2 forces several bounded batches per table.
+        let report = store.run_maintenance(30, 2).await.expect("maintenance");
+
+        assert_eq!(report.samples_deleted, 5);
+        assert_eq!(report.records_deleted, 5);
+        assert_eq!(store.get_sample_count().await.unwrap(), 2);
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transaction_fee_records")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 2);
+        assert_eq!(store.get_tx_records_for_ledger(100).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn maintenance_removes_recent_records_that_point_at_expired_samples() {
+        let store = maintenance_store().await;
+        let old = Utc::now() - chrono::Duration::days(40);
+
+        store
+            .upsert_ledger_sample(&sample_at(1, old))
+            .await
+            .unwrap();
+        // Recorded recently, but its ledger is past retention.
+        store
+            .insert_tx_record(&record_at(1, Utc::now()))
+            .await
+            .unwrap();
+
+        let report = store
+            .run_maintenance(30, MAINTENANCE_BATCH_SIZE)
+            .await
+            .unwrap();
+
+        assert_eq!(report.samples_deleted, 1);
+        assert_eq!(report.records_deleted, 1);
+        assert_eq!(store.get_sample_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_on_an_empty_store_is_a_no_op() {
+        let store = maintenance_store().await;
+
+        let report = store
+            .run_maintenance(30, MAINTENANCE_BATCH_SIZE)
+            .await
+            .unwrap();
+
+        assert_eq!(report.samples_deleted, 0);
+        assert_eq!(report.records_deleted, 0);
+        assert!(!report.checkpoint_busy);
     }
 }

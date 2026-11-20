@@ -3332,36 +3332,22 @@ async fn main() {
             "Fee market collector started"
         );
 
-        // Schedule periodic cleanup of old fee data
-        let cleanup_store = Arc::clone(&fee_store);
-        let retention_days = config.fee_retention_days;
-        let mut retention_shutdown = shutdown_tx.subscribe();
-        worker_handles.push(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // Every hour
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = retention_shutdown.recv() => {
-                        tracing::info!("Fee retention cleanup task shutting down");
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        tokio::select! {
-                            biased;
-                            _ = retention_shutdown.recv() => {
-                                tracing::info!("Fee retention cleanup task shutting down");
-                                break;
-                            }
-                            result = cleanup_store.cleanup_old_samples(retention_days as i32) => {
-                                if let Err(e) = result {
-                                    tracing::error!(error = %e, "Failed to cleanup old fee samples");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }));
+        // Schedule hourly fee retention maintenance (batched pruning + WAL
+        // checkpoint), run by the leader only (Issue #1407).
+        let maintenance_redis_client = redis::Client::open(config.redis_url.as_str())
+            .expect("Failed to create Redis client for fee maintenance leader lock");
+        let maintenance_lock = Arc::new(leader_lock::RedisLeaderLock::new(
+            maintenance_redis_client,
+            "soroscope:leader:fee_maintenance",
+            std::time::Duration::from_secs(600),
+        ));
+        worker_handles.push(JobQueue::spawn_fee_maintenance_task(
+            Arc::clone(&fee_store),
+            maintenance_lock,
+            config.fee_retention_days,
+            3600, // Every hour
+            shutdown_tx.subscribe(),
+        ));
     } else {
         tracing::info!("Fee market analysis is disabled");
     }

@@ -977,6 +977,55 @@ impl JobQueue {
         })
     }
 
+    /// Spawn the fee store maintenance task (Issue #1407).
+    ///
+    /// Every `interval_secs` it prunes fee rows older than `retention_days` in
+    /// bounded batches and checkpoints the SQLite WAL (see
+    /// [`crate::fee_store::FeeStore::run_maintenance`]). The work only runs on
+    /// the instance holding `leader_lock`, so a cluster prunes once per cycle.
+    pub fn spawn_fee_maintenance_task(
+        fee_store: Arc<crate::fee_store::FeeStore>,
+        leader_lock: Arc<crate::leader_lock::RedisLeaderLock>,
+        retention_days: u32,
+        interval_secs: u64,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(interval_secs.max(1)));
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => {
+                        tracing::info!("Fee store maintenance task shutting down");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        if !leader_lock.try_acquire_or_renew().await {
+                            tracing::debug!("not leader this cycle, skipping fee store maintenance");
+                            continue;
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.recv() => {
+                                tracing::info!("Fee store maintenance task shutting down");
+                                break;
+                            }
+                            result = fee_store.run_maintenance(
+                                retention_days,
+                                crate::fee_store::MAINTENANCE_BATCH_SIZE,
+                            ) => {
+                                if let Err(e) = result {
+                                    tracing::error!(error = %e, "Fee store maintenance failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     /// Close all database connections gracefully
     pub async fn close(&self) {
         tracing::info!("Closing JobQueue database connections");
