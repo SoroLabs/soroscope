@@ -28,6 +28,13 @@ pub struct AppMetrics {
     pub fee_quote_cache_hits_total: prometheus::IntCounter,
     /// Fee quote cache lookups that had to fetch a fresh quote (issue #1259).
     pub fee_quote_cache_misses_total: prometheus::IntCounter,
+    /// Bounded worker pool tasks currently executing (issue #1409).
+    pub worker_pool_active_tasks: prometheus::IntGauge,
+    /// Bounded worker pool tasks admitted and waiting for a worker (issue #1409).
+    pub worker_pool_queued_tasks: prometheus::IntGauge,
+    /// Tasks shed by the bounded worker pool: rejected when full or skipped
+    /// after waiting longer than `max_queue_wait_ms` (issue #1409).
+    pub worker_pool_shed_total: prometheus::IntCounter,
 }
 
 impl AppMetrics {
@@ -116,6 +123,18 @@ impl AppMetrics {
             "fee_quote_cache_misses_total",
             "Fee quote lookups that required a fresh fetch",
         )?;
+        let worker_pool_active_tasks = prometheus::IntGauge::new(
+            "worker_pool_active_tasks",
+            "Bounded worker pool tasks currently executing",
+        )?;
+        let worker_pool_queued_tasks = prometheus::IntGauge::new(
+            "worker_pool_queued_tasks",
+            "Bounded worker pool tasks waiting for a worker",
+        )?;
+        let worker_pool_shed_total = prometheus::IntCounter::new(
+            "worker_pool_shed_total",
+            "Tasks shed by the bounded worker pool (queue full or queue wait exceeded)",
+        )?;
 
         registry.register(Box::new(simulation_latency_seconds.clone()))?;
         registry.register(Box::new(rpc_error_count_total.clone()))?;
@@ -130,6 +149,9 @@ impl AppMetrics {
         registry.register(Box::new(job_queue_depth.clone()))?;
         registry.register(Box::new(fee_quote_cache_hits_total.clone()))?;
         registry.register(Box::new(fee_quote_cache_misses_total.clone()))?;
+        registry.register(Box::new(worker_pool_active_tasks.clone()))?;
+        registry.register(Box::new(worker_pool_queued_tasks.clone()))?;
+        registry.register(Box::new(worker_pool_shed_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -146,6 +168,18 @@ impl AppMetrics {
             job_queue_depth,
             fee_quote_cache_hits_total,
             fee_quote_cache_misses_total,
+            worker_pool_active_tasks,
+            worker_pool_queued_tasks,
+            worker_pool_shed_total,
         })
+    }
+
+    /// Handles for [`crate::worker_pool::EventWorkerPool::with_metrics`].
+    pub fn worker_pool_metrics(&self) -> crate::worker_pool::WorkerPoolMetrics {
+        crate::worker_pool::WorkerPoolMetrics {
+            active_tasks: self.worker_pool_active_tasks.clone(),
+            queued_tasks: self.worker_pool_queued_tasks.clone(),
+            shed_total: self.worker_pool_shed_total.clone(),
+        }
     }
 }

@@ -23,6 +23,10 @@ pub enum AppError {
 
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+
+    /// The worker pool shed the request under load (issue #1409).
+    #[error("Service overloaded: {0}")]
+    ServiceOverloaded(String),
 }
 
 /// RFC 7807 "Problem Details for HTTP APIs" response body.
@@ -51,6 +55,7 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::ServiceOverloaded(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -60,6 +65,7 @@ impl AppError {
             Self::NotFound(_) => "not-found",
             Self::BadRequest(_) => "bad-request",
             Self::Unauthorized(_) => "unauthorized",
+            Self::ServiceOverloaded(_) => "service-overloaded",
         }
     }
 
@@ -69,6 +75,7 @@ impl AppError {
             Self::NotFound(_) => "Not Found",
             Self::BadRequest(_) => "Bad Request",
             Self::Unauthorized(_) => "Unauthorized",
+            Self::ServiceOverloaded(_) => "Service Overloaded",
         }
     }
 }
