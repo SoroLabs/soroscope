@@ -3417,6 +3417,32 @@ async fn main() {
         .parse()
         .expect("Invalid gRPC bind address");
     let grpc_bus = Arc::clone(&app_state.simulation_bus);
+    // ── gRPC health (Issue #1404) ────────────────────────────────────────
+    // Publish DB + RPC provider readiness so the grpc.health.v1.Health status
+    // reports SERVING / NOT_SERVING in step with the dependencies.
+    let (grpc_ready_tx, grpc_ready_rx) = tokio::sync::watch::channel(false);
+    {
+        let provider_registry = Arc::clone(&app_state.provider_registry);
+        let fee_store = Arc::clone(&app_state.fee_store);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let rpc_healthy = provider_registry
+                    .provider_reports()
+                    .await
+                    .iter()
+                    .any(|p| p.healthy);
+                let db_healthy = sqlx::query("SELECT 1")
+                    .execute(fee_store.pool())
+                    .await
+                    .is_ok();
+                if grpc_ready_tx.send(rpc_healthy && db_healthy).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     // ── GraphQL query layer (Issue #579) ─────────────────────────────────
     // Assembles contract execution history and token metadata in a single
     // query instead of multiple REST round-trips.
@@ -3520,7 +3546,7 @@ async fn main() {
     // TLS is enabled automatically when GRPC_TLS_CERT / GRPC_TLS_KEY are set
     // (Issue #918).
     tokio::spawn(async move {
-        grpc::serve_with_tls_from_env(grpc_addr, grpc_bus).await;
+        grpc::serve_with_tls_from_env(grpc_addr, grpc_bus, grpc_ready_rx).await;
     });
 
     axum::serve(listener, app)
