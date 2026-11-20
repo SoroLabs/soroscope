@@ -123,6 +123,14 @@ pub struct CliArgs {
         help = "Enable verbose XDR logging and debug level output"
     )]
     pub verbose: bool,
+
+    /// Write the OpenAPI JSON spec to this path and exit without starting the server
+    #[arg(
+        long = "export-openapi",
+        value_name = "PATH",
+        help = "Write the OpenAPI JSON spec to PATH and exit without starting the HTTP server"
+    )]
+    pub export_openapi: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2462,6 +2470,8 @@ async fn fee_analytics(
         reprofile_historical_transaction,
         optimize_limits, compare_handler,
         auth::challenge_handler, auth::verify_handler, auth::jwks_handler,
+        auth::emergency_pause_handler,
+        analyze_wasm_branches, analyze_gas_golfing, analyze_host_import_heat,
         fee_recommend, fee_history, fee_analytics, batch_contract_state
     ),
     components(schemas(
@@ -2492,8 +2502,17 @@ async fn fee_analytics(
         crate::fee_analytics::MarketConditions,
         crate::fee_analytics::ModelBreakdown,
         crate::fee_analytics::TrendDirection,
-        BatchStateItem, BatchStateRequest, ContractStateResult, BatchStateResponse
+        BatchStateItem, BatchStateRequest, ContractStateResult, BatchStateResponse,
+        auth::EmergencyPauseRequest, auth::EmergencyPauseResponse,
+        GasGolfingRequest, GasGolfingResponse, GasGolfingReport,
+        HostImportHeatRequest, HostImportHeatResponse,
+        crate::host_import_heat::HostImportHeatMap,
+        crate::host_import_heat::HostImportHeatRow,
+        crate::host_import_heat::ImportHeat,
+        crate::host_import_heat::CostClass,
+        crate::host_import_heat::EstimateKind
     )),
+    modifiers(&JwtSecurityAddon),
     tags(
         (name = "Analysis", description = "Soroban contract resource analysis endpoints"),
         (name = "Auth", description = "SEP-10 wallet authentication"),
@@ -2507,6 +2526,36 @@ async fn fee_analytics(
     )
 )]
 struct ApiDoc;
+
+/// Registers the `jwt` bearer scheme referenced by `security(("jwt" = []))`
+/// on the protected routes.
+struct JwtSecurityAddon;
+
+impl utoipa::Modify for JwtSecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "jwt",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .build(),
+            ),
+        );
+    }
+}
+
+/// Serialize the OpenAPI spec as pretty JSON and write it to `path`
+/// (`--export-openapi`, issue #1410).
+fn export_openapi(path: &std::path::Path) -> std::io::Result<()> {
+    let json = ApiDoc::openapi()
+        .to_pretty_json()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(path, json)
+}
 
 #[derive(Debug, Deserialize, ToSchema)]
 struct BatchStateItem {
@@ -2701,6 +2750,19 @@ async fn registry_gossip(
 #[tokio::main]
 async fn main() {
     let cli = CliArgs::parse();
+
+    if let Some(path) = &cli.export_openapi {
+        match export_openapi(path) {
+            Ok(()) => {
+                println!("OpenAPI spec written to {}", path.display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("Failed to export OpenAPI spec to {}: {}", path.display(), e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     if cli.verbose {
         env::set_var("RUST_LOG", "debug");
@@ -3599,6 +3661,102 @@ async fn join_worker_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
 mod tests {
     use super::*;
     use crate::simulation::{SimulationError, SorobanResources};
+
+    /// Routes served by the main router that are operational rather than API
+    /// surface, and so intentionally absent from the OpenAPI spec.
+    const UNDOCUMENTED_ROUTES: &[&str] = &[
+        "/",
+        "/health",
+        "/healthz",
+        "/readyz",
+        "/metrics",
+        "/ws/jobs/:job_id",
+        "/api/v1/webhooks/incoming",
+    ];
+
+    /// Every `.route("...")` path registered by `main()`'s router.
+    fn main_router_paths() -> Vec<String> {
+        let source = include_str!("main.rs");
+        let start = source.find("async fn main()").expect("main() in main.rs");
+        let end = source[start..]
+            .find("\nmod tests {")
+            .map(|i| start + i)
+            .unwrap_or(source.len());
+        let mut paths = Vec::new();
+        let mut rest = &source[start..end];
+        while let Some(i) = rest.find(".route(\"") {
+            rest = &rest[i + ".route(\"".len()..];
+            let close = rest.find('"').expect("closing quote");
+            paths.push(rest[..close].to_string());
+            rest = &rest[close..];
+        }
+        paths
+    }
+
+    fn openapi_json() -> serde_json::Value {
+        serde_json::to_value(ApiDoc::openapi()).expect("spec serializes")
+    }
+
+    #[test]
+    fn openapi_spec_documents_every_api_route() {
+        let spec = openapi_json();
+        let documented = spec["paths"].as_object().expect("paths object");
+
+        let routes = main_router_paths();
+        assert!(!routes.is_empty(), "the main router must register routes");
+        let missing: Vec<&String> = routes
+            .iter()
+            .filter(|r| !UNDOCUMENTED_ROUTES.contains(&r.as_str()))
+            .filter(|r| !documented.contains_key(r.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "routes missing from the OpenAPI spec: {missing:?}");
+    }
+
+    #[test]
+    fn openapi_spec_has_valid_paths_schemas_and_security() {
+        let spec = openapi_json();
+
+        assert!(spec["openapi"].as_str().expect("version").starts_with("3."));
+        let paths = spec["paths"].as_object().expect("paths object");
+        assert!(!paths.is_empty());
+        assert!(paths.keys().all(|p| p.starts_with('/')));
+
+        let schemas = spec["components"]["schemas"].as_object().expect("schemas");
+        for name in ["AnalyzeRequest", "HostImportHeatResponse", "GasGolfingResponse"] {
+            assert!(schemas.contains_key(name), "schema {name} missing");
+        }
+
+        let schemes = spec["components"]["securitySchemes"].as_object().expect("security schemes");
+        assert_eq!(schemes["jwt"]["scheme"], "bearer");
+
+        // Every security requirement on an operation names a defined scheme.
+        for (path, item) in paths {
+            for (method, op) in item.as_object().expect("path item") {
+                for requirement in op["security"].as_array().into_iter().flatten() {
+                    for scheme in requirement.as_object().expect("requirement").keys() {
+                        assert!(
+                            schemes.contains_key(scheme),
+                            "{method} {path} uses undefined security scheme {scheme}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn openapi_export_writes_the_spec_as_json() {
+        let path = std::env::temp_dir()
+            .join(format!("soroscope-openapi-{}.json", std::process::id()));
+
+        export_openapi(&path).expect("export succeeds");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("readable"))
+                .expect("valid JSON");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(written, openapi_json());
+    }
 
     #[test]
     fn batch_state_groups_entries_by_requested_contract() {
