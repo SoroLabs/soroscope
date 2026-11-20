@@ -152,6 +152,14 @@ impl From<SimulationError> for AppError {
             SimulationError::ConsensusMismatch(msg) => {
                 AppError::Internal(format!("Consensus mismatch: {}", msg))
             }
+            SimulationError::TimeoutExceeded {
+                timeout_ms,
+                partial,
+            } => AppError::Internal(format!(
+                "Simulation exceeded the {timeout_ms}ms timeout \
+                 (partial budget: {} cpu instructions, {} memory bytes)",
+                partial.cpu_instructions, partial.memory_bytes
+            )),
         }
     }
 }

@@ -85,6 +85,84 @@ pub enum SimulationError {
 
     #[error("Consensus mismatch: {0}")]
     ConsensusMismatch(String),
+
+    /// The simulation did not finish within its wall-clock budget
+    /// (`simulation_timeout_ms`) or its cancellation token fired first
+    /// (#1396). `partial` carries the CPU and memory consumption recorded
+    /// before the cut-off.
+    #[error("Simulation exceeded the {timeout_ms}ms timeout")]
+    TimeoutExceeded {
+        timeout_ms: u64,
+        partial: PartialBudget,
+    },
+}
+
+/// CPU and memory consumed by a simulation before it was cut off (#1396).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialBudget {
+    pub cpu_instructions: u64,
+    pub memory_bytes: u64,
+}
+
+/// Shared recorder for the budget consumed by the steps of a simulation.
+///
+/// Each completed step adds its resources, so when the deadline fires the
+/// error reports everything that finished before it.
+#[derive(Debug, Clone, Default)]
+pub struct BudgetTelemetry(Arc<std::sync::Mutex<PartialBudget>>);
+
+impl BudgetTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add the CPU and memory reported by one completed simulation step.
+    pub fn record(&self, resources: &SorobanResources) {
+        let mut budget = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        budget.cpu_instructions = budget
+            .cpu_instructions
+            .saturating_add(resources.cpu_instructions);
+        budget.memory_bytes = budget.memory_bytes.saturating_add(resources.ram_bytes);
+    }
+
+    /// Budget recorded so far.
+    pub fn snapshot(&self) -> PartialBudget {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Run `fut` under a wall-clock `timeout` bound to `cancellation` (#1396).
+///
+/// When the timeout expires the token is cancelled, so any task holding a
+/// clone of it stops cooperatively, and the in-flight future is dropped. A
+/// token cancelled from outside ends the run the same way. Either case
+/// returns [`SimulationError::TimeoutExceeded`] with the budget `telemetry`
+/// recorded up to that point.
+pub async fn run_with_deadline<T, F>(
+    timeout: std::time::Duration,
+    cancellation: CancellationToken,
+    telemetry: &BudgetTelemetry,
+    fut: F,
+) -> Result<T, SimulationError>
+where
+    F: std::future::Future<Output = Result<T, SimulationError>>,
+{
+    let exceeded = || SimulationError::TimeoutExceeded {
+        timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        partial: telemetry.snapshot(),
+    };
+
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(exceeded()),
+        outcome = tokio::time::timeout(timeout, fut) => match outcome {
+            Ok(result) => result,
+            Err(_) => {
+                cancellation.cancel();
+                Err(exceeded())
+            }
+        },
+    }
 }
 
 impl SimulationError {
@@ -2881,6 +2959,31 @@ impl SimulationEngine {
 
         let transaction_xdr = self.create_invoke_transaction(contract_id, function_name, args)?;
         self.simulate_transaction(&transaction_xdr).await
+    }
+
+    /// [`Self::simulate_from_contract_id`] with a wall-clock deadline and a
+    /// cancellation token (#1396).
+    ///
+    /// Fails with [`SimulationError::TimeoutExceeded`] if the simulation is
+    /// still running after `timeout` (normally `simulation_timeout_ms`) or if
+    /// `cancellation` fires first; the in-flight work is dropped either way.
+    pub async fn simulate_with_timeout(
+        &self,
+        contract_id: &str,
+        function_name: &str,
+        args: Vec<String>,
+        timeout: std::time::Duration,
+        cancellation: CancellationToken,
+    ) -> Result<SimulationResult, SimulationError> {
+        let telemetry = BudgetTelemetry::new();
+        run_with_deadline(timeout, cancellation, &telemetry, async {
+            let result = self
+                .simulate_from_contract_id(contract_id, function_name, args, None, None, None)
+                .await?;
+            telemetry.record(&result.resources);
+            Ok(result)
+        })
+        .await
     }
 
     /// Re-simulate the first Soroban host-function operation from a historical transaction.
@@ -5917,6 +6020,138 @@ mod tests {
             .simulate_from_contract_id("", "test_function", vec![], None, None, None)
             .await;
         assert!(matches!(result, Err(SimulationError::NodeError(_))));
+    }
+
+    // ── Simulation deadline and cancellation (#1396) ─────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn test_simulation_deadline_times_out_stalled_execution() {
+        let telemetry = BudgetTelemetry::new();
+        telemetry.record(&SorobanResources {
+            cpu_instructions: 1_000,
+            ram_bytes: 2_048,
+            ..Default::default()
+        });
+        let cancellation = CancellationToken::new();
+
+        let result: Result<(), SimulationError> = run_with_deadline(
+            std::time::Duration::from_millis(5_000),
+            cancellation.clone(),
+            &telemetry,
+            std::future::pending(),
+        )
+        .await;
+
+        match result {
+            Err(SimulationError::TimeoutExceeded {
+                timeout_ms,
+                partial,
+            }) => {
+                assert_eq!(timeout_ms, 5_000);
+                assert_eq!(
+                    partial,
+                    PartialBudget {
+                        cpu_instructions: 1_000,
+                        memory_bytes: 2_048,
+                    }
+                );
+            }
+            other => panic!("expected TimeoutExceeded, got {other:?}"),
+        }
+        // Cooperating tasks holding the token see the cancellation.
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_simulation_deadline_passes_through_fast_result() {
+        let telemetry = BudgetTelemetry::new();
+        let cancellation = CancellationToken::new();
+
+        let result = run_with_deadline(
+            std::time::Duration::from_millis(5_000),
+            cancellation.clone(),
+            &telemetry,
+            async { Ok::<_, SimulationError>(42) },
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), 42);
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_simulation_deadline_honours_external_cancellation() {
+        let telemetry = BudgetTelemetry::new();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result: Result<(), SimulationError> = run_with_deadline(
+            std::time::Duration::from_millis(5_000),
+            cancellation,
+            &telemetry,
+            std::future::pending(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SimulationError::TimeoutExceeded { partial, .. }) if partial == PartialBudget::default()
+        ));
+    }
+
+    #[test]
+    fn test_budget_telemetry_accumulates_steps() {
+        let telemetry = BudgetTelemetry::new();
+        for _ in 0..3 {
+            telemetry.record(&SorobanResources {
+                cpu_instructions: 10,
+                ram_bytes: 20,
+                ..Default::default()
+            });
+        }
+        assert_eq!(
+            telemetry.snapshot(),
+            PartialBudget {
+                cpu_instructions: 30,
+                memory_bytes: 60,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simulate_with_timeout_against_stalled_rpc_node() {
+        // An RPC node that accepts connections but never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stalled = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+
+        let engine = SimulationEngine::new(format!("http://{addr}"));
+        let result = engine
+            .simulate_with_timeout(
+                "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                "hello",
+                vec![],
+                std::time::Duration::from_millis(200),
+                CancellationToken::new(),
+            )
+            .await;
+
+        stalled.abort();
+        assert!(
+            matches!(
+                result,
+                Err(SimulationError::TimeoutExceeded {
+                    timeout_ms: 200,
+                    ..
+                })
+            ),
+            "expected TimeoutExceeded, got {result:?}"
+        );
     }
 
     #[tokio::test]
