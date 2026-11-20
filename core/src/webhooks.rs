@@ -4,6 +4,10 @@
 //! external endpoint. The worker fans the event out to matching subscriptions,
 //! signs each request, and retries transient failures with bounded exponential
 //! backoff.
+//!
+//! Deliveries that exhaust their retries are persisted in a dead-letter queue
+//! ([`WebhookDlq`], `webhook_dlq` table) with full diagnostics, and can be
+//! inspected and replayed (#1399).
 
 use crate::contract_registry::{verify_bytecode, ContractBytecodeSource, ContractRegister};
 use chrono::{DateTime, Utc};
@@ -12,7 +16,12 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, RwLock},
@@ -119,6 +128,10 @@ impl SubscriptionRegistry {
         self.subscriptions.write().await.remove(&id)
     }
 
+    pub async fn get(&self, id: Uuid) -> Option<ContractSubscription> {
+        self.subscriptions.read().await.get(&id).cloned()
+    }
+
     pub async fn matching(&self, event: &ContractEvent) -> Vec<ContractSubscription> {
         self.subscriptions
             .read()
@@ -169,9 +182,26 @@ pub enum WebhookError {
     #[error("failed to serialize webhook payload: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("webhook delivery failed after {attempts} attempts: {reason}")]
-    DeliveryFailed { attempts: u32, reason: String },
+    DeliveryFailed {
+        attempts: u32,
+        reason: String,
+        /// HTTP status of the last attempt, if the endpoint answered at all.
+        last_status: Option<u16>,
+    },
     #[error("event rejected by contract bytecode verification: {0}")]
     BytecodeUnverified(String),
+    #[error("webhook dead-letter queue storage error: {0}")]
+    Storage(String),
+    #[error("dead-letter entry {0} not found")]
+    DlqEntryNotFound(Uuid),
+    #[error("subscription {0} no longer exists")]
+    SubscriptionNotFound(Uuid),
+}
+
+impl From<rusqlite::Error> for WebhookError {
+    fn from(error: rusqlite::Error) -> Self {
+        WebhookError::Storage(error.to_string())
+    }
 }
 
 #[derive(Clone)]
@@ -223,26 +253,31 @@ pub struct WebhookWorker {
 
 impl WebhookWorker {
     pub fn start(registry: SubscriptionRegistry, config: WebhookConfig) -> Self {
-        Self::start_with_client(registry, config, Client::new())
+        Self::start_with_client(registry, config, Client::new(), None)
+    }
+
+    /// Like [`Self::start`], but deliveries that exhaust their retries are
+    /// stored in `dlq` instead of being dropped (#1399).
+    pub fn start_with_dlq(
+        registry: SubscriptionRegistry,
+        config: WebhookConfig,
+        dlq: WebhookDlq,
+    ) -> Self {
+        Self::start_with_client(registry, config, Client::new(), Some(dlq))
     }
 
     fn start_with_client(
         registry: SubscriptionRegistry,
         config: WebhookConfig,
         client: Client,
+        dlq: Option<WebhookDlq>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel(config.queue_capacity);
         let task = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 for subscription in registry.matching(&event).await {
-                    if let Err(error) = deliver(&client, &config, &subscription, &event).await {
-                        tracing::error!(
-                            subscription_id = %subscription.id,
-                            event_id = %event.id,
-                            error = %error,
-                            "contract event webhook delivery exhausted retries"
-                        );
-                    }
+                    deliver_or_dead_letter(&client, &config, &subscription, &event, dlq.as_ref())
+                        .await;
                 }
             }
         });
@@ -254,19 +289,87 @@ impl WebhookWorker {
     }
 }
 
+/// Deliver `event` to `subscription`; if retries are exhausted, log it and
+/// persist it in `dlq` when one is configured.
+async fn deliver_or_dead_letter(
+    client: &Client,
+    config: &WebhookConfig,
+    subscription: &ContractSubscription,
+    event: &ContractEvent,
+    dlq: Option<&WebhookDlq>,
+) {
+    let delivery_id = Uuid::new_v4();
+    let Err(error) = deliver_with_id(client, config, subscription, event, delivery_id).await else {
+        return;
+    };
+    tracing::error!(
+        subscription_id = %subscription.id,
+        event_id = %event.id,
+        error = %error,
+        "contract event webhook delivery exhausted retries"
+    );
+
+    let (
+        Some(dlq),
+        WebhookError::DeliveryFailed {
+            attempts,
+            reason,
+            last_status,
+        },
+    ) = (dlq, error)
+    else {
+        return;
+    };
+    let payload = match serde_json::to_value(DeliveryPayload {
+        delivery_id,
+        subscription_id: subscription.id,
+        event,
+    }) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::error!(delivery_id = %delivery_id, error = %error, "webhook DLQ payload not serialisable");
+            return;
+        }
+    };
+    let entry = DlqEntry {
+        id: delivery_id,
+        subscription_id: subscription.id,
+        event_id: event.id,
+        target_url: subscription.callback_url.clone(),
+        payload,
+        last_status,
+        error: reason,
+        attempts,
+        failed_at: Utc::now(),
+    };
+    if let Err(error) = dlq.insert(&entry) {
+        tracing::error!(delivery_id = %delivery_id, error = %error, "failed to store webhook in DLQ");
+    }
+}
+
 async fn deliver(
     client: &Client,
     config: &WebhookConfig,
     subscription: &ContractSubscription,
     event: &ContractEvent,
 ) -> Result<(), WebhookError> {
-    let delivery_id = Uuid::new_v4();
+    deliver_with_id(client, config, subscription, event, Uuid::new_v4()).await
+}
+
+async fn deliver_with_id(
+    client: &Client,
+    config: &WebhookConfig,
+    subscription: &ContractSubscription,
+    event: &ContractEvent,
+    delivery_id: Uuid,
+) -> Result<(), WebhookError> {
     let body = serde_json::to_vec(&DeliveryPayload {
         delivery_id,
         subscription_id: subscription.id,
         event,
     })?;
     let mut last_error = "delivery was not attempted".to_string();
+    let mut last_status = None;
     let mut attempts = 0;
 
     for attempt in 1..=config.max_attempts.max(1) {
@@ -289,11 +392,15 @@ async fn deliver(
             Ok(response) => {
                 let status = response.status();
                 last_error = format!("HTTP {status}");
+                last_status = Some(status.as_u16());
                 if !is_retryable(status) {
                     break;
                 }
             }
-            Err(error) => last_error = error.to_string(),
+            Err(error) => {
+                last_error = error.to_string();
+                last_status = None;
+            }
         }
 
         if attempt < config.max_attempts {
@@ -304,7 +411,223 @@ async fn deliver(
     Err(WebhookError::DeliveryFailed {
         attempts,
         reason: last_error,
+        last_status,
     })
+}
+
+// ─── Dead-letter queue (#1399) ───────────────────────────────────────────────
+
+/// A webhook delivery that exhausted its retries.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DlqEntry {
+    /// The original delivery id, reused when the entry is replayed.
+    pub id: Uuid,
+    pub subscription_id: Uuid,
+    pub event_id: Uuid,
+    pub target_url: String,
+    /// The delivery body that was sent.
+    pub payload: Value,
+    /// HTTP status of the last attempt; `None` when the endpoint never answered.
+    pub last_status: Option<u16>,
+    pub error: String,
+    pub attempts: u32,
+    pub failed_at: DateTime<Utc>,
+}
+
+/// Result of replaying a dead-letter entry.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ReplayOutcome {
+    pub id: Uuid,
+    /// HTTP status returned by the endpoint, if it answered.
+    pub status: Option<u16>,
+    /// True when the endpoint answered 2xx and the entry was removed.
+    pub delivered: bool,
+}
+
+/// SQLite-backed store for deliveries that exhausted their retries.
+///
+/// Signing secrets are never stored here: a replay re-signs with the
+/// subscription's current secret.
+#[derive(Clone)]
+pub struct WebhookDlq {
+    conn: Arc<Mutex<rusqlite::Connection>>,
+}
+
+impl WebhookDlq {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, WebhookError> {
+        Self::init(rusqlite::Connection::open(path)?)
+    }
+
+    pub fn in_memory() -> Result<Self, WebhookError> {
+        Self::init(rusqlite::Connection::open_in_memory()?)
+    }
+
+    fn init(conn: rusqlite::Connection) -> Result<Self, WebhookError> {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS webhook_dlq (
+                id TEXT PRIMARY KEY,
+                subscription_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                target_url TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                last_status INTEGER,
+                error TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                failed_at TEXT NOT NULL
+            );
+            ",
+        )?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    fn conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn insert(&self, entry: &DlqEntry) -> Result<(), WebhookError> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO webhook_dlq
+                (id, subscription_id, event_id, target_url, payload, last_status, error, attempts, failed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                entry.id.to_string(),
+                entry.subscription_id.to_string(),
+                entry.event_id.to_string(),
+                entry.target_url,
+                serde_json::to_string(&entry.payload)?,
+                entry.last_status,
+                entry.error,
+                entry.attempts,
+                entry.failed_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every entry, oldest failure first.
+    pub fn list(&self) -> Result<Vec<DlqEntry>, WebhookError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, subscription_id, event_id, target_url, payload, last_status, error, attempts, failed_at
+             FROM webhook_dlq ORDER BY failed_at",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_entry)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(WebhookError::from)
+    }
+
+    pub fn get(&self, id: Uuid) -> Result<Option<DlqEntry>, WebhookError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, subscription_id, event_id, target_url, payload, last_status, error, attempts, failed_at
+             FROM webhook_dlq WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id.to_string()], Self::row_to_entry)?;
+        rows.next().transpose().map_err(WebhookError::from)
+    }
+
+    /// Remove an entry; returns whether it existed.
+    pub fn remove(&self, id: Uuid) -> Result<bool, WebhookError> {
+        let removed = self
+            .conn()
+            .execute("DELETE FROM webhook_dlq WHERE id = ?1", [id.to_string()])?;
+        Ok(removed > 0)
+    }
+
+    fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DlqEntry> {
+        fn invalid(
+            index: usize,
+            error: impl std::error::Error + Send + Sync + 'static,
+        ) -> rusqlite::Error {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        }
+        let uuid = |index: usize| -> rusqlite::Result<Uuid> {
+            Uuid::parse_str(&row.get::<_, String>(index)?).map_err(|e| invalid(index, e))
+        };
+        Ok(DlqEntry {
+            id: uuid(0)?,
+            subscription_id: uuid(1)?,
+            event_id: uuid(2)?,
+            target_url: row.get(3)?,
+            payload: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|e| invalid(4, e))?,
+            last_status: row.get(5)?,
+            error: row.get(6)?,
+            attempts: row.get(7)?,
+            failed_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(8)?)
+                .map_err(|e| invalid(8, e))?
+                .with_timezone(&Utc),
+        })
+    }
+
+    /// Re-send a dead-lettered delivery with a fresh timestamp and HMAC-SHA256
+    /// signature. A 2xx answer removes the entry; anything else keeps it with
+    /// the new status, error and attempt count.
+    pub async fn replay(
+        &self,
+        id: Uuid,
+        registry: &SubscriptionRegistry,
+        client: &Client,
+        config: &WebhookConfig,
+    ) -> Result<ReplayOutcome, WebhookError> {
+        let mut entry = self.get(id)?.ok_or(WebhookError::DlqEntryNotFound(id))?;
+        let subscription = registry
+            .get(entry.subscription_id)
+            .await
+            .ok_or(WebhookError::SubscriptionNotFound(entry.subscription_id))?;
+
+        let body = serde_json::to_vec(&entry.payload)?;
+        let timestamp = Utc::now().timestamp().to_string();
+        let signature = crate::webhook_validation::generate_signature(
+            &subscription.signing_secret,
+            &timestamp,
+            &body,
+        );
+        let response = client
+            .post(subscription.callback_url.clone())
+            .header("content-type", "application/json")
+            .header(DELIVERY_HEADER, entry.id.to_string())
+            .header(TIMESTAMP_HEADER, &timestamp)
+            .header(SIGNATURE_HEADER, signature)
+            .timeout(config.request_timeout)
+            .body(body)
+            .send()
+            .await;
+
+        entry.attempts = entry.attempts.saturating_add(1);
+        match response {
+            Ok(response) if response.status().is_success() => {
+                self.remove(id)?;
+                return Ok(ReplayOutcome {
+                    id,
+                    status: Some(response.status().as_u16()),
+                    delivered: true,
+                });
+            }
+            Ok(response) => {
+                let status = response.status();
+                entry.last_status = Some(status.as_u16());
+                entry.error = format!("HTTP {status}");
+            }
+            Err(error) => {
+                entry.last_status = None;
+                entry.error = error.to_string();
+            }
+        }
+        entry.failed_at = Utc::now();
+        self.insert(&entry)?;
+        Ok(ReplayOutcome {
+            id,
+            status: entry.last_status,
+            delivered: false,
+        })
+    }
 }
 
 fn is_retryable(status: StatusCode) -> bool {
@@ -540,5 +863,219 @@ mod tests {
             .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         server.abort();
+    }
+
+    // ── Dead-letter queue (#1399) ────────────────────────────────────────────
+
+    const SECRET: &str = "a-secret-that-is-at-least-thirty-two-bytes";
+
+    #[derive(Clone)]
+    struct ReceiverState {
+        status: StatusCode,
+        hits: Arc<AtomicUsize>,
+        signatures_valid: Arc<AtomicUsize>,
+    }
+
+    /// An endpoint answering `status`, counting requests with a valid signature.
+    async fn spawn_receiver(status: StatusCode) -> (String, ReceiverState, JoinHandle<()>) {
+        async fn receiver(
+            State(state): State<ReceiverState>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> StatusCode {
+            state.hits.fetch_add(1, Ordering::SeqCst);
+            let timestamp = headers.get(TIMESTAMP_HEADER).and_then(|v| v.to_str().ok());
+            let signature = headers.get(SIGNATURE_HEADER).and_then(|v| v.to_str().ok());
+            if let (Some(timestamp), Some(signature)) = (timestamp, signature) {
+                if verify(SECRET, timestamp, &body, signature) {
+                    state.signatures_valid.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            state.status
+        }
+
+        let state = ReceiverState {
+            status,
+            hits: Arc::new(AtomicUsize::new(0)),
+            signatures_valid: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/events", post(receiver))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/events"), state, server)
+    }
+
+    fn fast_retries(max_attempts: u32) -> WebhookConfig {
+        WebhookConfig {
+            max_attempts,
+            retry_base: Duration::from_millis(1),
+            retry_max: Duration::from_millis(1),
+            ..WebhookConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn webhooks_exhausted_delivery_is_stored_in_dlq() {
+        let (url, receiver, server) = spawn_receiver(StatusCode::SERVICE_UNAVAILABLE).await;
+        let subscription =
+            ContractSubscription::new("CABC", Vec::new(), url.clone(), SECRET).unwrap();
+        let dlq = WebhookDlq::in_memory().unwrap();
+        let event = event("transfer");
+
+        deliver_or_dead_letter(
+            &Client::new(),
+            &fast_retries(3),
+            &subscription,
+            &event,
+            Some(&dlq),
+        )
+        .await;
+
+        assert_eq!(receiver.hits.load(Ordering::SeqCst), 3);
+        let entries = dlq.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.subscription_id, subscription.id);
+        assert_eq!(entry.event_id, event.id);
+        assert_eq!(entry.target_url, url);
+        assert_eq!(entry.last_status, Some(503));
+        assert_eq!(entry.attempts, 3);
+        assert!(entry.error.contains("503"));
+        assert_eq!(entry.payload["event"]["event_type"], "transfer");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn webhooks_unreachable_endpoint_is_dead_lettered_without_status() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let subscription = ContractSubscription::new(
+            "CABC",
+            Vec::new(),
+            format!("http://{address}/events"),
+            SECRET,
+        )
+        .unwrap();
+        let dlq = WebhookDlq::in_memory().unwrap();
+
+        deliver_or_dead_letter(
+            &Client::new(),
+            &fast_retries(2),
+            &subscription,
+            &event("transfer"),
+            Some(&dlq),
+        )
+        .await;
+
+        let entries = dlq.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].last_status, None);
+        assert_eq!(entries[0].attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn webhooks_successful_delivery_is_not_dead_lettered() {
+        let (url, _receiver, server) = spawn_receiver(StatusCode::NO_CONTENT).await;
+        let subscription = ContractSubscription::new("CABC", Vec::new(), url, SECRET).unwrap();
+        let dlq = WebhookDlq::in_memory().unwrap();
+
+        deliver_or_dead_letter(
+            &Client::new(),
+            &fast_retries(3),
+            &subscription,
+            &event("transfer"),
+            Some(&dlq),
+        )
+        .await;
+
+        assert!(dlq.list().unwrap().is_empty());
+        server.abort();
+    }
+
+    /// Dead-letter one delivery to `url` and return the entry id.
+    async fn dead_letter_one(
+        registry: &SubscriptionRegistry,
+        dlq: &WebhookDlq,
+        url: String,
+    ) -> Uuid {
+        let subscription = ContractSubscription::new("CABC", Vec::new(), url, SECRET).unwrap();
+        registry.insert(subscription.clone()).await;
+        let (failing_url, _receiver, server) = spawn_receiver(StatusCode::BAD_GATEWAY).await;
+        let mut failing = subscription.clone();
+        failing.callback_url = failing_url;
+        deliver_or_dead_letter(
+            &Client::new(),
+            &fast_retries(1),
+            &failing,
+            &event("transfer"),
+            Some(dlq),
+        )
+        .await;
+        server.abort();
+
+        // Replays go to the subscription's registered callback, `url`.
+        dlq.list().unwrap().pop().unwrap().id
+    }
+
+    #[tokio::test]
+    async fn webhooks_replay_resigns_dispatches_and_removes_on_2xx() {
+        let (url, receiver, server) = spawn_receiver(StatusCode::OK).await;
+        let registry = SubscriptionRegistry::default();
+        let dlq = WebhookDlq::in_memory().unwrap();
+        let id = dead_letter_one(&registry, &dlq, url).await;
+
+        let outcome = dlq
+            .replay(id, &registry, &Client::new(), &WebhookConfig::default())
+            .await
+            .unwrap();
+
+        assert!(outcome.delivered);
+        assert_eq!(outcome.status, Some(200));
+        assert_eq!(receiver.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(receiver.signatures_valid.load(Ordering::SeqCst), 1);
+        assert!(dlq.get(id).unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn webhooks_failed_replay_keeps_entry_with_updated_diagnostics() {
+        let (url, _receiver, server) = spawn_receiver(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let registry = SubscriptionRegistry::default();
+        let dlq = WebhookDlq::in_memory().unwrap();
+        let id = dead_letter_one(&registry, &dlq, url).await;
+
+        let outcome = dlq
+            .replay(id, &registry, &Client::new(), &WebhookConfig::default())
+            .await
+            .unwrap();
+
+        assert!(!outcome.delivered);
+        assert_eq!(outcome.status, Some(500));
+        let entry = dlq.get(id).unwrap().unwrap();
+        assert_eq!(entry.last_status, Some(500));
+        assert_eq!(entry.attempts, 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn webhooks_replay_of_unknown_entry_fails() {
+        let dlq = WebhookDlq::in_memory().unwrap();
+        let id = Uuid::new_v4();
+
+        let error = dlq
+            .replay(
+                id,
+                &SubscriptionRegistry::default(),
+                &Client::new(),
+                &WebhookConfig::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, WebhookError::DlqEntryNotFound(missing) if missing == id));
     }
 }
