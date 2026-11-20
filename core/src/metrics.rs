@@ -35,6 +35,21 @@ pub struct AppMetrics {
     /// Tasks shed by the bounded worker pool: rejected when full or skipped
     /// after waiting longer than `max_queue_wait_ms` (issue #1409).
     pub worker_pool_shed_total: prometheus::IntCounter,
+    /// Resource exhaustion alarm severity per resource: 0 normal, 1 warning,
+    /// 2 critical (issue #1411).
+    pub resource_alarm_severity: prometheus::IntGaugeVec,
+}
+
+/// The `resource_alarm_severity{resource}` gauge published by
+/// `sys_alarms::ResourceAlarmMonitor` (issue #1411).
+pub fn resource_alarm_severity_gauge() -> Result<prometheus::IntGaugeVec, prometheus::Error> {
+    prometheus::IntGaugeVec::new(
+        Opts::new(
+            "resource_alarm_severity",
+            "Resource exhaustion alarm severity (0 normal, 1 warning, 2 critical)",
+        ),
+        &["resource"],
+    )
 }
 
 impl AppMetrics {
@@ -152,6 +167,8 @@ impl AppMetrics {
         registry.register(Box::new(worker_pool_active_tasks.clone()))?;
         registry.register(Box::new(worker_pool_queued_tasks.clone()))?;
         registry.register(Box::new(worker_pool_shed_total.clone()))?;
+        let resource_alarm_severity = resource_alarm_severity_gauge()?;
+        registry.register(Box::new(resource_alarm_severity.clone()))?;
 
         Ok(Self {
             registry,
@@ -171,6 +188,7 @@ impl AppMetrics {
             worker_pool_active_tasks,
             worker_pool_queued_tasks,
             worker_pool_shed_total,
+            resource_alarm_severity,
         })
     }
 

@@ -2704,23 +2704,33 @@ async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .iter()
         .any(|p| p.healthy);
 
-    if rpc_healthy {
+    // Issue #1411: a critical resource alarm takes the instance out of rotation.
+    let alarms = crate::sys_alarms::resource_alarm_state();
+    let critical: Vec<&str> = alarms.critical_resources().iter().map(|r| r.as_str()).collect();
+
+    if rpc_healthy && critical.is_empty() {
         (
             StatusCode::OK,
             axum::Json(serde_json::json!({
                 "status": "ready",
                 "checks": {
-                    "rpc": "ok"
+                    "rpc": "ok",
+                    "resources": alarms.snapshot()
                 }
             })),
         )
     } else {
+        if !critical.is_empty() {
+            tracing::warn!(critical = ?critical, "readyz failing on critical resource alarm");
+        }
+        let rpc_status = if rpc_healthy { "ok" } else { "unhealthy" };
         (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
                 "status": "not ready",
                 "checks": {
-                    "rpc": "unhealthy"
+                    "rpc": rpc_status,
+                    "resources": alarms.snapshot()
                 }
             })),
         )
@@ -3344,6 +3354,9 @@ async fn main() {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             interval.tick().await;
+            if crate::sys_alarms::resource_alarm_state().should_pause_background_jobs() {
+                continue;
+            }
             match depth_queue.queue_depth().await {
                 Ok(depth) => {
                     depth_metrics
@@ -3408,6 +3421,10 @@ async fn main() {
                         break;
                     }
                     _ = interval.tick() => {
+                        if crate::sys_alarms::resource_alarm_state().should_pause_background_jobs() {
+                            tracing::warn!("Fee retention cleanup paused by critical resource alarm");
+                            continue;
+                        }
                         tokio::select! {
                             biased;
                             _ = retention_shutdown.recv() => {
@@ -3469,6 +3486,21 @@ async fn main() {
     if let Some(_alarm_handle) = alarm_monitor.spawn() {
         tracing::info!("System resource alarm monitor spawned (issue #592)");
     }
+
+    // Issue #1411: memory / file-descriptor / disk exhaustion alarms.
+    let mut resource_monitor = crate::sys_alarms::ResourceAlarmMonitor::new(
+        crate::sys_alarms::HostStatsSource::new(),
+        crate::sys_alarms::resource_alarm_state(),
+        std::time::Duration::from_secs(crate::sys_alarms::DEFAULT_INTERVAL_SECS),
+    );
+    match crate::metrics::resource_alarm_severity_gauge() {
+        Ok(gauge) => match app_metrics.registry.register(Box::new(gauge.clone())) {
+            Ok(()) => resource_monitor = resource_monitor.with_gauge(gauge),
+            Err(e) => tracing::warn!(error = %e, "Failed to register resource_alarm_severity gauge"),
+        },
+        Err(e) => tracing::warn!(error = %e, "Failed to create resource_alarm_severity gauge"),
+    }
+    resource_monitor.spawn();
     // Clone the bus Arc before app_state is moved into the router, so the gRPC
     // server can subscribe to the same broadcast channel.
     let grpc_port: u16 = env::var("GRPC_PORT")
