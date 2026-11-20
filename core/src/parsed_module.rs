@@ -13,8 +13,9 @@
 //! exports before the code section — is what lets a single `parse_all` pass
 //! resolve function indices correctly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use stellar_xdr::curr::{Limited, Limits, ReadXdr, ScEnvMetaEntry, ScMetaEntry, ScSpecEntry};
 use wasmparser::{ExternalKind, Operator, Parser, Payload, TypeRef};
 
 /// A function imported from outside the module. In a Soroban contract these
@@ -236,6 +237,261 @@ pub fn loop_spans(operators: &[Operator]) -> Vec<LoopSpan> {
     spans
 }
 
+// ── Contract custom sections & spec validation (Issue #1406) ─────────────────
+
+/// Custom section holding the Soroban environment interface version.
+pub const CONTRACT_ENV_META_SECTION: &str = "contractenvmetav0";
+/// Custom section holding the XDR-encoded contract spec.
+pub const CONTRACT_SPEC_SECTION: &str = "contractspecv0";
+/// Custom section holding free-form contract metadata (key/value pairs).
+pub const CONTRACT_META_SECTION: &str = "contractmetav0";
+
+/// A structured compatibility diagnostic for a contract's custom sections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompatibilityWarning {
+    /// No `contractenvmetav0` section, so the interface version is unknown.
+    MissingEnvMeta,
+    /// No `contractspecv0` section, so exports cannot be cross-checked.
+    MissingSpec,
+    /// A custom section could not be decoded as XDR. An unknown
+    /// `ScSpecTypeDef` (or other enum) discriminant lands here too.
+    MalformedSection {
+        section: String,
+        offset: usize,
+        reason: String,
+    },
+    /// Built for an older protocol than the simulator's host.
+    OutdatedProtocol {
+        contract_protocol: u32,
+        host_protocol: u32,
+    },
+    /// Built for a newer protocol than the simulator's host can run.
+    UnsupportedProtocol {
+        contract_protocol: u32,
+        host_protocol: u32,
+    },
+    /// Pre-release interface versions must match exactly.
+    PreReleaseMismatch {
+        contract_pre_release: u32,
+        host_pre_release: u32,
+    },
+    /// The same function name is exported more than once.
+    DuplicateExport { name: String },
+    /// The same function name appears in more than one spec entry.
+    DuplicateSpecFunction { name: String },
+    /// An exported function has no `contractspecv0` entry.
+    ExportWithoutSpec { name: String },
+    /// A spec function is not exported by the module.
+    SpecWithoutExport { name: String },
+}
+
+/// What was decoded from a contract's custom sections, plus every
+/// compatibility warning found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContractMetadataReport {
+    /// `(protocol, pre_release)` from `contractenvmetav0`.
+    pub interface_version: Option<(u32, u32)>,
+    /// Key/value pairs from `contractmetav0`.
+    pub meta: Vec<(String, String)>,
+    /// Function names declared in `contractspecv0`.
+    pub spec_functions: Vec<String>,
+    /// Exported function names, in export order.
+    pub exported_functions: Vec<String>,
+    pub warnings: Vec<CompatibilityWarning>,
+}
+
+/// Decode a stream of back-to-back XDR values, returning the byte offset and
+/// reason of the first value that fails to decode.
+fn decode_xdr_stream<T: ReadXdr>(data: &[u8]) -> Result<Vec<T>, (usize, String)> {
+    let mut reader = Limited::new(std::io::Cursor::new(data), Limits::none());
+    let mut values = Vec::new();
+    while (reader.inner.position() as usize) < data.len() {
+        let offset = reader.inner.position() as usize;
+        match T::read_xdr(&mut reader) {
+            Ok(value) => values.push(value),
+            Err(e) => return Err((offset, e.to_string())),
+        }
+    }
+    Ok(values)
+}
+
+/// Compare a contract's interface version against the simulator's host.
+fn check_interface_version(
+    contract_protocol: u32,
+    contract_pre_release: u32,
+    host_protocol: u32,
+    host_pre_release: u32,
+) -> Option<CompatibilityWarning> {
+    if contract_protocol > host_protocol {
+        return Some(CompatibilityWarning::UnsupportedProtocol {
+            contract_protocol,
+            host_protocol,
+        });
+    }
+    if contract_protocol < host_protocol {
+        return Some(CompatibilityWarning::OutdatedProtocol {
+            contract_protocol,
+            host_protocol,
+        });
+    }
+    // Same protocol: pre-release builds are only compatible with the exact
+    // same pre-release.
+    if contract_pre_release != host_pre_release {
+        return Some(CompatibilityWarning::PreReleaseMismatch {
+            contract_pre_release,
+            host_pre_release,
+        });
+    }
+    None
+}
+
+/// Extract and validate the `contractenvmetav0`, `contractspecv0` and
+/// `contractmetav0` custom sections against the active simulator protocol.
+///
+/// Returns `Err` only when the bytes are not a WASM module at all; every
+/// contract-level problem is reported as a [`CompatibilityWarning`].
+pub fn validate_contract_metadata(
+    wasm_bytes: &[u8],
+) -> Result<ContractMetadataReport, ParseFailure> {
+    let host = soroban_env_host::meta::INTERFACE_VERSION;
+    validate_contract_metadata_against(wasm_bytes, host.protocol, host.pre_release)
+}
+
+/// [`validate_contract_metadata`] against an explicit host interface version.
+pub fn validate_contract_metadata_against(
+    wasm_bytes: &[u8],
+    host_protocol: u32,
+    host_pre_release: u32,
+) -> Result<ContractMetadataReport, ParseFailure> {
+    let mut report = ContractMetadataReport::default();
+    let mut saw_env_meta = false;
+    let mut saw_spec = false;
+
+    for payload in Parser::new(0).parse_all(wasm_bytes) {
+        let payload = payload.map_err(|e| ParseFailure(e.to_string()))?;
+        match payload {
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.map_err(|e| ParseFailure(e.to_string()))?;
+                    if export.kind == ExternalKind::Func {
+                        report.exported_functions.push(export.name.to_string());
+                    }
+                }
+            }
+            Payload::CustomSection(custom) => {
+                let section = custom.name();
+                let offset = custom.data_offset();
+                let malformed =
+                    |at: usize, reason: String| CompatibilityWarning::MalformedSection {
+                        section: section.to_string(),
+                        offset: offset + at,
+                        reason,
+                    };
+                if section == CONTRACT_ENV_META_SECTION {
+                    saw_env_meta = true;
+                    match decode_xdr_stream::<ScEnvMetaEntry>(custom.data()) {
+                        Ok(entries) => {
+                            for entry in entries {
+                                let ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(v) = entry;
+                                report.interface_version = Some((v.protocol, v.pre_release));
+                            }
+                        }
+                        Err((at, reason)) => report.warnings.push(malformed(at, reason)),
+                    }
+                } else if section == CONTRACT_SPEC_SECTION {
+                    saw_spec = true;
+                    match decode_xdr_stream::<ScSpecEntry>(custom.data()) {
+                        Ok(entries) => {
+                            for entry in entries {
+                                if let ScSpecEntry::FunctionV0(func) = entry {
+                                    report
+                                        .spec_functions
+                                        .push(func.name.0.to_utf8_string_lossy());
+                                }
+                            }
+                        }
+                        Err((at, reason)) => report.warnings.push(malformed(at, reason)),
+                    }
+                } else if section == CONTRACT_META_SECTION {
+                    match decode_xdr_stream::<ScMetaEntry>(custom.data()) {
+                        Ok(entries) => {
+                            for entry in entries {
+                                let ScMetaEntry::ScMetaV0(m) = entry;
+                                report.meta.push((
+                                    m.key.to_utf8_string_lossy(),
+                                    m.val.to_utf8_string_lossy(),
+                                ));
+                            }
+                        }
+                        Err((at, reason)) => report.warnings.push(malformed(at, reason)),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match report.interface_version {
+        Some((protocol, pre_release)) => {
+            if let Some(warning) =
+                check_interface_version(protocol, pre_release, host_protocol, host_pre_release)
+            {
+                report.warnings.push(warning);
+            }
+        }
+        // A present-but-malformed section was already reported above.
+        None if !saw_env_meta => report.warnings.push(CompatibilityWarning::MissingEnvMeta),
+        None => {}
+    }
+
+    let mut seen = HashSet::new();
+    for name in &report.exported_functions {
+        if !seen.insert(name.as_str()) {
+            report
+                .warnings
+                .push(CompatibilityWarning::DuplicateExport { name: name.clone() });
+        }
+    }
+
+    let mut seen = HashSet::new();
+    for name in &report.spec_functions {
+        if !seen.insert(name.as_str()) {
+            report
+                .warnings
+                .push(CompatibilityWarning::DuplicateSpecFunction { name: name.clone() });
+        }
+    }
+
+    if !saw_spec {
+        report.warnings.push(CompatibilityWarning::MissingSpec);
+    } else {
+        let spec: HashSet<&str> = report.spec_functions.iter().map(String::as_str).collect();
+        let exported: HashSet<&str> = report
+            .exported_functions
+            .iter()
+            .map(String::as_str)
+            .collect();
+        // Names starting with `_` are SDK-internal exports, not contract
+        // functions, so they are not expected in the spec.
+        for name in &report.exported_functions {
+            if !name.starts_with('_') && !spec.contains(name.as_str()) {
+                report
+                    .warnings
+                    .push(CompatibilityWarning::ExportWithoutSpec { name: name.clone() });
+            }
+        }
+        for name in &report.spec_functions {
+            if !exported.contains(name.as_str()) {
+                report
+                    .warnings
+                    .push(CompatibilityWarning::SpecWithoutExport { name: name.clone() });
+            }
+        }
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +627,246 @@ mod tests {
     fn invalid_bytes_are_rejected_rather_than_silently_scanned() {
         // The old analyzer accepted any byte string. A parser must not.
         assert!(parse_module(b"not a wasm module").is_err());
+    }
+
+    // ── Custom section & contract spec validation (Issue #1406) ───────────
+
+    use stellar_xdr::curr::{
+        ScEnvMetaEntryInterfaceVersion, ScMetaV0, ScSpecFunctionV0, ScSymbol, VecM, WriteXdr,
+    };
+
+    /// Unsigned LEB128, as used for WASM section sizes.
+    fn leb128(mut value: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return out;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    /// Encode a WASM custom section.
+    fn custom_section(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut body = leb128(name.len());
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(data);
+        let mut section = vec![0x00];
+        section.extend(leb128(body.len()));
+        section.extend(body);
+        section
+    }
+
+    /// One `() -> ()` function exported under every name in `names`.
+    fn module_exporting(names: &[&str]) -> Vec<u8> {
+        let mut wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        wasm.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]);
+        wasm.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]);
+        let mut exports = leb128(names.len());
+        for name in names {
+            exports.extend(leb128(name.len()));
+            exports.extend_from_slice(name.as_bytes());
+            exports.extend_from_slice(&[0x00, 0x00]);
+        }
+        wasm.push(0x07);
+        wasm.extend(leb128(exports.len()));
+        wasm.extend(exports);
+        wasm.extend_from_slice(&[0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b]);
+        wasm
+    }
+
+    fn env_meta(protocol: u32, pre_release: u32) -> Vec<u8> {
+        ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(ScEnvMetaEntryInterfaceVersion {
+            protocol,
+            pre_release,
+        })
+        .to_xdr(Limits::none())
+        .expect("encode env meta")
+    }
+
+    fn spec_function(name: &str) -> Vec<u8> {
+        ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+            doc: Default::default(),
+            name: ScSymbol(name.try_into().expect("valid symbol")),
+            inputs: VecM::default(),
+            outputs: VecM::default(),
+        })
+        .to_xdr(Limits::none())
+        .expect("encode spec entry")
+    }
+
+    /// A contract exporting `run`, with a matching spec and env meta.
+    fn contract(env: Option<Vec<u8>>, spec: Option<Vec<u8>>) -> Vec<u8> {
+        let mut wasm = module_exporting(&["run"]);
+        if let Some(env) = env {
+            wasm.extend(custom_section(CONTRACT_ENV_META_SECTION, &env));
+        }
+        if let Some(spec) = spec {
+            wasm.extend(custom_section(CONTRACT_SPEC_SECTION, &spec));
+        }
+        wasm
+    }
+
+    #[test]
+    fn a_valid_contract_has_no_warnings() {
+        let wasm = contract(Some(env_meta(22, 0)), Some(spec_function("run")));
+        let meta = ScMetaEntry::ScMetaV0(ScMetaV0 {
+            key: "rsver".try_into().unwrap(),
+            val: "1.81.0".try_into().unwrap(),
+        })
+        .to_xdr(Limits::none())
+        .unwrap();
+        let mut wasm = wasm;
+        wasm.extend(custom_section(CONTRACT_META_SECTION, &meta));
+
+        let report = validate_contract_metadata_against(&wasm, 22, 0).expect("valid module");
+
+        assert_eq!(report.interface_version, Some((22, 0)));
+        assert_eq!(report.spec_functions, vec!["run".to_string()]);
+        assert_eq!(
+            report.meta,
+            vec![("rsver".to_string(), "1.81.0".to_string())]
+        );
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    #[test]
+    fn missing_env_meta_is_reported() {
+        let wasm = contract(None, Some(spec_function("run")));
+        let report = validate_contract_metadata_against(&wasm, 22, 0).unwrap();
+        assert_eq!(report.warnings, vec![CompatibilityWarning::MissingEnvMeta]);
+    }
+
+    #[test]
+    fn an_outdated_protocol_is_reported() {
+        let wasm = contract(Some(env_meta(20, 0)), Some(spec_function("run")));
+        let report = validate_contract_metadata_against(&wasm, 22, 0).unwrap();
+        assert_eq!(
+            report.warnings,
+            vec![CompatibilityWarning::OutdatedProtocol {
+                contract_protocol: 20,
+                host_protocol: 22
+            }]
+        );
+    }
+
+    #[test]
+    fn a_newer_protocol_or_pre_release_mismatch_is_reported() {
+        let newer = contract(Some(env_meta(23, 0)), Some(spec_function("run")));
+        assert_eq!(
+            validate_contract_metadata_against(&newer, 22, 0)
+                .unwrap()
+                .warnings,
+            vec![CompatibilityWarning::UnsupportedProtocol {
+                contract_protocol: 23,
+                host_protocol: 22
+            }]
+        );
+
+        let pre_release = contract(Some(env_meta(22, 1)), Some(spec_function("run")));
+        assert_eq!(
+            validate_contract_metadata_against(&pre_release, 22, 0)
+                .unwrap()
+                .warnings,
+            vec![CompatibilityWarning::PreReleaseMismatch {
+                contract_pre_release: 1,
+                host_pre_release: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn malformed_sections_are_reported_with_their_offset() {
+        // Truncated env meta and a spec entry with an unknown discriminant.
+        let wasm = contract(Some(vec![0x00, 0x00]), Some(vec![0x00, 0x00, 0x00, 0x7f]));
+        let report = validate_contract_metadata_against(&wasm, 22, 0).unwrap();
+
+        let malformed: Vec<&str> = report
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                CompatibilityWarning::MalformedSection { section, .. } => Some(section.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            malformed,
+            vec![CONTRACT_ENV_META_SECTION, CONTRACT_SPEC_SECTION]
+        );
+        // A present-but-malformed env meta is not also reported as missing.
+        assert!(!report
+            .warnings
+            .contains(&CompatibilityWarning::MissingEnvMeta));
+    }
+
+    #[test]
+    fn exports_are_cross_checked_against_the_spec() {
+        let mut wasm = module_exporting(&["run", "transfer", "_"]);
+        wasm.extend(custom_section(CONTRACT_ENV_META_SECTION, &env_meta(22, 0)));
+        let mut spec = spec_function("run");
+        spec.extend(spec_function("mint"));
+        wasm.extend(custom_section(CONTRACT_SPEC_SECTION, &spec));
+
+        let report = validate_contract_metadata_against(&wasm, 22, 0).unwrap();
+
+        assert_eq!(
+            report.warnings,
+            vec![
+                CompatibilityWarning::ExportWithoutSpec {
+                    name: "transfer".to_string()
+                },
+                CompatibilityWarning::SpecWithoutExport {
+                    name: "mint".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_exports_and_spec_functions_are_reported() {
+        let mut wasm = module_exporting(&["run", "run"]);
+        wasm.extend(custom_section(CONTRACT_ENV_META_SECTION, &env_meta(22, 0)));
+        let mut spec = spec_function("run");
+        spec.extend(spec_function("run"));
+        wasm.extend(custom_section(CONTRACT_SPEC_SECTION, &spec));
+
+        let report = validate_contract_metadata_against(&wasm, 22, 0).unwrap();
+
+        assert!(report
+            .warnings
+            .contains(&CompatibilityWarning::DuplicateExport {
+                name: "run".to_string()
+            }));
+        assert!(report
+            .warnings
+            .contains(&CompatibilityWarning::DuplicateSpecFunction {
+                name: "run".to_string()
+            }));
+    }
+
+    #[test]
+    fn a_missing_spec_is_reported() {
+        let wasm = contract(Some(env_meta(22, 0)), None);
+        let report = validate_contract_metadata_against(&wasm, 22, 0).unwrap();
+        assert_eq!(report.warnings, vec![CompatibilityWarning::MissingSpec]);
+    }
+
+    #[test]
+    fn validation_uses_the_simulator_host_protocol() {
+        let host = soroban_env_host::meta::INTERFACE_VERSION;
+        let wasm = contract(
+            Some(env_meta(host.protocol, host.pre_release)),
+            Some(spec_function("run")),
+        );
+        let report = validate_contract_metadata(&wasm).unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    #[test]
+    fn non_wasm_input_is_an_error() {
+        assert!(validate_contract_metadata(b"not a wasm module").is_err());
     }
 }
