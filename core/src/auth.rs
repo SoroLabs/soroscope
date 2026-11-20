@@ -24,9 +24,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use stellar_strkey::Strkey;
 use utoipa::ToSchema;
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::response::IntoResponse;
 use std::collections::HashMap;
-use moka::sync::Cache;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ApiTier {
@@ -41,6 +44,134 @@ impl ApiTier {
             ApiTier::Pro => 1000,
         }
     }
+}
+
+/// Length of the rate-limit window that `rate_limit_per_minute` applies to.
+pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Above this many tracked tenants, idle ones are evicted on the next check.
+const MAX_TRACKED_RATE_LIMIT_KEYS: usize = 10_000;
+
+/// Outcome of a rate-limit check, rendered as `X-RateLimit-*` headers (and
+/// `Retry-After` when the request is throttled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitDecision {
+    /// Whether the request fits in the window.
+    pub allowed: bool,
+    /// Requests allowed per window for this tenant.
+    pub limit: u64,
+    /// Requests left in the current window after this one.
+    pub remaining: u64,
+    /// Seconds until the oldest request in the window expires and frees a slot.
+    pub reset_secs: u64,
+}
+
+impl RateLimitDecision {
+    /// Add `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`,
+    /// plus `Retry-After` (in seconds) when the request was throttled.
+    pub fn apply_headers(&self, headers: &mut HeaderMap) {
+        let mut set = |name: &'static str, value: u64| {
+            headers.insert(HeaderName::from_static(name), HeaderValue::from(value));
+        };
+        set("x-ratelimit-limit", self.limit);
+        set("x-ratelimit-remaining", self.remaining);
+        set("x-ratelimit-reset", self.reset_secs);
+        if !self.allowed {
+            set("retry-after", self.reset_secs.max(1));
+        }
+    }
+
+    /// HTTP 429 response carrying the rate-limit headers.
+    pub fn into_rejection(self) -> Response {
+        let mut response = AppError::TooManyRequests(format!(
+            "Rate limit of {} requests per minute exceeded",
+            self.limit
+        ))
+        .into_response();
+        self.apply_headers(response.headers_mut());
+        response
+    }
+}
+
+/// Sliding-window (request log) rate limiter keyed by tenant: the API key
+/// hash, or the client IP for requests without one.
+///
+/// Unlike a fixed per-minute bucket, a burst straddling a minute boundary
+/// cannot get twice the quota through.
+pub struct SlidingWindowLimiter {
+    window: Duration,
+    requests: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl SlidingWindowLimiter {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            requests: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record a request for `key` at `now` if it fits within `limit` requests
+    /// per window, and report the resulting quota.
+    pub fn check(&self, key: &str, limit: u64, now: Instant) -> RateLimitDecision {
+        let window = self.window;
+        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+
+        if requests.len() > MAX_TRACKED_RATE_LIMIT_KEYS {
+            requests.retain(|_, log| {
+                log.back()
+                    .is_some_and(|&last| now.saturating_duration_since(last) < window)
+            });
+        }
+
+        let log = requests.entry(key.to_string()).or_default();
+        while let Some(&oldest) = log.front() {
+            if now.saturating_duration_since(oldest) >= window {
+                log.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let allowed = (log.len() as u64) < limit;
+        if allowed {
+            log.push_back(now);
+        }
+
+        let reset_secs = log
+            .front()
+            .map(|&oldest| ceil_secs(window.saturating_sub(now.saturating_duration_since(oldest))))
+            .unwrap_or(0);
+
+        RateLimitDecision {
+            allowed,
+            limit,
+            remaining: limit.saturating_sub(log.len() as u64),
+            reset_secs,
+        }
+    }
+}
+
+fn ceil_secs(duration: Duration) -> u64 {
+    duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
+}
+
+/// Best-effort client IP for rate limiting requests that carry no API key.
+fn client_ip(req: &Request) -> String {
+    let headers = req.headers();
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .map(|ip| ip.trim().to_string())
+        .filter(|ip| !ip.is_empty())
+        .or_else(|| {
+            req.extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|info| info.0.ip().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 const CHALLENGE_EXPIRY_SECS: u64 = 300;
@@ -59,7 +190,7 @@ pub struct AuthState {
     /// When true, all verification endpoints reject requests.
     pub emergency_verification_paused: Arc<AtomicBool>,
     pub api_keys: HashMap<String, ApiTier>,
-    pub rate_limiter: Cache<String, u64>,
+    pub rate_limiter: SlidingWindowLimiter,
 }
 
 impl AuthState {
@@ -73,9 +204,7 @@ impl AuthState {
         // Dummy stored key hashes for testing
         api_keys.insert("hash_free_key".to_string(), ApiTier::Free);
         api_keys.insert("hash_pro_key".to_string(), ApiTier::Pro);
-        let rate_limiter = Cache::builder()
-            .time_to_live(Duration::from_secs(60))
-            .build();
+        let rate_limiter = SlidingWindowLimiter::new(RATE_LIMIT_WINDOW);
         let seed = match sep10_seed {
             Some(seed) => seed,
             None => {
@@ -533,19 +662,19 @@ pub async fn auth_middleware(
             AppError::Unauthorized("Invalid API Key".into())
         })?;
 
-        // Rate limiting
-        let limit = tier.rate_limit_per_minute();
-        // Just use the API key string or hash as the rate limit key
-        let cache_key = format!("{}-{}", hash_hex.clone(), now_secs() / 60);
-        
-        // Simple atomic counter increment using moka
-        let count = state.rate_limiter.get_with(cache_key.clone(), || 0);
-        if count >= limit {
-            return Err(AppError::Unauthorized("Rate limit exceeded".into()));
+        // Sliding-window rate limiting per API key (Issue #1401)
+        let decision = state.rate_limiter.check(
+            &format!("key:{hash_hex}"),
+            tier.rate_limit_per_minute(),
+            Instant::now(),
+        );
+        if !decision.allowed {
+            return Ok(decision.into_rejection());
         }
-        state.rate_limiter.insert(cache_key, count + 1);
 
-        return Ok(next.run(req).await);
+        let mut response = next.run(req).await;
+        decision.apply_headers(response.headers_mut());
+        return Ok(response);
     }
 
     // Fallback to JWT (Issue #31)
@@ -578,7 +707,19 @@ pub async fn auth_middleware(
         ));
     }
 
-    Ok(next.run(req).await)
+    // Requests without an API key fall back to the client IP at the free tier.
+    let decision = state.rate_limiter.check(
+        &format!("ip:{}", client_ip(&req)),
+        ApiTier::Free.rate_limit_per_minute(),
+        Instant::now(),
+    );
+    if !decision.allowed {
+        return Ok(decision.into_rejection());
+    }
+
+    let mut response = next.run(req).await;
+    decision.apply_headers(response.headers_mut());
+    Ok(response)
 }
 
 #[derive(Serialize, ToSchema)]
@@ -618,4 +759,141 @@ pub async fn jwks_handler(
             use_: "sig".to_string(),
         }],
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::StatusCode, routing::get, Router};
+    use tower::ServiceExt;
+
+    #[test]
+    fn sliding_window_counts_down_and_throttles_at_the_limit() {
+        let limiter = SlidingWindowLimiter::new(Duration::from_secs(60));
+        let start = Instant::now();
+
+        let first = limiter.check("key:a", 3, start);
+        assert_eq!(
+            first,
+            RateLimitDecision {
+                allowed: true,
+                limit: 3,
+                remaining: 2,
+                reset_secs: 60,
+            }
+        );
+        assert!(
+            limiter
+                .check("key:a", 3, start + Duration::from_secs(10))
+                .allowed
+        );
+        let third = limiter.check("key:a", 3, start + Duration::from_secs(20));
+        assert!(third.allowed);
+        assert_eq!(third.remaining, 0);
+
+        let throttled = limiter.check("key:a", 3, start + Duration::from_secs(30));
+        assert!(!throttled.allowed);
+        assert_eq!(throttled.remaining, 0);
+        // The first request ages out 60s after it was made, i.e. 30s from now.
+        assert_eq!(throttled.reset_secs, 30);
+    }
+
+    #[test]
+    fn sliding_window_frees_slots_as_old_requests_age_out() {
+        let limiter = SlidingWindowLimiter::new(Duration::from_secs(60));
+        let start = Instant::now();
+        assert!(limiter.check("key:a", 2, start).allowed);
+        assert!(
+            limiter
+                .check("key:a", 2, start + Duration::from_secs(30))
+                .allowed
+        );
+        assert!(
+            !limiter
+                .check("key:a", 2, start + Duration::from_secs(59))
+                .allowed
+        );
+
+        // Unlike a fixed bucket, only the request from `start` has expired.
+        let later = limiter.check("key:a", 2, start + Duration::from_secs(60));
+        assert!(later.allowed);
+        assert_eq!(later.remaining, 0);
+        assert_eq!(later.reset_secs, 30);
+    }
+
+    #[test]
+    fn sliding_window_tracks_tenants_independently() {
+        let limiter = SlidingWindowLimiter::new(Duration::from_secs(60));
+        let now = Instant::now();
+        assert!(limiter.check("key:a", 1, now).allowed);
+        assert!(!limiter.check("key:a", 1, now).allowed);
+        assert!(limiter.check("ip:203.0.113.7", 1, now).allowed);
+    }
+
+    #[test]
+    fn rate_limit_headers_include_retry_after_only_when_throttled() {
+        let mut headers = HeaderMap::new();
+        RateLimitDecision {
+            allowed: true,
+            limit: 100,
+            remaining: 42,
+            reset_secs: 17,
+        }
+        .apply_headers(&mut headers);
+        assert_eq!(headers["x-ratelimit-limit"], "100");
+        assert_eq!(headers["x-ratelimit-remaining"], "42");
+        assert_eq!(headers["x-ratelimit-reset"], "17");
+        assert!(headers.get("retry-after").is_none());
+
+        let rejection = RateLimitDecision {
+            allowed: false,
+            limit: 100,
+            remaining: 0,
+            reset_secs: 17,
+        }
+        .into_rejection();
+        assert_eq!(rejection.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejection.headers()["retry-after"], "17");
+        assert_eq!(rejection.headers()["x-ratelimit-remaining"], "0");
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_sets_rate_limit_headers_and_returns_429_after_a_burst() {
+        let state = Arc::new(AuthState::new(None, Some([7u8; 32]), "Test".into(), false));
+        let app = Router::new()
+            .route("/protected", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn(auth_middleware))
+            .layer(Extension(state));
+
+        let request = || {
+            axum::http::Request::get("/protected")
+                .header("X-API-Key", "hash_free_key")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let limit = ApiTier::Free.rate_limit_per_minute();
+        for i in 0..limit {
+            let response = app.clone().oneshot(request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let headers = response.headers();
+            assert_eq!(headers["x-ratelimit-limit"], limit.to_string().as_str());
+            assert_eq!(
+                headers["x-ratelimit-remaining"],
+                (limit - i - 1).to_string().as_str()
+            );
+            assert!(headers.contains_key("x-ratelimit-reset"));
+            assert!(headers.get("retry-after").is_none());
+        }
+
+        let throttled = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = throttled.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry_after));
+        assert_eq!(throttled.headers()["x-ratelimit-remaining"], "0");
+    }
 }

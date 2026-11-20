@@ -29,6 +29,9 @@ pub enum AppError {
 
     #[error("Unprocessable entity: {0}")]
     UnprocessableEntity(String),
+
+    #[error("Too many requests: {0}")]
+    TooManyRequests(String),
 }
 
 /// RFC 7807 "Problem Details for HTTP APIs" response body.
@@ -59,6 +62,7 @@ impl AppError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -70,6 +74,7 @@ impl AppError {
             Self::Unauthorized(_) => "unauthorized",
             Self::PayloadTooLarge(_) => "payload-too-large",
             Self::UnprocessableEntity(_) => "unprocessable-entity",
+            Self::TooManyRequests(_) => "too-many-requests",
         }
     }
 
@@ -81,6 +86,7 @@ impl AppError {
             Self::Unauthorized(_) => "Unauthorized",
             Self::PayloadTooLarge(_) => "Payload Too Large",
             Self::UnprocessableEntity(_) => "Unprocessable Entity",
+            Self::TooManyRequests(_) => "Too Many Requests",
         }
     }
 }
