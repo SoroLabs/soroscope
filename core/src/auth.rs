@@ -1,4 +1,5 @@
 use crate::errors::AppError;
+use crate::logging::{AuditEvent, AuditOutcome};
 use axum::{extract::Request, http::header, middleware::Next, response::Response, Extension, Json};
 use base64::{
     engine::general_purpose::STANDARD as BASE64,
@@ -156,9 +157,8 @@ fn ceil_secs(duration: Duration) -> u64 {
     duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
 }
 
-/// Best-effort client IP for rate limiting requests that carry no API key.
-fn client_ip(req: &Request) -> String {
-    let headers = req.headers();
+/// Client IP from `X-Forwarded-For` (first hop) or `X-Real-IP`, if present.
+fn client_ip_from_headers(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
@@ -166,6 +166,11 @@ fn client_ip(req: &Request) -> String {
         .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
         .map(|ip| ip.trim().to_string())
         .filter(|ip| !ip.is_empty())
+}
+
+/// Best-effort client IP for rate limiting requests that carry no API key.
+fn client_ip(req: &Request) -> String {
+    client_ip_from_headers(req.headers())
         .or_else(|| {
             req.extensions()
                 .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -598,6 +603,7 @@ pub async fn challenge_handler(
 )]
 pub async fn verify_handler(
     Extension(state): Extension<Arc<AuthState>>,
+    headers: HeaderMap,
     Json(payload): Json<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, AppError> {
     if state.is_verification_paused() {
@@ -606,8 +612,39 @@ pub async fn verify_handler(
         ));
     }
 
-    let token = verify_challenge_envelope(&state, &payload.transaction)?;
-    Ok(Json(VerifyResponse { token }))
+    let ip = client_ip_from_headers(&headers).unwrap_or_else(|| "unknown".to_string());
+    match verify_challenge_envelope(&state, &payload.transaction) {
+        Ok(token) => {
+            let subject = decode::<Claims>(
+                &token,
+                &state.decoding_key,
+                &Validation::new(Algorithm::RS256),
+            )
+            .map(|data| data.claims.sub)
+            .unwrap_or_else(|_| "unknown".to_string());
+            AuditEvent::new(
+                &subject,
+                &ip,
+                "auth.sep10_verify",
+                "/auth/verify",
+                AuditOutcome::Success,
+            )
+            .emit();
+            Ok(Json(VerifyResponse { token }))
+        }
+        Err(err) => {
+            AuditEvent::new(
+                "anonymous",
+                &ip,
+                "auth.sep10_verify",
+                "/auth/verify",
+                AuditOutcome::Failure,
+            )
+            .with_reason(&err.to_string())
+            .emit();
+            Err(err)
+        }
+    }
 }
 
 /// Emergency pause toggle endpoint (for administrative control).
@@ -624,9 +661,19 @@ pub async fn verify_handler(
 )]
 pub async fn emergency_pause_handler(
     Extension(state): Extension<Arc<AuthState>>,
+    headers: HeaderMap,
     Json(payload): Json<EmergencyPauseRequest>,
 ) -> Result<Json<EmergencyPauseResponse>, AppError> {
     state.set_verification_paused(payload.paused);
+    AuditEvent::new(
+        "anonymous",
+        &client_ip_from_headers(&headers).unwrap_or_else(|| "unknown".to_string()),
+        "admin.emergency_pause",
+        "auth/verification",
+        AuditOutcome::Success,
+    )
+    .with_reason(&format!("paused={}", payload.paused))
+    .emit();
 
     let message = if payload.paused {
         "Message verification has been PAUSED for emergency maintenance".to_string()
@@ -651,6 +698,19 @@ pub async fn auth_middleware(
         ));
     }
 
+    // Audit every authentication outcome (Issue #1403).
+    let ip = client_ip(&req);
+    let resource = req.uri().path().to_string();
+    let audit = |actor: &str, outcome: AuditOutcome, reason: &str| {
+        AuditEvent::new(actor, &ip, "auth.authenticate", &resource, outcome)
+            .with_reason(reason)
+            .emit();
+    };
+    let deny = |reason: String| {
+        audit("anonymous", AuditOutcome::Failure, &reason);
+        AppError::Unauthorized(reason)
+    };
+
     // Check for API Key first (Issue #32)
     if let Some(api_key) = req.headers().get("X-API-Key").and_then(|v| v.to_str().ok()) {
         // Hash the provided API key to check against stored hashes
@@ -659,8 +719,10 @@ pub async fn auth_middleware(
         let hash_hex = hex::encode(hasher.finalize());
         
         let tier = state.api_keys.get(&hash_hex).or_else(|| state.api_keys.get(api_key)).ok_or_else(|| {
-            AppError::Unauthorized("Invalid API Key".into())
+            deny("Invalid API Key".into())
         })?;
+        // Identify the key by a hash prefix; the raw key is never logged.
+        let actor = format!("key_fp:{}", &hash_hex[..12]);
 
         // Sliding-window rate limiting per API key (Issue #1401)
         let decision = state.rate_limiter.check(
@@ -669,8 +731,10 @@ pub async fn auth_middleware(
             Instant::now(),
         );
         if !decision.allowed {
+            audit(&actor, AuditOutcome::Failure, "rate limit exceeded");
             return Ok(decision.into_rejection());
         }
+        audit(&actor, AuditOutcome::Success, "api_key");
 
         let mut response = next.run(req).await;
         decision.apply_headers(response.headers_mut());
@@ -682,40 +746,46 @@ pub async fn auth_middleware(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| AppError::Unauthorized("Missing Authorization or X-API-Key header".into()))?;
+        .ok_or_else(|| deny("Missing Authorization or X-API-Key header".into()))?;
 
     let token = auth_header
         .strip_prefix("Bearer ")
-        .ok_or_else(|| AppError::Unauthorized("Expected Bearer token".into()))?;
+        .ok_or_else(|| deny("Expected Bearer token".into()))?;
 
     let mut validation = Validation::new(Algorithm::RS256);
     validation.validate_exp = true;
 
     let token_data = decode::<Claims>(token, &state.decoding_key, &validation)
-        .map_err(|e| AppError::Unauthorized(format!("Invalid token: {e}")))?;
+        .map_err(|e| deny(format!("Invalid token: {e}")))?;
 
     if !token_data.claims.scopes.contains(&"simulate".to_string()) {
-        return Err(AppError::Unauthorized(
+        return Err(deny(
             "Missing required scope 'simulate'".into(),
         ));
     }
 
     // Role validation from claims
     if !token_data.claims.roles.contains(&"admin".to_string()) && !token_data.claims.roles.contains(&"user".to_string()) {
-        return Err(AppError::Unauthorized(
+        return Err(deny(
             "Missing required roles".into(),
         ));
     }
 
     // Requests without an API key fall back to the client IP at the free tier.
     let decision = state.rate_limiter.check(
-        &format!("ip:{}", client_ip(&req)),
+        &format!("ip:{ip}"),
         ApiTier::Free.rate_limit_per_minute(),
         Instant::now(),
     );
     if !decision.allowed {
+        audit(
+            &token_data.claims.sub,
+            AuditOutcome::Failure,
+            "rate limit exceeded",
+        );
         return Ok(decision.into_rejection());
     }
+    audit(&token_data.claims.sub, AuditOutcome::Success, "jwt");
 
     let mut response = next.run(req).await;
     decision.apply_headers(response.headers_mut());
