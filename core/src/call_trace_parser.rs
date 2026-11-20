@@ -17,6 +17,8 @@
 //! final tree root represents the outermost contract invocation.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use soroban_sdk::xdr::{DiagnosticEvent, Hash, Limits, ReadXdr, ScVal};
 use stellar_strkey::{Contract as StrkeyContract, Strkey};
@@ -91,6 +93,14 @@ impl CallGraph {
     /// Maximum nesting depth of sub-calls (root = depth 1).
     pub fn max_depth(&self) -> usize {
         node_depth(&self.root)
+    }
+
+    /// Dynamic invocation count per host function: how many `"Host"` nodes in
+    /// the tree carry each function name. Feeds the host import heat score.
+    pub fn host_call_counts(&self) -> HashMap<String, u64> {
+        let mut counts = HashMap::new();
+        count_host_calls(&self.root, &mut counts);
+        counts
     }
 }
 
@@ -371,6 +381,15 @@ fn append_mermaid_nodes(node: &CallNode, mermaid: &mut String, id_gen: &mut usiz
 
 fn count_nodes(node: &CallNode) -> usize {
     1 + node.children.iter().map(count_nodes).sum::<usize>()
+}
+
+fn count_host_calls(node: &CallNode, counts: &mut HashMap<String, u64>) {
+    if node.contract_id == "Host" {
+        *counts.entry(node.function.clone()).or_insert(0) += 1;
+    }
+    for child in &node.children {
+        count_host_calls(child, counts);
+    }
 }
 
 fn node_depth(node: &CallNode) -> usize {

@@ -2,6 +2,7 @@ use crate::simulation::{
     first_dimension_at_or_above, BytesByDurability, CostBreakdown, DurabilityByteCounts,
     LimitHeadroom, SorobanResources,
 };
+use crate::host_import_heat::{CostClass, HostCallHotspot, TOP_HOST_HOTSPOTS};
 use serde::{Deserialize, Serialize};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -412,6 +413,51 @@ pub fn insights_from_headroom(headroom: &LimitHeadroom, rule_name: &str) -> Vec<
     }
 
     out
+}
+
+/// Surface the top host-call hotspots (issue #1408) as insights.
+///
+/// `hotspots` comes from `host_import_heat::rank_host_hotspots`, already sorted
+/// by heat. At most [`TOP_HOST_HOTSPOTS`] are reported; a hotspot at 75 heat or
+/// above is a Warning, the rest are Info.
+pub fn insights_from_host_hotspots(hotspots: &[HostCallHotspot], rule_name: &str) -> Vec<Insight> {
+    hotspots
+        .iter()
+        .take(TOP_HOST_HOTSPOTS)
+        .map(|hotspot| {
+            let severity = if hotspot.heat_score >= 75.0 {
+                Severity::Warning
+            } else {
+                Severity::Info
+            };
+            let suggested_fix = match hotspot.cost_class {
+                CostClass::Crypto => format!(
+                    "Batch or cache {} results, or verify off-chain where the trust model allows.",
+                    hotspot.host_function
+                ),
+                CostClass::Storage => format!(
+                    "Reduce {} calls by caching reads in memory and writing once per invocation.",
+                    hotspot.host_function
+                ),
+                _ => format!("Review how often {} is called on the hot path.", hotspot.host_function),
+            };
+            Insight {
+                severity,
+                rule: rule_name.to_string(),
+                message: format!(
+                    "Host call hotspot: {} ({}) heat {:.1}/100 from {} static call site(s) and {} \
+                     traced invocation(s), weight {}",
+                    hotspot.host_function,
+                    hotspot.cost_class.as_str(),
+                    hotspot.heat_score,
+                    hotspot.static_calls,
+                    hotspot.dynamic_calls,
+                    hotspot.weight
+                ),
+                suggested_fix,
+            }
+        })
+        .collect()
 }
 
 impl InsightRule for LimitHeadroomRule {
@@ -1282,5 +1328,38 @@ mod tests {
         let breakdown = CostBreakdown::default();
         assert_eq!(breakdown.cpu_fraction("WasmInsnExec"), 0.0);
         assert_eq!(breakdown.dominant_cpu_type(), None);
+    }
+
+    fn hotspot(name: &str, class: CostClass, heat: f64) -> HostCallHotspot {
+        HostCallHotspot {
+            host_function: name.to_string(),
+            cost_class: class,
+            static_calls: 1,
+            dynamic_calls: 2,
+            weight: 10,
+            heat_score: heat,
+        }
+    }
+
+    #[test]
+    fn host_import_heat_hotspots_surface_the_top_five() {
+        let hotspots: Vec<HostCallHotspot> = vec![
+            hotspot("bls12_381_multi_pairing_check", CostClass::Crypto, 100.0),
+            hotspot("put_contract_data", CostClass::Storage, 60.0),
+            hotspot("verify_sig_ed25519", CostClass::Crypto, 40.0),
+            hotspot("get_contract_data", CostClass::Storage, 20.0),
+            hotspot("compute_hash_sha256", CostClass::Crypto, 10.0),
+            hotspot("obj_cmp", CostClass::Other, 1.0),
+        ];
+
+        let insights = insights_from_host_hotspots(&hotspots, "host_import_heat");
+
+        assert_eq!(insights.len(), 5);
+        assert_eq!(insights[0].severity, Severity::Warning);
+        assert!(insights[0].message.contains("bls12_381_multi_pairing_check"));
+        assert!(insights[0].message.contains("100.0/100"));
+        assert_eq!(insights[1].severity, Severity::Info);
+        assert!(insights.iter().all(|i| i.rule == "host_import_heat"));
+        assert!(!insights.iter().any(|i| i.message.contains("obj_cmp")));
     }
 }

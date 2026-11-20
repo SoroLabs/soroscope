@@ -132,6 +132,7 @@ impl ContractCostParams {
 #[serde(rename_all = "snake_case")]
 pub enum CostClass {
     Storage,
+    Crypto,
     Event,
     ContractCode,
     Other,
@@ -141,6 +142,7 @@ impl CostClass {
     pub fn as_str(&self) -> &'static str {
         match self {
             CostClass::Storage => "storage",
+            CostClass::Crypto => "crypto",
             CostClass::Event => "event",
             CostClass::ContractCode => "contract_code",
             CostClass::Other => "other",
@@ -156,11 +158,163 @@ pub fn classify_import(qualified_name: &str) -> CostClass {
         } else {
             CostClass::Storage
         }
+    } else if is_crypto_host_function(qualified_name) {
+        CostClass::Crypto
     } else if qualified_name.contains("contract_event") || qualified_name.contains("log") {
         CostClass::Event
     } else {
         CostClass::Other
     }
+}
+
+fn is_crypto_host_function(name: &str) -> bool {
+    name.contains("bls12_381")
+        || name.contains("verify_sig")
+        || name.contains("compute_hash")
+        || name.contains("recover_key")
+}
+
+// ── Host function names and weights (issue #1408) ────────────────────────────
+
+/// Soroban host import symbols as they appear in a compiled contract
+/// (`module`, `symbol`) mapped to the host function they call.
+///
+/// Compiled contracts import host functions by short symbols from the
+/// `soroban-env-common` interface (`l` = ledger, `c` = crypto). Modules that
+/// import by full name (`env.put_contract_data`) need no table entry.
+const HOST_SYMBOLS: &[(&str, &str, &str)] = &[
+    ("l", "_", "put_contract_data"),
+    ("l", "0", "has_contract_data"),
+    ("l", "1", "get_contract_data"),
+    ("l", "2", "del_contract_data"),
+    ("c", "_", "compute_hash_sha256"),
+    ("c", "0", "verify_sig_ed25519"),
+    ("c", "1", "compute_hash_keccak256"),
+    ("c", "2", "recover_key_ecdsa_secp256k1"),
+    ("c", "3", "verify_sig_ecdsa_secp256r1"),
+];
+
+/// Resolve a `module.name` import to a readable host function name.
+///
+/// Known short symbols are looked up in [`HOST_SYMBOLS`]; otherwise the name
+/// after the module prefix is returned (`env.put_contract_data` becomes
+/// `put_contract_data`), and an import with no prefix is returned unchanged.
+pub fn resolve_host_function_name(qualified_name: &str) -> String {
+    let Some((module, name)) = qualified_name.split_once('.') else {
+        return qualified_name.to_string();
+    };
+    HOST_SYMBOLS
+        .iter()
+        .find(|(m, sym, _)| *m == module && *sym == name)
+        .map(|(_, _, host)| (*host).to_string())
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// Relative CPU/memory weight of one call to a host function.
+///
+/// Pairing checks and signature verification dominate a crypto-heavy budget,
+/// and ledger writes dominate a storage-heavy one; a plain host helper is the
+/// unit weight. The scale is relative, used only to rank hotspots.
+pub fn host_function_weight(host_function: &str) -> u64 {
+    if host_function.contains("bls12_381_multi_pairing_check") {
+        1000
+    } else if host_function.contains("bls12_381") {
+        200
+    } else if host_function.contains("verify_sig_ecdsa_secp256r1")
+        || host_function.contains("recover_key_ecdsa_secp256k1")
+    {
+        150
+    } else if host_function.contains("verify_sig_ed25519") {
+        100
+    } else if host_function.contains("put_contract_data")
+        || host_function.contains("del_contract_data")
+    {
+        50
+    } else if host_function.contains("extend_") && host_function.contains("ttl") {
+        30
+    } else if host_function.contains("get_contract_data")
+        || host_function.contains("has_contract_data")
+    {
+        25
+    } else if host_function.contains("compute_hash") {
+        20
+    } else if host_function.contains("contract_event") || host_function.contains("log") {
+        5
+    } else {
+        1
+    }
+}
+
+/// How many hotspots the insights report surfaces.
+pub const TOP_HOST_HOTSPOTS: usize = 5;
+
+/// One host function's combined static and dynamic heat.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct HostCallHotspot {
+    /// Readable host function name, e.g. `verify_sig_ed25519`.
+    pub host_function: String,
+    pub cost_class: CostClass,
+    /// Direct call sites across every function in the module.
+    pub static_calls: u64,
+    /// Invocations observed in a simulation's call trace.
+    pub dynamic_calls: u64,
+    /// Relative per-call weight from [`host_function_weight`].
+    pub weight: u64,
+    /// Normalized heat in `0.0..=100.0`; the hottest function scores 100.
+    pub heat_score: f64,
+}
+
+/// Rank host functions by `(static_calls + dynamic_calls) * weight`,
+/// normalized so the hottest scores 100. `dynamic_calls` is keyed by host
+/// function name, e.g. from `CallGraph::host_call_counts`; pass an empty map
+/// for a static-only ranking. Returns at most `limit` hotspots.
+pub fn rank_host_hotspots(
+    map: &HostImportHeatMap,
+    dynamic_calls: &HashMap<String, u64>,
+    limit: usize,
+) -> Vec<HostCallHotspot> {
+    let mut static_calls: HashMap<String, u64> = HashMap::new();
+    for import in map.rows.iter().flat_map(|r| r.imports.iter()) {
+        *static_calls.entry(resolve_host_function_name(&import.import)).or_insert(0) +=
+            import.call_count;
+    }
+
+    let mut names: Vec<&String> = static_calls.keys().chain(dynamic_calls.keys()).collect();
+    names.sort();
+    names.dedup();
+
+    let raw: Vec<(String, u64, u64, u64, u64)> = names
+        .into_iter()
+        .map(|name| {
+            let s = static_calls.get(name).copied().unwrap_or(0);
+            let d = dynamic_calls.get(name).copied().unwrap_or(0);
+            let weight = host_function_weight(name);
+            (name.clone(), s, d, weight, (s + d).saturating_mul(weight))
+        })
+        .collect();
+
+    let max = raw.iter().map(|r| r.4).max().unwrap_or(0);
+    let mut hotspots: Vec<HostCallHotspot> = raw
+        .into_iter()
+        .filter(|r| r.4 > 0)
+        .map(|(name, s, d, weight, score)| HostCallHotspot {
+            cost_class: classify_import(&name),
+            host_function: name,
+            static_calls: s,
+            dynamic_calls: d,
+            weight,
+            heat_score: score as f64 * 100.0 / max as f64,
+        })
+        .collect();
+
+    hotspots.sort_by(|a, b| {
+        b.heat_score
+            .partial_cmp(&a.heat_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.host_function.cmp(&b.host_function))
+    });
+    hotspots.truncate(limit);
+    hotspots
 }
 
 /// Marks every number in the report as a static estimate.
@@ -540,6 +694,109 @@ mod tests {
 
         assert!(put > get, "a write must cost more than a read");
         assert!(get > other, "a ledger read must cost more than a plain import");
+    }
+
+    /// A module importing `(module, name)` pairs, with one export `run` that
+    /// calls each import the given number of times.
+    fn module_with_calls(imports: &[(&str, &str, usize)]) -> Vec<u8> {
+        let mut wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        wasm.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]);
+        let mut section = vec![imports.len() as u8];
+        for (module, name, _) in imports {
+            section.push(module.len() as u8);
+            section.extend_from_slice(module.as_bytes());
+            section.push(name.len() as u8);
+            section.extend_from_slice(name.as_bytes());
+            section.extend_from_slice(&[0x00, 0x00]);
+        }
+        wasm.push(0x02);
+        wasm.push(section.len() as u8);
+        wasm.extend_from_slice(&section);
+        let func_index = imports.len() as u8;
+        wasm.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]);
+        let mut export = vec![0x01, 0x03];
+        export.extend_from_slice(b"run");
+        export.extend_from_slice(&[0x00, func_index]);
+        wasm.push(0x07);
+        wasm.push(export.len() as u8);
+        wasm.extend_from_slice(&export);
+        let mut body = vec![0x00];
+        for (index, (_, _, calls)) in imports.iter().enumerate() {
+            for _ in 0..*calls {
+                body.extend_from_slice(&[0x10, index as u8]);
+            }
+        }
+        body.push(0x0b);
+        let mut code = vec![0x01, body.len() as u8];
+        code.extend_from_slice(&body);
+        wasm.push(0x0a);
+        wasm.push(code.len() as u8);
+        wasm.extend_from_slice(&code);
+        wasm
+    }
+
+    #[test]
+    fn host_import_heat_resolves_short_symbols_to_host_function_names() {
+        assert_eq!(resolve_host_function_name("l._"), "put_contract_data");
+        assert_eq!(resolve_host_function_name("l.1"), "get_contract_data");
+        assert_eq!(resolve_host_function_name("c.0"), "verify_sig_ed25519");
+        assert_eq!(
+            resolve_host_function_name("env.bls12_381_multi_pairing_check"),
+            "bls12_381_multi_pairing_check"
+        );
+        assert_eq!(resolve_host_function_name("x.unknown"), "unknown");
+    }
+
+    #[test]
+    fn host_import_heat_ranks_a_crypto_heavy_contract() {
+        let wasm = module_with_calls(&[
+            ("env", "bls12_381_multi_pairing_check", 1),
+            ("c", "0", 2),
+            ("l", "1", 3),
+            ("env", "obj_cmp", 10),
+        ]);
+        let map = build_host_import_heat_map(&wasm, "crypto_heavy", &ContractCostParams::free())
+            .expect("parses");
+        let hotspots = rank_host_hotspots(&map, &HashMap::new(), TOP_HOST_HOTSPOTS);
+
+        assert_eq!(hotspots[0].host_function, "bls12_381_multi_pairing_check");
+        assert_eq!(hotspots[0].cost_class, CostClass::Crypto);
+        assert_eq!(hotspots[0].heat_score, 100.0);
+        assert_eq!(hotspots[1].host_function, "verify_sig_ed25519");
+        assert!(hotspots.iter().all(|h| (0.0..=100.0).contains(&h.heat_score)));
+        assert_eq!(hotspots.last().expect("hotspots").host_function, "obj_cmp");
+    }
+
+    #[test]
+    fn host_import_heat_ranks_a_storage_heavy_contract_with_dynamic_calls() {
+        let wasm = module_with_calls(&[("l", "_", 1), ("l", "1", 1), ("c", "_", 1)]);
+        let map = build_host_import_heat_map(&wasm, "storage_heavy", &ContractCostParams::free())
+            .expect("parses");
+        // The trace shows the write running far more often than its one call site.
+        let dynamic = HashMap::from([("put_contract_data".to_string(), 9)]);
+        let hotspots = rank_host_hotspots(&map, &dynamic, TOP_HOST_HOTSPOTS);
+
+        assert_eq!(hotspots[0].host_function, "put_contract_data");
+        assert_eq!(hotspots[0].cost_class, CostClass::Storage);
+        assert_eq!(hotspots[0].static_calls, 1);
+        assert_eq!(hotspots[0].dynamic_calls, 9);
+        assert_eq!(hotspots[0].heat_score, 100.0);
+        assert_eq!(hotspots[1].host_function, "get_contract_data");
+    }
+
+    #[test]
+    fn host_import_heat_caps_hotspots_at_the_limit() {
+        let wasm = module_with_calls(&[
+            ("l", "_", 1),
+            ("l", "0", 1),
+            ("l", "1", 1),
+            ("l", "2", 1),
+            ("c", "_", 1),
+            ("c", "0", 1),
+        ]);
+        let map = build_host_import_heat_map(&wasm, "many", &ContractCostParams::free())
+            .expect("parses");
+        assert_eq!(rank_host_hotspots(&map, &HashMap::new(), TOP_HOST_HOTSPOTS).len(), 5);
     }
 
     #[test]
