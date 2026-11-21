@@ -54,11 +54,11 @@ impl ContractSubscription {
                 "contract_id cannot be empty".into(),
             ));
         }
-        if !(callback_url.starts_with("http://") || callback_url.starts_with("https://")) {
-            return Err(WebhookError::InvalidSubscription(
-                "callback_url must use http or https".into(),
-            ));
-        }
+        crate::webhook_validation::validate_webhook_target_url(
+            &callback_url,
+            cfg!(debug_assertions),
+        )
+        .map_err(|error| WebhookError::InvalidSubscription(error.to_string()))?;
         if signing_secret.len() < 32 {
             return Err(WebhookError::InvalidSubscription(
                 "signing_secret must contain at least 32 bytes".into(),
@@ -223,7 +223,7 @@ pub struct WebhookWorker {
 
 impl WebhookWorker {
     pub fn start(registry: SubscriptionRegistry, config: WebhookConfig) -> Self {
-        Self::start_with_client(registry, config, Client::new())
+        Self::start_with_client(registry, config, build_outbound_client(&config))
     }
 
     fn start_with_client(
@@ -252,6 +252,20 @@ impl WebhookWorker {
             task,
         }
     }
+}
+
+/// Builds the HTTP client used for outbound webhook deliveries.
+///
+/// Redirects are never followed: an attacker-controlled endpoint could
+/// otherwise answer with a `302` pointing at an internal address (for example
+/// the cloud metadata service at `169.254.169.254`) and bypass the
+/// registration-time SSRF checks.
+fn build_outbound_client(config: &WebhookConfig) -> Client {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(config.request_timeout)
+        .build()
+        .expect("failed to build webhook HTTP client")
 }
 
 async fn deliver(
@@ -475,6 +489,46 @@ mod tests {
     fn rejects_weak_subscription_configuration() {
         let result = ContractSubscription::new("", Vec::new(), "https://example.com", "short");
         assert!(matches!(result, Err(WebhookError::InvalidSubscription(_))));
+    }
+
+    #[test]
+    fn rejects_ssrf_callback_urls_at_registration() {
+        let secret = "a-secret-that-is-at-least-thirty-two-bytes";
+        let blocked = [
+            "http://127.0.0.1:8080/admin",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/hook",
+            "http://172.16.0.1/hook",
+            "http://192.168.1.10/hook",
+            "http://localhost/hook",
+            "http://[::1]/hook",
+            "file:///etc/passwd",
+        ];
+        for url in blocked {
+            let result = ContractSubscription::new("CABC", Vec::new(), url, secret);
+            assert!(
+                matches!(result, Err(WebhookError::InvalidSubscription(_))),
+                "expected {url} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_public_https_callback_url() {
+        let subscription = ContractSubscription::new(
+            "CABC",
+            Vec::new(),
+            "https://example.com/events",
+            "a-secret-that-is-at-least-thirty-two-bytes",
+        )
+        .unwrap();
+        assert_eq!(subscription.callback_url, "https://example.com/events");
+    }
+
+    #[test]
+    fn outbound_client_does_not_follow_redirects() {
+        let client = build_outbound_client(&WebhookConfig::default());
+        assert_eq!(client.redirect_policy(), &reqwest::redirect::Policy::none());
     }
 
     #[tokio::test]
