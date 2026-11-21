@@ -10,7 +10,14 @@
 //!
 //! The engine tries local first and falls back to RPC when no WASM is
 //! loaded for the target contract or a retriable error occurs.
+//!
+//! This module also hosts the [`ShutdownCoordinator`], which orchestrates
+//! graceful drain across HTTP, gRPC, WebSocket and the worker pool.
 
 pub mod local;
+pub mod shutdown;
 
 pub use local::{ContractInvocation, LocalRunner};
+pub use shutdown::{
+    DrainError, ShutdownCoordinator, ShutdownHook, ShutdownPhase, ShutdownSignal,
+};

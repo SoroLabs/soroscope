@@ -197,3 +197,136 @@ export function clearSelectedNetwork(): void {
     console.warn('Failed to clear selected network preference', e);
   }
 }
+
+/* -------------------------------------------------------------------------- */
+/* Shareable permalink state codec                                            */
+/* -------------------------------------------------------------------------- */
+
+export const PERMALINK_STATE_PARAM = 'state';
+
+export interface SimulationState {
+  network: string;
+  contractId: string;
+  fnName: string;
+  args: string[];
+  viewTab: string;
+}
+
+export const DEFAULT_SIMULATION_STATE: SimulationState = {
+  network: 'testnet',
+  contractId: '',
+  fnName: '',
+  args: [],
+  viewTab: 'simulate',
+};
+
+const MAX_STATE_LENGTH = 8192;
+const MAX_ARGS = 50;
+const MAX_FIELD_LENGTH = 4096;
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlToBytes(base64url: string): Uint8Array {
+  const normalized = base64url.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function isSafeString(value: unknown, maxLength = MAX_FIELD_LENGTH): value is string {
+  return typeof value === 'string' && value.length <= maxLength;
+}
+
+/**
+ * Encode a simulation state into a compact base64url string suitable for a
+ * `?state=` query parameter. Returns an empty string when the state cannot be
+ * serialized so callers can fall back gracefully.
+ */
+export function encodeSimulationState(state: SimulationState): string {
+  try {
+    const payload = {
+      n: state.network,
+      c: state.contractId,
+      f: state.fnName,
+      a: state.args,
+      t: state.viewTab,
+    };
+    const json = JSON.stringify(payload);
+    return bytesToBase64Url(new TextEncoder().encode(json));
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Decode a `?state=` query parameter back into a validated simulation state.
+ * Malformed, oversized, or tampered input falls back to the default state.
+ */
+export function decodeSimulationState(encoded: string | null | undefined): SimulationState {
+  if (!encoded || typeof encoded !== 'string' || encoded.length > MAX_STATE_LENGTH) {
+    return { ...DEFAULT_SIMULATION_STATE };
+  }
+
+  try {
+    const json = new TextDecoder().decode(base64UrlToBytes(encoded));
+    const parsed = JSON.parse(json) as Record<string, unknown>;
+    if (typeof parsed !== 'object' || parsed === null) {
+      return { ...DEFAULT_SIMULATION_STATE };
+    }
+
+    const network = isSafeString(parsed.n) ? parsed.n : DEFAULT_SIMULATION_STATE.network;
+    const contractId = isSafeString(parsed.c) ? parsed.c : DEFAULT_SIMULATION_STATE.contractId;
+    const fnName = isSafeString(parsed.f) ? parsed.f : DEFAULT_SIMULATION_STATE.fnName;
+    const viewTab = isSafeString(parsed.t) ? parsed.t : DEFAULT_SIMULATION_STATE.viewTab;
+
+    let args: string[] = [];
+    if (Array.isArray(parsed.a)) {
+      args = parsed.a
+        .filter((arg): arg is string => isSafeString(arg))
+        .slice(0, MAX_ARGS);
+    }
+
+    return { network, contractId, fnName, args, viewTab };
+  } catch {
+    return { ...DEFAULT_SIMULATION_STATE };
+  }
+}
+
+/**
+ * Build a shareable permalink URL for the given simulation state.
+ */
+export function buildPermalink(
+  state: SimulationState,
+  baseUrl?: string,
+): string {
+  const encoded = encodeSimulationState(state);
+  const base =
+    baseUrl ??
+    (typeof window !== 'undefined' && window.location
+      ? `${window.location.origin}${window.location.pathname}`
+      : '');
+  if (!encoded) return base;
+  return `${base}?${PERMALINK_STATE_PARAM}=${encoded}`;
+}
+
+/**
+ * Read and decode the simulation state from a URL search string.
+ */
+export function readSimulationStateFromSearch(search: string): SimulationState {
+  try {
+    const params = new URLSearchParams(search);
+    return decodeSimulationState(params.get(PERMALINK_STATE_PARAM));
+  } catch {
+    return { ...DEFAULT_SIMULATION_STATE };
+  }
+}

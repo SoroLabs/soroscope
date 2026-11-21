@@ -18,6 +18,16 @@ export interface CopyButtonProps {
   className?: string;
   iconSize?: number;
   variant?: "default" | "outline" | "ghost" | "icon";
+  /**
+   * Optional callback that produces the text to copy at click time. When
+   * provided it takes precedence over `text`, which allows callers (e.g. the
+   * Share Permalink button) to build the payload lazily from current state.
+   */
+  buildText?: () => string;
+  /** Accessible label override for the button (defaults to `${label} to clipboard`). */
+  ariaLabel?: string;
+  /** Native title attribute override for the button. */
+  title?: string;
   onCopy?: () => void;
   onError?: (error: unknown, message: string) => void;
 }
@@ -33,6 +43,9 @@ export function CopyButton({
   className = "",
   iconSize = 16,
   variant = "ghost",
+  buildText,
+  ariaLabel,
+  title,
   onCopy,
   onError,
 }: CopyButtonProps) {
@@ -60,7 +73,8 @@ export function CopyButton({
       attemptRef.current = attempt;
 
       try {
-        await writeTextToClipboard(text);
+        const payload = buildText ? buildText() : text;
+        await writeTextToClipboard(payload);
 
         // A newer click already settled the feedback state.
         if (attemptRef.current !== attempt) return;
@@ -79,7 +93,7 @@ export function CopyButton({
         console.error("Failed to copy text: ", err);
       }
     },
-    [feedback, onCopy, onError, text],
+    [buildText, feedback, onCopy, onError, text],
   );
 
   const isCopied = status === COPY_STATE.COPIED;
@@ -154,8 +168,10 @@ export function CopyButton({
         type="button"
         onClick={handleCopy}
         data-state={status}
-        aria-label={label ? `${label} to clipboard` : "Copy to clipboard"}
-        title={!showTooltip ? activeLabel || "Copy" : undefined}
+        aria-label={
+          ariaLabel ?? (label ? `${label} to clipboard` : "Copy to clipboard")
+        }
+        title={title ?? (!showTooltip ? activeLabel || "Copy" : undefined)}
         className={`inline-flex min-h-[36px] items-center justify-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-all duration-150 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 disabled:cursor-not-allowed disabled:opacity-60 ${variantStyles} ${isCopied || isError ? activeStateStyles : ""} ${className}`}
       >
         {isCopied ? (

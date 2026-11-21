@@ -327,8 +327,24 @@ async fn handle_socket(mut socket: WebSocket, job_id: String, state: Arc<crate::
 
     let mut rx = state.simulation_bus.subscribe();
 
+    // Observe the shutdown coordinator so we can send a Close frame and stop
+    // subscribing to new events as soon as a drain begins.
+    let mut shutdown_rx = state.shutdown_coordinator.subscribe();
+
     loop {
         tokio::select! {
+            // Shutdown signalled: stop consuming events and close gracefully.
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    tracing::info!(
+                        job_id = %job_id,
+                        "Server shutting down — sending WebSocket Close frame"
+                    );
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+
             // Receive next event from the bus
             result = rx.recv() => {
                 match result {
