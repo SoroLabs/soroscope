@@ -44,9 +44,11 @@ use axum::{
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+use url::{Host, Url};
 
 use crate::webhooks::{DELIVERY_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER};
 
@@ -223,6 +225,113 @@ pub fn verify_signature(secret: &str, timestamp: &str, body: &[u8], signature: &
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Outbound target URL validation (SSRF protection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Validate a user-supplied outbound webhook target URL to prevent SSRF.
+///
+/// # Rules
+///
+/// - The URL must parse and use `http` or `https`. Any other scheme
+///   (e.g. `file://`, `ftp://`, `gopher://`) is rejected.
+/// - In production (`allow_localhost_in_dev == false`) only `https://` is
+///   accepted. `http://` is permitted only when `allow_localhost_in_dev` is
+///   `true` (local development).
+/// - The host must not resolve to a loopback, link-local, private (RFC1918 /
+///   IPv6 unique-local), or unspecified address, and must not be `localhost`.
+///   This blocks cloud metadata endpoints such as `169.254.169.254` and
+///   internal LAN addresses.
+///
+/// Note: this validates the literal host only. Callers must additionally
+/// disable redirect following on the outbound HTTP client so that an external
+/// server cannot 302-redirect into an internal network.
+pub fn validate_webhook_target_url(
+    url: &str,
+    allow_localhost_in_dev: bool,
+) -> Result<Url, WebhookValidationError> {
+    let parsed = Url::parse(url)
+        .map_err(|e| WebhookValidationError::InvalidTargetUrl(format!("invalid URL: {e}")))?;
+
+    match parsed.scheme() {
+        "https" => {}
+        "http" if allow_localhost_in_dev => {}
+        "http" => {
+            return Err(WebhookValidationError::InvalidTargetUrl(
+                "http:// is not allowed; use https://".to_string(),
+            ));
+        }
+        other => {
+            return Err(WebhookValidationError::InvalidTargetUrl(format!(
+                "unsupported scheme '{other}'; only http(s) is allowed"
+            )));
+        }
+    }
+
+    let host = parsed
+        .host()
+        .ok_or_else(|| WebhookValidationError::InvalidTargetUrl("URL has no host".to_string()))?;
+
+    let blocked = match host {
+        Host::Domain(domain) => {
+            let domain = domain.to_ascii_lowercase();
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
+        Host::Ipv4(ip) => is_blocked_ipv4(ip),
+        Host::Ipv6(ip) => is_blocked_ipv6(ip),
+    };
+
+    if blocked {
+        return Err(WebhookValidationError::InvalidTargetUrl(
+            "target host resolves to a loopback, link-local, private, or unspecified address"
+                .to_string(),
+        ));
+    }
+
+    Ok(parsed)
+}
+
+/// Returns `true` for loopback, link-local, private (RFC1918), and unspecified
+/// IPv4 addresses.
+fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
+    ip.is_loopback()          // 127.0.0.0/8
+        || ip.is_link_local() // 169.254.0.0/16 (includes 169.254.169.254)
+        || ip.is_private()    // 10/8, 172.16/12, 192.168/16
+        || ip.is_unspecified() // 0.0.0.0
+        || ip.is_broadcast()  // 255.255.255.255
+}
+
+/// Returns `true` for loopback, link-local (fe80::/10), unique-local
+/// (fc00::/7), and unspecified IPv6 addresses.
+fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    ip.is_loopback()      // ::1
+        || ip.is_unspecified() // ::
+        || is_ipv6_unique_local(ip) // fc00::/7
+        || is_ipv6_link_local(ip) // fe80::/10
+        || ip
+            .to_ipv4_mapped()
+            .map(|v4| is_blocked_ipv4(v4))
+            .unwrap_or(false)
+}
+
+/// `fc00::/7` — IPv6 unique-local addresses.
+fn is_ipv6_unique_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
+/// `fe80::/10` — IPv6 link-local addresses.
+fn is_ipv6_link_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// Convenience helper for callers that already hold an [`IpAddr`].
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        IpAddr::V6(v6) => is_blocked_ipv6(v6),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Error type
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -241,6 +350,8 @@ pub enum WebhookValidationError {
     BodyReadError,
     /// The pre-shared secret is not configured.
     MissingSecret,
+    /// The outbound webhook target URL failed SSRF validation.
+    InvalidTargetUrl(String),
 }
 
 impl IntoResponse for WebhookValidationError {
@@ -269,6 +380,10 @@ impl IntoResponse for WebhookValidationError {
             Self::MissingSecret => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Inbound webhook secret not configured".to_string(),
+            ),
+            Self::InvalidTargetUrl(reason) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid webhook target URL: {reason}"),
             ),
         };
 
@@ -532,5 +647,102 @@ mod tests {
 
         // Empty signature.
         assert!(!verify_signature(SECRET, &ts, BODY, "sha256="));
+    // ── SSRF target URL validation ──────────────────────────────────────────
+
+    #[test]
+    fn accepts_valid_https_endpoint() {
+        let url = validate_webhook_target_url("https://example.com/webhook", false)
+            .expect("valid https endpoint should be accepted");
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("example.com"));
+    }
+
+    #[test]
+    fn rejects_cloud_metadata_ip() {
+        let err = validate_webhook_target_url("http://169.254.169.254/latest/meta-data/", true)
+            .expect_err("cloud metadata IP must be blocked");
+        assert!(matches!(err, WebhookValidationError::InvalidTargetUrl(_)));
+
+        let err = validate_webhook_target_url("https://169.254.169.254/latest/meta-data/", false)
+            .expect_err("cloud metadata IP must be blocked even over https");
+        assert!(matches!(err, WebhookValidationError::InvalidTargetUrl(_)));
+    }
+
+    #[test]
+    fn rejects_private_lan_ips() {
+        for target in [
+            "https://10.0.0.1/hook",
+            "https://172.16.0.1/hook",
+            "https://172.31.255.255/hook",
+            "https://192.168.1.1/hook",
+            "https://127.0.0.1/hook",
+            "https://0.0.0.0/hook",
+        ] {
+            let err = validate_webhook_target_url(target, false)
+                .unwrap_or_else(|_| panic!("{target} must be blocked"));
+            let _ = err;
+        }
+    }
+
+    #[test]
+    fn rejects_private_lan_ips_returns_error() {
+        for target in [
+            "https://10.0.0.1/hook",
+            "https://172.16.0.1/hook",
+            "https://192.168.1.1/hook",
+            "https://127.0.0.1/hook",
+            "https://[::1]/hook",
+            "https://[fc00::1]/hook",
+            "https://[fe80::1]/hook",
+            "https://[::]/hook",
+        ] {
+            assert!(
+                validate_webhook_target_url(target, false).is_err(),
+                "{target} must be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_localhost_hostname() {
+        assert!(validate_webhook_target_url("https://localhost/hook", false).is_err());
+        assert!(validate_webhook_target_url("https://LOCALHOST/hook", false).is_err());
+        assert!(validate_webhook_target_url("https://foo.localhost/hook", false).is_err());
+    }
+
+    #[test]
+    fn rejects_non_http_schemes() {
+        for target in [
+            "file:///etc/passwd",
+            "ftp://example.com/hook",
+            "gopher://example.com/hook",
+            "javascript:alert(1)",
+        ] {
+            assert!(
+                validate_webhook_target_url(target, false).is_err(),
+                "{target} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_http_in_production() {
+        assert!(validate_webhook_target_url("http://example.com/hook", false).is_err());
+    }
+
+    #[test]
+    fn allows_http_in_dev_mode() {
+        assert!(validate_webhook_target_url("http://example.com/hook", true).is_ok());
+    }
+
+    #[test]
+    fn dev_mode_still_blocks_private_ips() {
+        assert!(validate_webhook_target_url("http://127.0.0.1/hook", true).is_err());
+        assert!(validate_webhook_target_url("http://169.254.169.254/hook", true).is_err());
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_ipv6_loopback() {
+        assert!(validate_webhook_target_url("https://[::ffff:127.0.0.1]/hook", false).is_err());
     }
 }

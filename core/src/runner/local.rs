@@ -363,4 +363,70 @@ mod tests {
             .with_invocation(Some("ef".repeat(32)), Some("transfer"));
         assert!(matches!(err, SimulationError::NodeError(ref m) if m == "no such contract"));
     }
+
+    /// Ordered shutdown hooks: readiness must flip before any drain begins,
+    /// and the remaining hooks must fire in the documented order.
+    ///
+    /// This mirrors the integration test in
+    /// `core/tests/shutdown_coordinator.rs` but runs in-process so it is
+    /// exercised by `cargo test -p soroscope-core` without a separate
+    /// binary target.
+    #[tokio::test]
+    async fn shutdown_hooks_fire_in_order_and_readiness_flips_first() {
+        use crate::runner::ShutdownCoordinator;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+
+        let coordinator = ShutdownCoordinator::new();
+        let fired: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let readiness_at_drain = Arc::new(AtomicBool::new(true));
+
+        let record = |name: &'static str| {
+            let fired = Arc::clone(&fired);
+            move || {
+                fired.lock().unwrap().push(name);
+            }
+        };
+
+        // Readiness flip must be observable as false by the time any drain
+        // hook runs.
+        {
+            let readiness_at_drain = Arc::clone(&readiness_at_drain);
+            let coordinator_for_hook = coordinator.clone();
+            coordinator.register_hook("readiness", move || {
+                // Readiness is flipped by the coordinator before hooks run;
+                // record what the drain hooks will observe.
+                readiness_at_drain.store(
+                    coordinator_for_hook.is_ready(),
+                    Ordering::SeqCst,
+                );
+            });
+        }
+        coordinator.register_hook("stop_traffic", record("stop_traffic"));
+        coordinator.register_hook("ws_close", record("ws_close"));
+        coordinator.register_hook("worker_drain", record("worker_drain"));
+        coordinator.register_hook("leader_lock_release", record("leader_lock_release"));
+        coordinator.register_hook("db_close", record("db_close"));
+
+        assert!(coordinator.is_ready());
+        coordinator.begin_shutdown().await;
+        assert!(!coordinator.is_ready());
+
+        let order = fired.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec![
+                "stop_traffic",
+                "ws_close",
+                "worker_drain",
+                "leader_lock_release",
+                "db_close",
+            ],
+            "hooks must fire in the documented shutdown order"
+        );
+        assert!(
+            !readiness_at_drain.load(Ordering::SeqCst),
+            "readiness must be false before any drain hook runs"
+        );
+    }
 }

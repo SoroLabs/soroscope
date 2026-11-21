@@ -157,6 +157,10 @@ fn default_log_format_json() -> bool {
     false
 }
 
+fn default_shutdown_grace_period_secs() -> u64 {
+    30
+}
+
 // ---------------------------------------------------------------------------
 // AppConfig struct
 // ---------------------------------------------------------------------------
@@ -351,6 +355,15 @@ pub struct AppConfig {
     #[serde(default = "default_event_bus_capacity")]
     pub event_bus_capacity: usize,
 
+    // --- Graceful shutdown ---
+
+    /// Maximum time (seconds) the drain coordinator waits for in-flight
+    /// simulations and webhook dispatches to complete after a shutdown signal
+    /// (SIGTERM/SIGINT) before forcing exit.
+    /// Env: `SHUTDOWN_GRACE_PERIOD_SECS` · Default: `30`
+    #[serde(default = "default_shutdown_grace_period_secs")]
+    pub shutdown_grace_period_secs: u64,
+
     // --- Deployment environment ---
 
     /// Deployment environment tag used for production validation.
@@ -530,6 +543,10 @@ pub fn load_config() -> Result<AppConfig, ConfigLoadError> {
         .set_default("disk_cache_path", default_disk_cache_path())?
         .set_default("max_ledger_age", default_max_ledger_age())?
         .set_default("event_bus_capacity", default_event_bus_capacity())?
+        .set_default(
+            "shutdown_grace_period_secs",
+            default_shutdown_grace_period_secs(),
+        )?
         .set_default("cors_allowed_origins", "")?
         .set_default("allowed_origins", "")?
         .set_default("inbound_webhook_secret", "")?
@@ -576,6 +593,7 @@ mod tests {
             "NETWORK_PASSPHRASE",
             "DATABASE_URL",
             "APP_ENV",
+            "SHUTDOWN_GRACE_PERIOD_SECS",
         ];
         for k in &keys {
             env::remove_var(k);
@@ -592,6 +610,7 @@ mod tests {
             "Test SDF Network ; September 2015"
         );
         assert_eq!(cfg.database_url, "sqlite://soroscope.db");
+        assert_eq!(cfg.shutdown_grace_period_secs, 30);
         assert!(!cfg.is_production());
     }
 
@@ -618,6 +637,19 @@ mod tests {
         assert_eq!(cfg.server_port, 9090);
         assert_eq!(cfg.rust_log, "debug");
         assert_eq!(cfg.database_url, "sqlite://custom.db");
+    }
+
+    #[test]
+    fn shutdown_grace_period_env_override() {
+        let _guard = EnvGuard(vec![
+            "SHUTDOWN_GRACE_PERIOD_SECS".into(),
+            "APP_ENV".into(),
+        ]);
+        env::set_var("SHUTDOWN_GRACE_PERIOD_SECS", "45");
+        env::set_var("APP_ENV", "development");
+
+        let cfg = load_config().expect("load_config should succeed");
+        assert_eq!(cfg.shutdown_grace_period_secs, 45);
     }
 
     // ------------------------------------------------------------------
@@ -692,6 +724,7 @@ mod tests {
             disk_cache_path: String::new(),
             max_ledger_age: 100,
             event_bus_capacity: 256,
+            shutdown_grace_period_secs: 30,
         };
 
         assert!(cfg.validate_production().is_ok());
@@ -731,6 +764,7 @@ mod tests {
             disk_cache_path: String::new(),
             max_ledger_age: 100,
             event_bus_capacity: 256,
+            shutdown_grace_period_secs: 30,
         };
 
         let result = cfg.validate_production();
@@ -783,6 +817,7 @@ mod tests {
             disk_cache_path: String::new(),
             max_ledger_age: 100,
             event_bus_capacity: 256,
+            shutdown_grace_period_secs: 30,
         };
 
         assert!(

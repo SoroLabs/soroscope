@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { Cpu, Database, Zap, Activity, Info, Sliders, Flame, AlertTriangle, MemoryStick } from 'lucide-react';
 import { cn } from '../lib/utils';
 import type { CallGraph, CallNode } from '../lib/sorobantypes';
@@ -292,6 +292,45 @@ function fmtInstr(n: number): string {
   return new Intl.NumberFormat('en-US', { notation: 'compact', compactDisplay: 'short' }).format(n);
 }
 
+// ── Canvas heatmap geometry helpers ──────────────────────────────────────────
+
+/** Number of columns in the canvas heatmap grid. */
+export const HEATMAP_COLS = 6;
+/** Number of rows in the canvas heatmap grid. */
+export const HEATMAP_ROWS = 6;
+
+/**
+ * Map a pointer position (in CSS pixels, relative to the canvas element) to a
+ * heatmap grid cell index. Returns `null` when the point falls outside the grid.
+ *
+ * `cssWidth` / `cssHeight` are the element's layout size (CSS pixels), NOT the
+ * backing-store size. Callers must divide `offsetX` / `offsetY` by
+ * `devicePixelRatio` when the canvas backing store is scaled for HiDPI.
+ */
+export function hitTestHeatmapCell(
+  offsetX: number,
+  offsetY: number,
+  cssWidth: number,
+  cssHeight: number,
+  cols: number = HEATMAP_COLS,
+  rows: number = HEATMAP_ROWS,
+): number | null {
+  if (!(cssWidth > 0) || !(cssHeight > 0)) return null;
+  if (offsetX < 0 || offsetY < 0 || offsetX >= cssWidth || offsetY >= cssHeight) return null;
+  const col = Math.min(Math.floor((offsetX / cssWidth) * cols), cols - 1);
+  const row = Math.min(Math.floor((offsetY / cssHeight) * rows), rows - 1);
+  return row * cols + col;
+}
+
+/**
+ * Convert a raw pointer offset (which may be in device pixels on some browsers
+ * when the backing store is scaled) into CSS pixels using the DPR.
+ */
+export function toCssOffset(offset: number, dpr: number): number {
+  const safeDpr = dpr > 0 ? dpr : 1;
+  return offset / safeDpr;
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export function ResourceHeatmap({ resourceCost, callGraph }: ResourceHeatmapProps) {
@@ -301,6 +340,12 @@ export function ResourceHeatmap({ resourceCost, callGraph }: ResourceHeatmapProp
   const [hoveredRamId,      setHoveredRamId]      = useState<string | null>(null);
   const [hoveredSegmentId,  setHoveredSegmentId]  = useState<string | null>(null);
   const [hoveredKey,        setHoveredKey]         = useState<string | null>(null);
+
+  // ── Canvas heatmap refs ─────────────────────────────────────────────────────
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const rafHandleRef = useRef<number | null>(null);
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  const [hoveredCanvasCell, setHoveredCanvasCell] = useState<number | null>(null);
 
   const {
     cpu_instructions = 0,
@@ -394,6 +439,108 @@ export function ResourceHeatmap({ resourceCost, callGraph }: ResourceHeatmapProp
 
   const formatKey = (key: string) =>
     key.length <= 16 ? key : `${key.slice(0, 8)}…${key.slice(-8)}`;
+
+  // ── Canvas heatmap drawing (HiDPI-aware) ────────────────────────────────────
+  const drawHeatmap = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const cssWidth = rect.width;
+    const cssHeight = rect.height;
+    if (!(cssWidth > 0) || !(cssHeight > 0)) return;
+
+    const dpr = window.devicePixelRatio || 1;
+
+    // Scale the backing store by DPR for crisp Retina rendering.
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+    // Keep the CSS layout size at the logical (CSS pixel) dimensions.
+    canvas.style.width = `${cssWidth}px`;
+    canvas.style.height = `${cssHeight}px`;
+
+    // Normalise the drawing coordinate system back to CSS pixels.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+    const cellW = cssWidth / HEATMAP_COLS;
+    const cellH = cssHeight / HEATMAP_ROWS;
+
+    for (let row = 0; row < HEATMAP_ROWS; row++) {
+      for (let col = 0; col < HEATMAP_COLS; col++) {
+        const idx = row * HEATMAP_COLS + col;
+        const cell = hotspotCells[idx];
+        const share = cell?.cpuShare ?? 0;
+        const clr = hotspotColors(share);
+        const isHovered = hoveredCanvasCell === idx;
+
+        ctx.fillStyle = clr.barHex;
+        ctx.globalAlpha = isHovered ? 0.95 : 0.55;
+        ctx.fillRect(col * cellW + 1, row * cellH + 1, cellW - 2, cellH - 2);
+
+        if (isHovered) {
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(col * cellW + 1, row * cellH + 1, cellW - 2, cellH - 2);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+  }, [hotspotCells, hoveredCanvasCell]);
+
+  // Draw + observe size changes; clean up observer and pending RAF on unmount.
+  useEffect(() => {
+    drawHeatmap();
+
+    const canvas = canvasRef.current;
+    if (!canvas || typeof ResizeObserver === 'undefined') {
+      return () => {
+        if (rafHandleRef.current !== null) {
+          cancelAnimationFrame(rafHandleRef.current);
+          rafHandleRef.current = null;
+        }
+      };
+    }
+
+    const observer = new ResizeObserver(() => {
+      if (rafHandleRef.current !== null) cancelAnimationFrame(rafHandleRef.current);
+      rafHandleRef.current = requestAnimationFrame(() => {
+        rafHandleRef.current = null;
+        drawHeatmap();
+      });
+    });
+    resizeObserverRef.current = observer;
+    observer.observe(canvas);
+
+    return () => {
+      observer.disconnect();
+      resizeObserverRef.current = null;
+      if (rafHandleRef.current !== null) {
+        cancelAnimationFrame(rafHandleRef.current);
+        rafHandleRef.current = null;
+      }
+    };
+  }, [drawHeatmap]);
+
+  const handleCanvasMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    // Normalise pointer offsets to CSS pixels before hit-testing.
+    const x = toCssOffset(e.nativeEvent.offsetX, dpr);
+    const y = toCssOffset(e.nativeEvent.offsetY, dpr);
+    const idx = hitTestHeatmapCell(x, y, rect.width, rect.height);
+    setHoveredCanvasCell(idx);
+  }, []);
+
+  const handleCanvasMouseLeave = useCallback(() => {
+    setHoveredCanvasCell(null);
+  }, []);
 
   // ── Tabs ────────────────────────────────────────────────────────────────────
   const tabs: Array<{ key: Tab; label: string; icon: React.ReactNode }> = [
@@ -842,6 +989,20 @@ export function ResourceHeatmap({ resourceCost, callGraph }: ResourceHeatmapProp
                       </button>
                     );
                   })}
+                </div>
+
+                {/* HiDPI-aware canvas heatmap */}
+                <div className="mt-4">
+                  <div className="text-[9px] font-mono text-slate-500 uppercase mb-1.5">
+                    Instruction Density Map
+                  </div>
+                  <canvas
+                    ref={canvasRef}
+                    onMouseMove={handleCanvasMouseMove}
+                    onMouseLeave={handleCanvasMouseLeave}
+                    className="w-full rounded-lg border border-slate-800/80 bg-slate-950/60 cursor-crosshair"
+                    style={{ height: '120px' }}
+                  />
                 </div>
 
                 {/* Colour legend */}
