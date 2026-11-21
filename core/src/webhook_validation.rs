@@ -13,7 +13,11 @@
 //!
 //! **Constant-time comparison:** signature bytes are compared with
 //! [`hmac::Mac::verify_slice`], which is constant-time by construction and avoids
-//! timing-based forgery.
+//! timing-based forgery. The hex-decoding path is length-checked before any
+//! comparison so that malformed or truncated signatures are rejected without
+//! leaking information through variable-length work. Any raw secret/signature
+//! equality in this module goes through [`constant_time_eq`], which hashes both
+//! sides with SHA-256 (uniform 32-byte digests) and XOR-accumulates the digests.
 //!
 //! # Complexity
 //!
@@ -38,7 +42,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -145,6 +149,30 @@ where
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Constant-time comparison helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compare two byte slices in constant time with respect to their contents.
+///
+/// Both inputs are hashed with SHA-256 first, so the comparison always operates
+/// on two uniform 32-byte digests regardless of the input lengths. This avoids
+/// leaking prefix-length information through short-circuiting equality and
+/// keeps the work independent of where (or whether) the inputs differ.
+///
+/// Note: differing input lengths are still observable (they are not secret in
+/// the HMAC path, where the expected digest length is fixed).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let digest_a = Sha256::digest(a);
+    let digest_b = Sha256::digest(b);
+
+    let mut diff: u8 = 0;
+    for (x, y) in digest_a.iter().zip(digest_b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Core verification logic
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -159,16 +187,31 @@ pub fn generate_signature(secret: &str, timestamp: &str, body: &[u8]) -> String 
 }
 
 /// Verify an HMAC-SHA256 signature.
+///
+/// The comparison is constant-time: [`hmac::Mac::verify_slice`] performs the
+/// final check without short-circuiting. The hex-decoding path is length-checked
+/// up front so that truncated or oversized signatures are rejected before any
+/// comparison work, without leaking timing information about the expected value.
 pub fn verify_signature(secret: &str, timestamp: &str, body: &[u8], signature: &str) -> bool {
     let hex_sig = match signature.strip_prefix("sha256=") {
         Some(h) => h,
         None => signature,
     };
 
+    // A SHA-256 HMAC is exactly 32 bytes, i.e. 64 hex characters. Reject any
+    // other length before decoding so the comparison always sees a fixed size.
+    if hex_sig.len() != 64 {
+        return false;
+    }
+
     let sig_bytes = match hex::decode(hex_sig) {
         Ok(b) => b,
         Err(_) => return false,
     };
+
+    if sig_bytes.len() != 32 {
+        return false;
+    }
 
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
@@ -422,5 +465,72 @@ mod tests {
         let generated = generate_signature(secret, ts, body);
         assert!(verify_signature(secret, ts, body, &generated));
         assert!(!verify_signature(secret, ts, b"tampered", &generated));
+    }
+
+    #[test]
+    fn constant_time_eq_equal_inputs() {
+        assert!(constant_time_eq(b"same-value", b"same-value"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn constant_time_eq_different_inputs() {
+        assert!(!constant_time_eq(b"same-value", b"other-value"));
+        // Differ only in the first byte.
+        assert!(!constant_time_eq(b"aame-value", b"bame-value"));
+        // Differ only in the last byte.
+        assert!(!constant_time_eq(b"same-valuX", b"same-valuY"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq(b"short", b"a-much-longer-value"));
+        assert!(!constant_time_eq(b"", b"non-empty"));
+    }
+
+    /// Flip a single bit in the hex signature at the given character index.
+    fn flip_hex_bit(hex_sig: &str, index: usize) -> String {
+        let mut chars: Vec<char> = hex_sig.chars().collect();
+        let digit = chars[index].to_digit(16).expect("valid hex digit");
+        let flipped = digit ^ 0b0001;
+        chars[index] = std::char::from_digit(flipped, 16).unwrap();
+        chars.into_iter().collect()
+    }
+
+    #[test]
+    fn single_bit_flip_at_start_is_rejected() {
+        let ts = now_str();
+        let sig = format!("sha256={}", sign(SECRET, &ts, BODY));
+        let hex_sig = sig.strip_prefix("sha256=").unwrap();
+        let tampered = format!("sha256={}", flip_hex_bit(hex_sig, 0));
+        assert!(!verify_signature(SECRET, &ts, BODY, &tampered));
+    }
+
+    #[test]
+    fn single_bit_flip_at_end_is_rejected() {
+        let ts = now_str();
+        let sig = format!("sha256={}", sign(SECRET, &ts, BODY));
+        let hex_sig = sig.strip_prefix("sha256=").unwrap();
+        let last = hex_sig.len() - 1;
+        let tampered = format!("sha256={}", flip_hex_bit(hex_sig, last));
+        assert!(!verify_signature(SECRET, &ts, BODY, &tampered));
+    }
+
+    #[test]
+    fn different_length_signature_is_rejected() {
+        let ts = now_str();
+        let sig = format!("sha256={}", sign(SECRET, &ts, BODY));
+        let hex_sig = sig.strip_prefix("sha256=").unwrap();
+
+        // Truncated signature.
+        let truncated = format!("sha256={}", &hex_sig[..hex_sig.len() - 2]);
+        assert!(!verify_signature(SECRET, &ts, BODY, &truncated));
+
+        // Extended signature.
+        let extended = format!("sha256={}00", hex_sig);
+        assert!(!verify_signature(SECRET, &ts, BODY, &extended));
+
+        // Empty signature.
+        assert!(!verify_signature(SECRET, &ts, BODY, "sha256="));
     }
 }
