@@ -3078,7 +3078,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "oracle-aggregator"
+name = "oracle_aggregator"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",

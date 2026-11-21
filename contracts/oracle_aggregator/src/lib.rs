@@ -10,6 +10,9 @@ const STDDEV_MULTIPLIER: i128 = 2;
 const MAX_DEVIATION_PERCENT: i128 = 5;
 /// Maximum number of price observations retained for any asset (about two hours).
 const MAX_TWAP_OBSERVATIONS: u32 = 1_440;
+/// Hard cap on the active oracle provider list. Sorting is O(n^2), so an
+/// unbounded list can exhaust the Soroban CPU budget and brick price reads.
+pub const MAX_ORACLE_PROVIDERS: u32 = 32;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -26,6 +29,12 @@ pub enum Error {
     InvalidWindow = 6,
     /// Returned when an oracle returns a stale price.
     InvalidOraclePrice = 7,
+    /// Returned when a provider is already in the active provider list.
+    DuplicateProvider = 8,
+    /// Returned when a provider list operation would exceed `MAX_ORACLE_PROVIDERS`.
+    TooManyProviders = 9,
+    /// Returned when removing a provider that is not in the active list.
+    ProviderNotFound = 10,
 }
 
 /// A price record returned by an oracle source, including a Unix timestamp
@@ -63,6 +72,8 @@ pub enum DataKey {
     AssetTwapNextIndex(Address),
     AssetTwapLen(Address),
     AssetTwapObservation(Address, u32),
+    /// Ordered list of oracle addresses iterated during price aggregation.
+    OracleProviders,
 }
 
 /// Oracle interface that returns only a price (legacy / simple sources).
@@ -98,6 +109,57 @@ impl OracleAggregator {
         Ok(())
     }
 
+    /// Adds an oracle provider to the active list iterated by `get_price`.
+    ///
+    /// Reverts with `DuplicateProvider` if the address is already registered
+    /// and with `TooManyProviders` once `MAX_ORACLE_PROVIDERS` is reached.
+    pub fn register_provider(env: Env, provider: Address) -> Result<(), Error> {
+        let mut providers = Self::stored_providers(&env);
+        if Self::provider_index(&providers, &provider).is_some() {
+            return Err(Error::DuplicateProvider);
+        }
+        if providers.len() >= MAX_ORACLE_PROVIDERS {
+            return Err(Error::TooManyProviders);
+        }
+        providers.push_back(provider);
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleProviders, &providers);
+        Ok(())
+    }
+
+    /// Removes a decommissioned oracle provider from the active iteration list
+    /// so it no longer consumes aggregation gas.
+    pub fn remove_provider(env: Env, provider: Address) -> Result<(), Error> {
+        let providers = Self::stored_providers(&env);
+        let Some(index) = Self::provider_index(&providers, &provider) else {
+            return Err(Error::ProviderNotFound);
+        };
+
+        let mut updated = Vec::new(&env);
+        for idx in 0..providers.len() {
+            if idx != index {
+                updated.push_back(providers.get(idx).unwrap());
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleProviders, &updated);
+        Ok(())
+    }
+
+    /// Returns the oracle providers currently used by `get_price`.
+    pub fn get_providers(env: Env) -> Vec<Address> {
+        Self::stored_providers(&env)
+    }
+
+    /// Aggregates prices from the registered provider list using the bounded
+    /// active iteration list. This is the storage-backed price read entry point.
+    pub fn get_price(env: Env, max_age_seconds: u64) -> Result<i128, Error> {
+        let providers = Self::stored_providers(&env);
+        Self::aggregate_price(env, providers, max_age_seconds)
+    }
+
     /// Aggregates prices from multiple oracle sources, rejecting any source
     /// whose price timestamp is older than `max_age_seconds` relative to the
     /// current ledger timestamp.
@@ -117,11 +179,17 @@ impl OracleAggregator {
     /// - `OracleStaleness`         – fewer than 3 sources returned a fresh price.
     /// - `NotEnoughValidPrices`    – fewer than 3 sources returned a valid (> 0) price.
     /// - `NotEnoughReliableSources`– after outlier filtering, fewer than 3 prices remain.
+    /// - `TooManyProviders`       – more than `MAX_ORACLE_PROVIDERS` sources supplied.
     pub fn aggregate_price(
         env: Env,
         sources: Vec<Address>,
         max_age_seconds: u64,
     ) -> Result<i128, Error> {
+        // Caller supplied vectors must obey the same bound as the stored
+        // provider list; otherwise the O(n^2) sort can exhaust the CPU budget.
+        if sources.len() > MAX_ORACLE_PROVIDERS {
+            return Err(Error::TooManyProviders);
+        }
         if sources.len() < 3 {
             return Err(Error::NotEnoughSources);
         }
@@ -275,6 +343,19 @@ impl OracleAggregator {
             env.ledger().sequence() as u64,
             window_ledgers as u64,
         )
+    }
+
+    /// Loads the active provider list, defaulting to empty before registration.
+    fn stored_providers(env: &Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::OracleProviders)
+            .unwrap_or(Vec::new(env))
+    }
+
+    /// Position of `provider` in the active list, if present.
+    fn provider_index(providers: &Vec<Address>, provider: &Address) -> Option<u32> {
+        (0..providers.len()).find(|&idx| &providers.get(idx).unwrap() == provider)
     }
 
     fn record_sample(env: &Env, price: i128) {
