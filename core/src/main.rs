@@ -3359,6 +3359,7 @@ async fn main() {
     let app_metrics = Arc::new(
         AppMetrics::new().expect("Failed to initialize Prometheus metrics"),
     );
+    registry.attach_metrics((*app_metrics).clone());
 
     let app_state = Arc::new(AppState {
         engine: SimulationEngine::with_registry_and_cache(

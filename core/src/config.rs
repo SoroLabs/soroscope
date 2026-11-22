@@ -112,6 +112,10 @@ fn default_simulation_timeout_secs() -> u64 {
     30
 }
 
+fn default_simulation_timeout_ms() -> u64 {
+    5000
+}
+
 fn default_job_timeout_secs() -> u64 {
     300
 }
@@ -286,6 +290,13 @@ pub struct AppConfig {
     /// Env: `SIMULATION_TIMEOUT_SECS` · Default: `30`
     #[serde(default = "default_simulation_timeout_secs")]
     pub simulation_timeout_secs: u64,
+
+    /// Wall-clock budget for a single host simulation, in milliseconds.
+    /// A simulation still running when it expires is cancelled and fails with
+    /// `SimulationError::TimeoutExceeded`.
+    /// Env: `SIMULATION_TIMEOUT_MS` · Default: `5000`
+    #[serde(default = "default_simulation_timeout_ms")]
+    pub simulation_timeout_ms: u64,
 
     /// Execution mode: `"failover"` or `"consensus"`.
     /// Env: `SIMULATION_MODE` · Default: `"failover"`
@@ -527,6 +538,7 @@ pub fn load_config() -> Result<AppConfig, ConfigLoadError> {
         .set_default("health_check_interval_secs", default_health_check_interval_secs())?
         .set_default("gossip_interval_secs", default_gossip_interval_secs())?
         .set_default("simulation_timeout_secs", default_simulation_timeout_secs())?
+        .set_default("simulation_timeout_ms", default_simulation_timeout_ms())?
         .set_default("job_timeout_secs", default_job_timeout_secs())?
         .set_default("max_concurrent_jobs", default_max_concurrent_jobs())?
         .set_default("event_worker_threads", default_event_worker_threads())?
@@ -686,6 +698,11 @@ mod tests {
         assert_eq!(cfg.clamped_event_bus_capacity(), 512);
     }
 
+    #[test]
+    fn simulation_timeout_ms_defaults_to_5000() {
+        assert_eq!(default_simulation_timeout_ms(), 5000);
+    }
+
     // ------------------------------------------------------------------
     // Production validation
     // ------------------------------------------------------------------
@@ -713,6 +730,7 @@ mod tests {
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
+            simulation_timeout_ms: 5000,
             simulation_mode: "failover".to_string(),
             job_timeout_secs: 300,
             max_concurrent_jobs: 10,
@@ -753,6 +771,7 @@ mod tests {
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
+            simulation_timeout_ms: 5000,
             simulation_mode: "failover".to_string(),
             job_timeout_secs: 300,
             max_concurrent_jobs: 10,
@@ -806,6 +825,7 @@ mod tests {
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
+            simulation_timeout_ms: 5000,
             simulation_mode: "failover".to_string(),
             job_timeout_secs: 300,
             max_concurrent_jobs: 10,
