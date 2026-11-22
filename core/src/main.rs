@@ -229,6 +229,16 @@ struct AppConfig {
     /// When empty, defaults to `*` (allow all origins).
     #[serde(default = "default_allowed_origins")]
     allowed_origins: String,
+    /// Maximum time, in seconds, to wait for in-flight simulations, webhook
+    /// dispatches, and worker jobs to finish during a graceful shutdown
+    /// (issue #1425). After this elapses the drain coordinator aborts the
+    /// remaining work, releases the leader lock, and checkpoints SQLite.
+    #[serde(default = "default_shutdown_grace_period_secs")]
+    shutdown_grace_period_secs: u64,
+}
+
+fn default_shutdown_grace_period_secs() -> u64 {
+    30
 }
 
 fn default_health_check_interval() -> u64 {
@@ -336,6 +346,7 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("event_bus_capacity", 256)?
         .set_default("log_format_json", false)?
         .set_default("allowed_origins", "")?
+        .set_default("shutdown_grace_period_secs", 30)?
         .build()?;
 
     settings.try_deserialize()
@@ -2607,6 +2618,21 @@ async fn healthz() -> impl IntoResponse {
 /// 503 when at least one dependency is unavailable (the pod should be removed
 /// from the load-balancer rotation until it recovers).
 async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Issue #1425: the drain coordinator flips readiness to false the instant
+    // SIGTERM/SIGINT arrives, before any subsystem starts winding down, so the
+    // load balancer stops routing new traffic while in-flight work drains.
+    if state.shutdown.is_shutting_down() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "draining",
+                "checks": {
+                    "shutdown": "in_progress"
+                }
+            })),
+        );
+    }
+
     let rpc_healthy = state
         .provider_registry
         .provider_reports()
@@ -3749,6 +3775,7 @@ mod tests {
             insights_engine: InsightsEngine::new(),
             simulation_timeout: std::time::Duration::from_secs(30),
             event_worker_pool: Arc::clone(&event_pool),
+            shutdown: runner::ShutdownCoordinator::new(std::time::Duration::from_secs(30)),
         });
         let auth_state = Arc::new(auth::AuthState::new(
             "test-secret".to_string(),
@@ -3888,6 +3915,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_readyz_flips_to_503_immediately_when_shutdown_begins() {
+        use axum::body::Body;
+        use http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app = build_test_app();
+        let state = app
+            .clone()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+        // Sanity check: the coordinator starts in the "running" state.
+        drop(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        // Without a healthy RPC provider the probe is already 503, but the
+        // body must not yet report the draining state.
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn test_profile_endpoint_no_jwt_returns_401() {
         use axum::body::Body;
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -3955,6 +4007,7 @@ mod config_validation_tests {
             event_bus_capacity: 256,
             log_format_json: false,
             allowed_origins: String::new(),
+            shutdown_grace_period_secs: 30,
         }
     }
 

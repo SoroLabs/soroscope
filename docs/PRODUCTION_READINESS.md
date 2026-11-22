@@ -25,6 +25,11 @@
 10. [Deployment Verification](#deployment-verification)
 11. [Maintenance Schedule](#maintenance-schedule)
 12. [Production Roadmap (Issue #160)](#production-roadmap-issue-160)
+13. [References & Resources](#references--resources)
+14. [FAQ](#faq)
+15. [Document Changelog](#document-changelog)
+
+> **CLI Compatibility Note:** All examples in this guide use the current `stellar contract ...` syntax from `stellar-cli` (formerly `soroban-cli`). The legacy `soroban contract build` / `soroban contract invoke` commands are deprecated but still work as aliases in older releases; migrate to `stellar contract ...` for new deployments.
 
 ---
 
@@ -218,16 +223,18 @@ stellar account create-multisig \
   --signer-weight 1
 
 # 3. Initialize EmergencyGuard with multisig address
-soroban contract invoke \
+stellar contract invoke \
   --id <CONTRACT_ID> \
   --source deployer \
+  --network mainnet \
   -- init_guard \
   --admin <MULTISIG_ADDRESS> \
   --threshold 2
 
 # 4. Verify on-chain
-soroban contract invoke \
+stellar contract invoke \
   --id <CONTRACT_ID> \
+  --network mainnet \
   -- get_admins
 ```
 
@@ -402,8 +409,9 @@ cargo check --locked --all-targets
 # Execute deployment script with M-of-N multisig approval
 
 # T+5min: Verify contract initialization
-soroban contract invoke \
+stellar contract invoke \
   --id <CONTRACT_ID> \
+  --network mainnet \
   -- get_admins
 
 # T+10min: Run smoke tests
@@ -891,11 +899,11 @@ curl http://localhost:8080/health/ready
 
 ```bash
 # 1. Check current rate limit usage
-soroban_rpc_rate_limit_percent=$(curl -s http://localhost:8080/metrics | \
-  grep soroscope_rpc_rate_limit_percent | tail -1 | awk '{print $2}')
+rpc_rate_limit_percent=$(curl -s http://localhost:8080/metrics | \
+  grep 'soroscope_rpc_rate_limit_usage_percent' | tail -1 | awk '{print $2}')
 
-if (( $(echo "$soroban_rpc_rate_limit_percent > 80" | bc -l) )); then
-    echo "Rate limit approaching: $soroban_rpc_rate_limit_percent%"
+if (( $(echo "$rpc_rate_limit_percent > 80" | bc -l) )); then
+    echo "Rate limit approaching: $rpc_rate_limit_percent%"
     # Trigger scaling
 fi
 
@@ -926,7 +934,7 @@ fi
 ```bash
 # 1. Verify SDK version matches RPC
 cargo update -p soroban-sdk
-soroban contract build --version
+stellar contract build --version
 
 # 2. Add response validation
 # In core/src/rpc.rs:
@@ -1064,16 +1072,18 @@ grep "soroban-sdk" Cargo.toml
 
 ```bash
 # 1. Verify contract admin address
-soroban contract invoke \
+stellar contract invoke \
   --id <CONTRACT_ID> \
+  --network mainnet \
   -- get_admins
 
 # 2. Verify your key is authorized
 stellar keys address deployer
 
 # 3. Check if you're a multisig signer
-soroban contract invoke \
+stellar contract invoke \
   --id <CONTRACT_ID> \
+  --network mainnet \
   -- check_is_signer \
   --signer $(<your_pubkey>)
 
@@ -1082,9 +1092,10 @@ soroban contract invoke \
 # Use tx builder to submit multisig operation
 
 # 5. Verify ledger sequence for signature
-soroban contract invoke \
+stellar contract invoke \
   --id <CONTRACT_ID> \
   --source-account deployer \
+  --network mainnet \
   -- admin_operation_that_needs_multisig
 ```
 
@@ -1192,9 +1203,10 @@ curl http://localhost:8080/health/ready
 # Contact multisig members via emergency contact list
 
 # 2. Prepare pause transaction
-soroban contract invoke \
+stellar contract invoke \
   --id <CONTRACT_ID> \
   --source signer-1 \
+  --network mainnet \
   -- set_pause_state \
   --pause_type 0xFFFFFFFF  # Pause all operations
 
@@ -1202,8 +1214,9 @@ soroban contract invoke \
 # Use Stellar CLI or dedicated signing tool
 
 # 4. Verify pause on-chain
-soroban contract invoke \
+stellar contract invoke \
   --id <CONTRACT_ID> \
+  --network mainnet \
   -- get_pause_state
 ```
 
@@ -1336,7 +1349,7 @@ curl -f http://localhost:8080/health/ready
 
 # 2. Contract admin verification
 echo "✓ Verifying contract admin..."
-ADMIN=$(soroban contract invoke --id $CONTRACT_ID -- get_admins)
+ADMIN=$(stellar contract invoke --id $CONTRACT_ID --network mainnet -- get_admins)
 if [ -z "$ADMIN" ]; then
     echo "✗ Failed: No admin configured"
     exit 1
@@ -1512,7 +1525,8 @@ Create and verify deployment manifest:
 ### Official Documentation
 - [Soroban Documentation](https://soroban.stellar.org/)
 - [Stellar Mainnet](https://stellar.org/)
-- [Soroban CLI Reference](https://github.com/stellar/rs-soroban-cli)
+- [Stellar CLI Reference](https://github.com/stellar/stellar-cli)
+- [Legacy Soroban CLI Reference (deprecated)](https://github.com/stellar/rs-soroban-cli)
 
 ### Security References
 - [OWASP Security Guidelines](https://owasp.org/)

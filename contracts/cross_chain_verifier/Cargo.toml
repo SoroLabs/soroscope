@@ -11,3 +11,6 @@ soroban-sdk.workspace = true
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[dev-dependencies.ed25519-dalek]
+version = "2"

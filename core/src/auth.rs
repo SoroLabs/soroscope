@@ -183,6 +183,42 @@ const CHALLENGE_EXPIRY_SECS: u64 = 300;
 const JWT_EXPIRY_SECS: u64 = 86400;
 const WEB_AUTH_DOMAIN: &str = "soroscope";
 
+/// Constant-time byte slice comparison.
+///
+/// Both inputs are hashed with SHA-256 so that the comparison always operates
+/// on uniform 32-byte digests, regardless of the input lengths. The digests are
+/// then compared with an XOR-accumulate loop that never short-circuits, so the
+/// execution time does not depend on the position of the first mismatched byte.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let a_digest = Sha256::digest(a);
+    let b_digest = Sha256::digest(b);
+
+    let mut diff: u8 = 0;
+    for (x, y) in a_digest.iter().zip(b_digest.iter()) {
+        diff |= x ^ y;
+    }
+
+    diff == 0
+}
+
+/// Constant-time lookup of an API tier for a presented API key.
+///
+/// The presented key is hashed with SHA-256 and compared against every stored
+/// key hash using [`constant_time_eq`], avoiding short-circuiting string
+/// equality on the raw key.
+fn lookup_api_tier(api_keys: &HashMap<String, ApiTier>, presented_key: &str) -> Option<ApiTier> {
+    let presented_hash = Sha256::digest(presented_key.as_bytes());
+
+    let mut matched: Option<ApiTier> = None;
+    for (stored_hash, tier) in api_keys.iter() {
+        if constant_time_eq(&presented_hash, stored_hash.as_bytes()) {
+            matched = Some(tier.clone());
+        }
+    }
+
+    matched
+}
+
 pub struct AuthState {
     pub encoding_key: EncodingKey,
     pub decoding_key: DecodingKey,
@@ -733,6 +769,21 @@ pub async fn auth_middleware(
         if !decision.allowed {
             audit(&actor, AuditOutcome::Failure, "rate limit exceeded");
             return Ok(decision.into_rejection());
+
+        // Constant-time lookup: compare the presented key's digest against
+        // every stored key hash without short-circuiting.
+        let tier = lookup_api_tier(&state.api_keys, api_key)
+            .ok_or_else(|| AppError::Unauthorized("Invalid API Key".into()))?;
+
+        // Rate limiting
+        let limit = tier.rate_limit_per_minute();
+        // Just use the API key string or hash as the rate limit key
+        let cache_key = format!("{}-{}", hash_hex.clone(), now_secs() / 60);
+        
+        // Simple atomic counter increment using moka
+        let count = state.rate_limiter.get_with(cache_key.clone(), || 0);
+        if count >= limit {
+            return Err(AppError::Unauthorized("Rate limit exceeded".into()));
         }
         audit(&actor, AuditOutcome::Success, "api_key");
 
@@ -965,5 +1016,64 @@ mod tests {
             .unwrap();
         assert!((1..=60).contains(&retry_after));
         assert_eq!(throttled.headers()["x-ratelimit-remaining"], "0");
+
+    #[test]
+    fn constant_time_eq_equal_inputs() {
+        assert!(constant_time_eq(b"super-secret-api-key", b"super-secret-api-key"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(&[0u8; 64], &[0u8; 64]));
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq(b"short", b"a-much-longer-key"));
+        assert!(!constant_time_eq(b"prefix", b"prefix-suffix"));
+        assert!(!constant_time_eq(b"", b"non-empty"));
+    }
+
+    #[test]
+    fn constant_time_eq_single_bit_flip_at_start() {
+        let key = b"0123456789abcdef0123456789abcdef";
+        let mut flipped = *key;
+        flipped[0] ^= 0x01;
+        assert!(!constant_time_eq(key, &flipped));
+    }
+
+    #[test]
+    fn constant_time_eq_single_bit_flip_at_end() {
+        let key = b"0123456789abcdef0123456789abcdef";
+        let mut flipped = *key;
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0x01;
+        assert!(!constant_time_eq(key, &flipped));
+    }
+
+    #[test]
+    fn constant_time_eq_single_bit_flip_in_signature() {
+        let sig = [0xABu8; 64];
+        let mut flipped = sig;
+        flipped[0] ^= 0x80;
+        assert!(!constant_time_eq(&sig, &flipped));
+
+        let mut flipped_end = sig;
+        flipped_end[63] ^= 0x80;
+        assert!(!constant_time_eq(&sig, &flipped_end));
+    }
+
+    #[test]
+    fn lookup_api_tier_matches_stored_hash() {
+        let mut api_keys = HashMap::new();
+        api_keys.insert("hash_free_key".to_string(), ApiTier::Free);
+        api_keys.insert("hash_pro_key".to_string(), ApiTier::Pro);
+
+        assert_eq!(
+            lookup_api_tier(&api_keys, "hash_free_key"),
+            Some(ApiTier::Free)
+        );
+        assert_eq!(
+            lookup_api_tier(&api_keys, "hash_pro_key"),
+            Some(ApiTier::Pro)
+        );
+        assert_eq!(lookup_api_tier(&api_keys, "unknown_key"), None);
     }
 }
