@@ -1654,6 +1654,8 @@ async fn analyze(
         (status = 200, description = "Resource analysis successful", body = ResourceReport),
         (status = 400, description = "Invalid base64 or WASM data"),
         (status = 401, description = "Unauthorized"),
+        (status = 413, description = "WASM payload exceeds the upload limit"),
+        (status = 422, description = "Not a valid Soroban WASM module"),
         (status = 500, description = "Analysis failed")
     ),
     security(
@@ -1676,39 +1678,8 @@ async fn analyze_wasm(
         .decode(&payload.wasm_bytes)
         .map_err(|e| AppError::BadRequest(format!("Invalid base64 WASM data: {}", e)))?;
 
-    // ── Validate WASM size: reject files larger than 2 MB ────────────────────
-    const MAX_WASM_SIZE: usize = 2 * 1024 * 1024; // 2 MB
-    if wasm_bytes.len() > MAX_WASM_SIZE {
-        return Err(AppError::BadRequest(format!(
-            "WASM file too large: {} bytes exceeds the {} byte (2 MB) limit",
-            wasm_bytes.len(),
-            MAX_WASM_SIZE,
-        )));
-    }
-
-    // ── Validate WASM magic bytes: must start with \0asm (0x00 0x61 0x73 0x6D) ──
-    const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6d];
-    if wasm_bytes.len() < 8 || wasm_bytes[..4] != WASM_MAGIC {
-        return Err(AppError::BadRequest(
-            "Invalid WASM file: missing magic bytes (\\0asm). \
-             Please upload a compiled Soroban .wasm contract."
-                .to_string(),
-        ));
-    }
-
-    // ── Validate WASM binary version: must be version 1 (little-endian) ──────
-    let version = u32::from_le_bytes([
-        wasm_bytes[4],
-        wasm_bytes[5],
-        wasm_bytes[6],
-        wasm_bytes[7],
-    ]);
-    if version != 1 {
-        return Err(AppError::BadRequest(format!(
-            "Unsupported WASM version: {}. Expected version 1.",
-            version
-        )));
-    }
+    // ── Validate size (413), \0asm + version 1 header and custom sections (422) ──
+    parser::validate_wasm_upload(&wasm_bytes, parser::max_wasm_upload_bytes())?;
 
     let function_name = payload.function_name.clone();
     let args = payload.args.clone().unwrap_or_default();
@@ -2072,6 +2043,8 @@ pub struct CompareApiResponse {
     responses(
         (status = 200, description = "Comparison report", body = CompareApiResponse),
         (status = 400, description = "Invalid request"),
+        (status = 413, description = "WASM payload exceeds the upload limit"),
+        (status = 422, description = "Not a valid Soroban WASM module"),
         (status = 500, description = "Comparison failed")
     ),
     tag = "Analysis"
@@ -2103,26 +2076,12 @@ async fn compare_handler(
                 );
             }
             "current_wasm" => {
-                current_wasm_bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| {
-                            AppError::BadRequest(format!("Failed to read current_wasm: {}", e))
-                        })?
-                        .to_vec(),
-                );
+                current_wasm_bytes =
+                    Some(parser::read_wasm_upload(field, parser::max_wasm_upload_bytes()).await?);
             }
             "base_wasm" => {
-                base_wasm_bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| {
-                            AppError::BadRequest(format!("Failed to read base_wasm: {}", e))
-                        })?
-                        .to_vec(),
-                );
+                base_wasm_bytes =
+                    Some(parser::read_wasm_upload(field, parser::max_wasm_upload_bytes()).await?);
             }
             "contract_id" => {
                 contract_id =
@@ -3476,6 +3435,8 @@ async fn main() {
         .route("/analyze/compare", post(compare_handler))
         .route("/analyze/gas-golfing", post(analyze_gas_golfing))
         .route("/analyze/host-import-heat", post(analyze_host_import_heat))
+        // Bound request bodies on the WASM upload routes (Issue #1400).
+        .layer(parser::upload_body_limit())
         .route_layer(middleware::from_fn(auth::auth_middleware));
 
     let app = Router::new()

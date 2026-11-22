@@ -809,6 +809,175 @@ impl ContractSpecValidator {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Upload validation (Issue #1400)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The 8-byte header every Soroban WASM module starts with: the `\0asm` magic
+/// followed by binary format version 1 (little-endian).
+pub const WASM_HEADER: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+
+/// Default maximum size of an uploaded WASM binary (2 MB).
+pub const DEFAULT_MAX_WASM_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+/// Largest custom section accepted in an upload (512 KB). Custom sections are
+/// opaque to the host, so an oversized one is the usual shape of a
+/// decompression bomb hiding inside an otherwise small module.
+pub const MAX_CUSTOM_SECTION_BYTES: usize = 512 * 1024;
+
+/// Why an uploaded WASM binary was rejected.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum UploadValidationError {
+    /// The upload exceeded the configured byte limit (HTTP 413).
+    #[error("WASM upload exceeds the {limit} byte limit")]
+    TooLarge { limit: usize },
+
+    /// The first bytes are not `\0asm` + version 1 (HTTP 422).
+    #[error("Invalid WASM header: expected \\0asm magic bytes followed by version 1")]
+    InvalidHeader,
+
+    /// A custom section is larger than [`MAX_CUSTOM_SECTION_BYTES`] (HTTP 422).
+    #[error("Custom section '{name}' is {size} bytes, exceeding the {limit} byte limit")]
+    CustomSectionTooLarge {
+        name: String,
+        size: usize,
+        limit: usize,
+    },
+
+    /// The module could not be parsed (HTTP 422).
+    #[error("Malformed WASM module: {0}")]
+    Malformed(String),
+
+    /// The upload body itself could not be read (HTTP 400).
+    #[error("Failed to read WASM upload: {0}")]
+    ReadFailed(String),
+}
+
+/// Environment variable overriding the per-file WASM upload limit, in bytes.
+pub const MAX_WASM_UPLOAD_BYTES_ENV: &str = "SOROSCOPE_MAX_WASM_UPLOAD_BYTES";
+
+/// The configured per-file WASM upload limit: `SOROSCOPE_MAX_WASM_UPLOAD_BYTES`
+/// when set to a positive integer, otherwise [`DEFAULT_MAX_WASM_UPLOAD_BYTES`].
+pub fn max_wasm_upload_bytes() -> usize {
+    std::env::var(MAX_WASM_UPLOAD_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_WASM_UPLOAD_BYTES)
+}
+
+/// Request body limit for WASM upload routes. Leaves room for two raw files
+/// (`/analyze/compare`) or one base64-encoded file (`/analyze/wasm`) plus the
+/// form / JSON envelope; anything beyond it is rejected with HTTP 413 while
+/// the body is still streaming.
+pub fn upload_body_limit() -> axum::extract::DefaultBodyLimit {
+    axum::extract::DefaultBodyLimit::max(max_wasm_upload_bytes() * 3 + 64 * 1024)
+}
+
+/// Stream a multipart file field through a [`StreamingWasmValidator`], so a
+/// non-WASM upload fails on its first chunk and an oversized one stops at the
+/// limit instead of being buffered in full.
+pub async fn read_wasm_upload(
+    mut field: axum::extract::multipart::Field<'_>,
+    limit: usize,
+) -> Result<Vec<u8>, UploadValidationError> {
+    let mut validator = StreamingWasmValidator::new(limit);
+    loop {
+        match field.chunk().await {
+            Ok(Some(chunk)) => validator.push(&chunk)?,
+            Ok(None) => break,
+            Err(e) if e.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE => {
+                return Err(UploadValidationError::TooLarge { limit });
+            }
+            Err(e) => return Err(UploadValidationError::ReadFailed(e.to_string())),
+        }
+    }
+    validator.finish()
+}
+
+/// Incremental validator for WASM uploads.
+///
+/// Feed body chunks to [`push`](Self::push) as they arrive. The header is
+/// checked as soon as enough bytes are available — normally on the first
+/// chunk — and the running size is checked *before* each chunk is buffered,
+/// so neither a non-WASM payload nor an oversized one is ever fully read into
+/// memory.
+#[derive(Debug)]
+pub struct StreamingWasmValidator {
+    limit: usize,
+    buffer: Vec<u8>,
+}
+
+impl StreamingWasmValidator {
+    /// Create a validator that accepts at most `limit` bytes.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Accept the next chunk of the upload.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<(), UploadValidationError> {
+        if self.buffer.len() + chunk.len() > self.limit {
+            return Err(UploadValidationError::TooLarge { limit: self.limit });
+        }
+
+        // Compare whatever part of the header this chunk covers, so a bad
+        // payload fails on its first chunk even when that chunk is short.
+        let start = self.buffer.len();
+        if start < WASM_HEADER.len() {
+            let end = (start + chunk.len()).min(WASM_HEADER.len());
+            if chunk[..end - start] != WASM_HEADER[start..end] {
+                return Err(UploadValidationError::InvalidHeader);
+            }
+        }
+
+        self.buffer.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// Finish the upload: the header must be complete and no custom section
+    /// may exceed [`MAX_CUSTOM_SECTION_BYTES`]. Returns the validated bytes.
+    pub fn finish(self) -> Result<Vec<u8>, UploadValidationError> {
+        if self.buffer.len() < WASM_HEADER.len() {
+            return Err(UploadValidationError::InvalidHeader);
+        }
+        check_custom_sections(&self.buffer, MAX_CUSTOM_SECTION_BYTES)?;
+        Ok(self.buffer)
+    }
+}
+
+/// Validate a WASM binary that is already in memory against `limit`, the
+/// header and the custom-section cap.
+pub fn validate_wasm_upload(bytes: &[u8], limit: usize) -> Result<(), UploadValidationError> {
+    if bytes.len() > limit {
+        return Err(UploadValidationError::TooLarge { limit });
+    }
+    if bytes.len() < WASM_HEADER.len() || bytes[..WASM_HEADER.len()] != WASM_HEADER {
+        return Err(UploadValidationError::InvalidHeader);
+    }
+    check_custom_sections(bytes, MAX_CUSTOM_SECTION_BYTES)
+}
+
+/// Reject any custom section larger than `limit` bytes.
+pub fn check_custom_sections(bytes: &[u8], limit: usize) -> Result<(), UploadValidationError> {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload {
+            Ok(wasmparser::Payload::CustomSection(custom)) if custom.data().len() > limit => {
+                return Err(UploadValidationError::CustomSectionTooLarge {
+                    name: custom.name().to_string(),
+                    size: custom.data().len(),
+                    limit,
+                });
+            }
+            Ok(_) => {}
+            Err(e) => return Err(UploadValidationError::Malformed(e.to_string())),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1333,5 +1502,103 @@ mod tests {
         assert!(matches!(&func.arguments[0], ArgumentDescriptor::Supported { name, .. } if name == "arg_u64"));
         assert!(matches!(&func.arguments[1], ArgumentDescriptor::Unsupported { name, function, .. } if name == "arg_unsupported" && function == "test_fn"));
         assert_eq!(res.unsupported_types_count, 1);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Upload validation (Issue #1400)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn upload_validator_accepts_a_clean_module_in_chunks() {
+        let wasm = clean_module();
+        let mut validator = StreamingWasmValidator::new(DEFAULT_MAX_WASM_UPLOAD_BYTES);
+        for chunk in wasm.chunks(3) {
+            validator.push(chunk).unwrap();
+        }
+        assert_eq!(validator.finish().unwrap(), wasm);
+    }
+
+    #[test]
+    fn upload_validator_rejects_non_wasm_on_the_first_chunk() {
+        let mut validator = StreamingWasmValidator::new(DEFAULT_MAX_WASM_UPLOAD_BYTES);
+        assert_eq!(
+            validator.push(b"PK\x03\x04 not a wasm module"),
+            Err(UploadValidationError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn upload_validator_rejects_a_short_first_chunk_that_already_mismatches() {
+        let mut validator = StreamingWasmValidator::new(DEFAULT_MAX_WASM_UPLOAD_BYTES);
+        assert_eq!(
+            validator.push(&[0x00, 0x62]),
+            Err(UploadValidationError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn upload_validator_rejects_the_wrong_binary_version() {
+        let mut validator = StreamingWasmValidator::new(DEFAULT_MAX_WASM_UPLOAD_BYTES);
+        assert_eq!(
+            validator.push(&[0x00, 0x61, 0x73, 0x6d, 0x02, 0x00, 0x00, 0x00]),
+            Err(UploadValidationError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn upload_validator_rejects_oversized_payloads_before_buffering() {
+        let mut validator = StreamingWasmValidator::new(16);
+        validator.push(&WASM_HEADER).unwrap();
+        assert_eq!(
+            validator.push(&[0u8; 9]),
+            Err(UploadValidationError::TooLarge { limit: 16 })
+        );
+        assert_eq!(validator.buffer.len(), WASM_HEADER.len());
+    }
+
+    #[test]
+    fn upload_validator_rejects_a_truncated_header() {
+        let mut validator = StreamingWasmValidator::new(DEFAULT_MAX_WASM_UPLOAD_BYTES);
+        validator.push(&WASM_HEADER[..4]).unwrap();
+        assert_eq!(
+            validator.finish(),
+            Err(UploadValidationError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn upload_validator_rejects_an_oversized_custom_section() {
+        let name = b"bomb";
+        let mut body = vec![name.len() as u8];
+        body.extend_from_slice(name);
+        body.resize(body.len() + MAX_CUSTOM_SECTION_BYTES + 1, 0);
+        let wasm = clean_module_with_custom((0, body));
+
+        let mut validator = StreamingWasmValidator::new(DEFAULT_MAX_WASM_UPLOAD_BYTES);
+        validator.push(&wasm).unwrap();
+        assert_eq!(
+            validator.finish(),
+            Err(UploadValidationError::CustomSectionTooLarge {
+                name: "bomb".to_string(),
+                size: MAX_CUSTOM_SECTION_BYTES + 1,
+                limit: MAX_CUSTOM_SECTION_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_wasm_upload_checks_size_header_and_custom_sections() {
+        assert_eq!(
+            validate_wasm_upload(&clean_module(), DEFAULT_MAX_WASM_UPLOAD_BYTES),
+            Ok(())
+        );
+        assert_eq!(
+            validate_wasm_upload(&clean_module(), 8),
+            Err(UploadValidationError::TooLarge { limit: 8 })
+        );
+        assert_eq!(
+            validate_wasm_upload(b"not wasm", DEFAULT_MAX_WASM_UPLOAD_BYTES),
+            Err(UploadValidationError::InvalidHeader)
+        );
     }
 }
