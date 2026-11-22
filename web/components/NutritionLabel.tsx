@@ -11,6 +11,12 @@ import {
   type NutritionResources,
   type NutritionSeverity,
 } from '../lib/nutritionLabel';
+import {
+  TTL_OPTIONS,
+  projectRent,
+  buildFeeBreakdown,
+  type TtlOption,
+} from '../lib/rentProjection';
 
 interface NutritionLabelProps extends NutritionResources {
   /** Total resource fee for the transaction, used in the gas breakdown. */
@@ -70,6 +76,7 @@ export const NutritionLabel: React.FC<NutritionLabelProps> = ({
   const [expanded, setExpanded] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [ttlDays, setTtlDays] = useState<TtlOption>(30);
 
   const metrics = useMemo(
     () =>
@@ -97,6 +104,22 @@ export const NutritionLabel: React.FC<NutritionLabelProps> = ({
   const peakSeverity = metrics.reduce<NutritionSeverity>(
     (worst, m) => (m.percent >= peak ? m.severity : worst),
     'low',
+  );
+
+  // Rent projections for the selected TTL, recomputed on every change so the
+  // panel tracks the slider in real time.
+  const rent = useMemo(
+    () =>
+      projectRent(
+        { ledger_read_bytes, ledger_write_bytes },
+        ttlDays,
+      ),
+    [ledger_read_bytes, ledger_write_bytes, ttlDays],
+  );
+
+  const feeBreakdown = useMemo(
+    () => buildFeeBreakdown(cost_stroops ?? 0, rent),
+    [cost_stroops, rent],
   );
 
   /**
@@ -275,6 +298,132 @@ export const NutritionLabel: React.FC<NutritionLabelProps> = ({
             </p>
           </div>
         )}
+
+        {/* Ledger footprint TTL & rent calculator */}
+        <div className="mt-3 border-t border-[var(--border-default)] pt-2 text-xs">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-bold uppercase tracking-wide text-[10px]">TTL Rent Projection</span>
+            <span className="tabular-nums text-[var(--text-secondary)]">{ttlDays}d</span>
+          </div>
+
+          <div className="mt-1.5 flex flex-wrap gap-1" role="group" aria-label="Ledger entry TTL">
+            {TTL_OPTIONS.map((option) => (
+              <button
+                key={option}
+                type="button"
+                onClick={() => setTtlDays(option)}
+                aria-pressed={ttlDays === option}
+                className={`rounded border px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                  ttlDays === option
+                    ? 'border-[var(--text-primary)] bg-[var(--text-primary)] text-[var(--bg-card)]'
+                    : 'border-[var(--border-default)] bg-[var(--bg-elevated)] text-[var(--text-primary)] hover:bg-[var(--bg-card)]'
+                }`}
+              >
+                {option}d
+              </button>
+            ))}
+          </div>
+
+          <table className="mt-2 w-full border-collapse">
+            <thead>
+              <tr className="text-[10px] uppercase text-[var(--text-secondary)] text-left">
+                <th scope="col" className="font-normal pb-1">
+                  Storage
+                </th>
+                <th scope="col" className="font-normal pb-1 text-right">
+                  Stroops
+                </th>
+                <th scope="col" className="font-normal pb-1 text-right">
+                  XLM
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr className="align-baseline">
+                <td className="py-0.5 pr-2">Persistent</td>
+                <td className="py-0.5 text-right tabular-nums">
+                  {Math.round(rent.persistentStroops).toLocaleString()}
+                </td>
+                <td className="py-0.5 text-right tabular-nums">
+                  {stroopsToXlm(rent.persistentStroops)}
+                </td>
+              </tr>
+              <tr className="align-baseline">
+                <td className="py-0.5 pr-2">Temporary</td>
+                <td className="py-0.5 text-right tabular-nums">
+                  {Math.round(rent.temporaryStroops).toLocaleString()}
+                </td>
+                <td className="py-0.5 text-right tabular-nums">
+                  {stroopsToXlm(rent.temporaryStroops)}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          {/* Stacked fee breakdown bar */}
+          <div className="mt-2">
+            <div className="flex justify-between text-[10px] uppercase text-[var(--text-secondary)] pb-1">
+              <span>Fee Breakdown</span>
+              <span className="tabular-nums">{stroopsToXlm(feeBreakdown.totalStroops)} XLM</span>
+            </div>
+            <div
+              className="flex h-2 w-full overflow-hidden rounded-sm bg-[var(--bg-elevated)]"
+              role="img"
+              aria-label="Fee breakdown: inclusion fee, resource execution fee, and TTL rent fee"
+            >
+              <div
+                className="h-full"
+                style={{ width: `${feeBreakdown.inclusionPercent}%`, backgroundColor: '#2da44e' }}
+                title={`Inclusion Fee: ${stroopsToXlm(feeBreakdown.inclusionStroops)} XLM`}
+              />
+              <div
+                className="h-full"
+                style={{ width: `${feeBreakdown.executionPercent}%`, backgroundColor: '#bf8700' }}
+                title={`Resource Execution Fee: ${stroopsToXlm(feeBreakdown.executionStroops)} XLM`}
+              />
+              <div
+                className="h-full"
+                style={{ width: `${feeBreakdown.rentPercent}%`, backgroundColor: '#e16f24' }}
+                title={`TTL Rent Fee: ${stroopsToXlm(feeBreakdown.rentStroops)} XLM`}
+              />
+            </div>
+            <ul className="mt-1 list-none m-0 p-0 text-[10px] text-[var(--text-secondary)]">
+              <li className="flex items-center justify-between">
+                <span className="flex items-center gap-1">
+                  <span
+                    className="inline-block h-2 w-2 rounded-sm"
+                    style={{ backgroundColor: '#2da44e' }}
+                    aria-hidden="true"
+                  />
+                  Inclusion Fee
+                </span>
+                <span className="tabular-nums">{stroopsToXlm(feeBreakdown.inclusionStroops)} XLM</span>
+              </li>
+              <li className="flex items-center justify-between">
+                <span className="flex items-center gap-1">
+                  <span
+                    className="inline-block h-2 w-2 rounded-sm"
+                    style={{ backgroundColor: '#bf8700' }}
+                    aria-hidden="true"
+                  />
+                  Resource Execution Fee
+                </span>
+                <span className="tabular-nums">{stroopsToXlm(feeBreakdown.executionStroops)} XLM</span>
+              </li>
+              <li className="flex items-center justify-between">
+                <span className="flex items-center gap-1">
+                  <span
+                    className="inline-block h-2 w-2 rounded-sm"
+                    style={{ backgroundColor: '#e16f24' }}
+                    aria-hidden="true"
+                  />
+                  TTL Rent Fee
+                </span>
+                <span className="tabular-nums">{stroopsToXlm(feeBreakdown.rentStroops)} XLM</span>
+              </li>
+            </ul>
+          </div>
+        </div>
 
         {/* Footnote */}
         <p className="mt-3 pt-2 border-t-4 border-[var(--text-primary)] text-[10px] leading-snug text-[var(--text-secondary)]">

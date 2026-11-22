@@ -229,6 +229,16 @@ struct AppConfig {
     /// When empty, defaults to `*` (allow all origins).
     #[serde(default = "default_allowed_origins")]
     allowed_origins: String,
+    /// Maximum time, in seconds, to wait for in-flight simulations, webhook
+    /// dispatches, and worker jobs to finish during a graceful shutdown
+    /// (issue #1425). After this elapses the drain coordinator aborts the
+    /// remaining work, releases the leader lock, and checkpoints SQLite.
+    #[serde(default = "default_shutdown_grace_period_secs")]
+    shutdown_grace_period_secs: u64,
+}
+
+fn default_shutdown_grace_period_secs() -> u64 {
+    30
 }
 
 fn default_health_check_interval() -> u64 {
@@ -336,6 +346,7 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("event_bus_capacity", 256)?
         .set_default("log_format_json", false)?
         .set_default("allowed_origins", "")?
+        .set_default("shutdown_grace_period_secs", 30)?
         .build()?;
 
     settings.try_deserialize()
@@ -1643,6 +1654,8 @@ async fn analyze(
         (status = 200, description = "Resource analysis successful", body = ResourceReport),
         (status = 400, description = "Invalid base64 or WASM data"),
         (status = 401, description = "Unauthorized"),
+        (status = 413, description = "WASM payload exceeds the upload limit"),
+        (status = 422, description = "Not a valid Soroban WASM module"),
         (status = 500, description = "Analysis failed")
     ),
     security(
@@ -1665,39 +1678,8 @@ async fn analyze_wasm(
         .decode(&payload.wasm_bytes)
         .map_err(|e| AppError::BadRequest(format!("Invalid base64 WASM data: {}", e)))?;
 
-    // ── Validate WASM size: reject files larger than 2 MB ────────────────────
-    const MAX_WASM_SIZE: usize = 2 * 1024 * 1024; // 2 MB
-    if wasm_bytes.len() > MAX_WASM_SIZE {
-        return Err(AppError::BadRequest(format!(
-            "WASM file too large: {} bytes exceeds the {} byte (2 MB) limit",
-            wasm_bytes.len(),
-            MAX_WASM_SIZE,
-        )));
-    }
-
-    // ── Validate WASM magic bytes: must start with \0asm (0x00 0x61 0x73 0x6D) ──
-    const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6d];
-    if wasm_bytes.len() < 8 || wasm_bytes[..4] != WASM_MAGIC {
-        return Err(AppError::BadRequest(
-            "Invalid WASM file: missing magic bytes (\\0asm). \
-             Please upload a compiled Soroban .wasm contract."
-                .to_string(),
-        ));
-    }
-
-    // ── Validate WASM binary version: must be version 1 (little-endian) ──────
-    let version = u32::from_le_bytes([
-        wasm_bytes[4],
-        wasm_bytes[5],
-        wasm_bytes[6],
-        wasm_bytes[7],
-    ]);
-    if version != 1 {
-        return Err(AppError::BadRequest(format!(
-            "Unsupported WASM version: {}. Expected version 1.",
-            version
-        )));
-    }
+    // ── Validate size (413), \0asm + version 1 header and custom sections (422) ──
+    parser::validate_wasm_upload(&wasm_bytes, parser::max_wasm_upload_bytes())?;
 
     let function_name = payload.function_name.clone();
     let args = payload.args.clone().unwrap_or_default();
@@ -2061,6 +2043,8 @@ pub struct CompareApiResponse {
     responses(
         (status = 200, description = "Comparison report", body = CompareApiResponse),
         (status = 400, description = "Invalid request"),
+        (status = 413, description = "WASM payload exceeds the upload limit"),
+        (status = 422, description = "Not a valid Soroban WASM module"),
         (status = 500, description = "Comparison failed")
     ),
     tag = "Analysis"
@@ -2092,26 +2076,12 @@ async fn compare_handler(
                 );
             }
             "current_wasm" => {
-                current_wasm_bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| {
-                            AppError::BadRequest(format!("Failed to read current_wasm: {}", e))
-                        })?
-                        .to_vec(),
-                );
+                current_wasm_bytes =
+                    Some(parser::read_wasm_upload(field, parser::max_wasm_upload_bytes()).await?);
             }
             "base_wasm" => {
-                base_wasm_bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| {
-                            AppError::BadRequest(format!("Failed to read base_wasm: {}", e))
-                        })?
-                        .to_vec(),
-                );
+                base_wasm_bytes =
+                    Some(parser::read_wasm_upload(field, parser::max_wasm_upload_bytes()).await?);
             }
             "contract_id" => {
                 contract_id =
@@ -2648,6 +2618,21 @@ async fn healthz() -> impl IntoResponse {
 /// 503 when at least one dependency is unavailable (the pod should be removed
 /// from the load-balancer rotation until it recovers).
 async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Issue #1425: the drain coordinator flips readiness to false the instant
+    // SIGTERM/SIGINT arrives, before any subsystem starts winding down, so the
+    // load balancer stops routing new traffic while in-flight work drains.
+    if state.shutdown.is_shutting_down() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "draining",
+                "checks": {
+                    "shutdown": "in_progress"
+                }
+            })),
+        );
+    }
+
     let rpc_healthy = state
         .provider_registry
         .provider_reports()
@@ -3451,6 +3436,8 @@ async fn main() {
         .route("/analyze/compare", post(compare_handler))
         .route("/analyze/gas-golfing", post(analyze_gas_golfing))
         .route("/analyze/host-import-heat", post(analyze_host_import_heat))
+        // Bound request bodies on the WASM upload routes (Issue #1400).
+        .layer(parser::upload_body_limit())
         .route_layer(middleware::from_fn(auth::auth_middleware));
 
     let app = Router::new()
@@ -3789,6 +3776,7 @@ mod tests {
             insights_engine: InsightsEngine::new(),
             simulation_timeout: std::time::Duration::from_secs(30),
             event_worker_pool: Arc::clone(&event_pool),
+            shutdown: runner::ShutdownCoordinator::new(std::time::Duration::from_secs(30)),
         });
         let auth_state = Arc::new(auth::AuthState::new(
             "test-secret".to_string(),
@@ -3928,6 +3916,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_readyz_flips_to_503_immediately_when_shutdown_begins() {
+        use axum::body::Body;
+        use http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app = build_test_app();
+        let state = app
+            .clone()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+        // Sanity check: the coordinator starts in the "running" state.
+        drop(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        // Without a healthy RPC provider the probe is already 503, but the
+        // body must not yet report the draining state.
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn test_profile_endpoint_no_jwt_returns_401() {
         use axum::body::Body;
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -3995,6 +4008,7 @@ mod config_validation_tests {
             event_bus_capacity: 256,
             log_format_json: false,
             allowed_origins: String::new(),
+            shutdown_grace_period_secs: 30,
         }
     }
 

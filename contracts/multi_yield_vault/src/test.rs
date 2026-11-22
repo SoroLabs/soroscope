@@ -1,4 +1,4 @@
-use crate::{MultiYieldVault, MultiYieldVaultClient};
+use crate::{MultiYieldVault, MultiYieldVaultClient, VIRTUAL_ASSETS, VIRTUAL_SHARES};
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
@@ -32,11 +32,7 @@ impl MockPool {
         let total_lp: i128 = e.storage().instance().get(&MockKey::TotalLp).unwrap_or(0);
 
         let deposit_amount = amount_a.max(amount_b);
-        let lp = if total_lp == 0 {
-            deposit_amount
-        } else {
-            deposit_amount
-        };
+        let lp = deposit_amount;
 
         e.storage()
             .instance()
@@ -128,6 +124,7 @@ fn test_initialize() {
     let (client, _, _, _) = setup(&e);
     let vault = client.get_vault();
     assert_eq!(vault.total_shares, 0);
+    assert_eq!(vault.total_assets, 0);
     assert_eq!(vault.slippage_bps, 100);
 }
 
@@ -183,7 +180,7 @@ fn test_apr_estimation() {
 fn test_deposit_routes_by_weights() {
     let e = Env::default();
     e.mock_all_auths();
-    let (client, admin, deposit_token, vault_id) = setup(&e);
+    let (client, admin, deposit_token, _) = setup(&e);
 
     let pool_low = register_mock_pool(&e, &admin, 10_000, 10);
     let pool_high = register_mock_pool(&e, &admin, 10_000, 50);
@@ -193,11 +190,12 @@ fn test_deposit_routes_by_weights() {
 
     let user = Address::generate(&e);
     mint(&e, &admin, &deposit_token, &user, 1_000);
-    mint(&e, &admin, &deposit_token, &vault_id, 20_000);
 
     let shares = client.deposit(&user, &1_000);
-    assert_eq!(shares, 1_000);
-    assert_eq!(client.vault_balance(&user), 1_000);
+    // First deposit into an empty vault: 1_000 * VIRTUAL_SHARES / VIRTUAL_ASSETS.
+    assert_eq!(shares, 1_000 * VIRTUAL_SHARES / VIRTUAL_ASSETS);
+    assert_eq!(client.vault_balance(&user), shares);
+    assert_eq!(client.get_vault().total_assets, 1_000);
 
     // LP shares should be distributed to both pools.
     let pools = client.get_pools();
@@ -209,7 +207,7 @@ fn test_deposit_routes_by_weights() {
 fn test_withdraw_returns_tokens() {
     let e = Env::default();
     e.mock_all_auths();
-    let (client, admin, deposit_token, vault_id) = setup(&e);
+    let (client, admin, deposit_token, _) = setup(&e);
 
     let pool1 = register_mock_pool(&e, &admin, 10_000, 30);
     let pool2 = register_mock_pool(&e, &admin, 10_000, 30);
@@ -221,12 +219,15 @@ fn test_withdraw_returns_tokens() {
 
     let user = Address::generate(&e);
     mint(&e, &admin, &deposit_token, &user, 1_000);
-    mint(&e, &admin, &deposit_token, &vault_id, 20_000);
-    client.deposit(&user, &1_000);
+    let deposited_shares = client.deposit(&user, &1_000);
 
-    let received = client.withdraw(&user, &500);
+    // Redeem half of the user's shares; with the virtual offset the payout is
+    // just under half of the 1_000 deposited assets (rounding favours the vault).
+    let half = deposited_shares / 2;
+    let received = client.withdraw(&user, &half);
     assert!(received > 0);
-    assert_eq!(client.vault_balance(&user), 500);
+    assert!(received <= 500);
+    assert_eq!(client.vault_balance(&user), deposited_shares - half);
 }
 
 #[test]
@@ -234,7 +235,7 @@ fn test_withdraw_returns_tokens() {
 fn test_withdraw_too_many_shares() {
     let e = Env::default();
     e.mock_all_auths();
-    let (client, admin, deposit_token, vault_id) = setup(&e);
+    let (client, admin, deposit_token, _) = setup(&e);
 
     let pool1 = register_mock_pool(&e, &admin, 10_000, 30);
     let pool2 = register_mock_pool(&e, &admin, 10_000, 30);
@@ -244,16 +245,15 @@ fn test_withdraw_too_many_shares() {
 
     let user = Address::generate(&e);
     mint(&e, &admin, &deposit_token, &user, 1_000);
-    mint(&e, &admin, &deposit_token, &vault_id, 20_000);
     client.deposit(&user, &1_000);
-    client.withdraw(&user, &2_000); // more than owned
+    client.withdraw(&user, &(2 * 1_000 * VIRTUAL_SHARES)); // more than owned
 }
 
 #[test]
 fn test_rebalance_redistributes_by_weights() {
     let e = Env::default();
     e.mock_all_auths();
-    let (client, admin, deposit_token, vault_id) = setup(&e);
+    let (client, admin, deposit_token, _) = setup(&e);
 
     let pool1 = register_mock_pool(&e, &admin, 10_000, 30);
     let pool2 = register_mock_pool(&e, &admin, 10_000, 30);
@@ -263,7 +263,6 @@ fn test_rebalance_redistributes_by_weights() {
 
     let user = Address::generate(&e);
     mint(&e, &admin, &deposit_token, &user, 1_000);
-    mint(&e, &admin, &deposit_token, &vault_id, 20_000);
     client.deposit(&user, &1_000);
 
     client.rebalance();
@@ -279,7 +278,7 @@ fn test_rebalance_redistributes_by_weights() {
 fn test_rebalance_noop_with_aligned_weights() {
     let e = Env::default();
     e.mock_all_auths();
-    let (client, admin, deposit_token, vault_id) = setup(&e);
+    let (client, admin, deposit_token, _) = setup(&e);
 
     let pool1 = register_mock_pool(&e, &admin, 10_000, 30);
     let pool2 = register_mock_pool(&e, &admin, 10_000, 30);
@@ -289,16 +288,12 @@ fn test_rebalance_noop_with_aligned_weights() {
 
     let user = Address::generate(&e);
     mint(&e, &admin, &deposit_token, &user, 500);
-    mint(&e, &admin, &deposit_token, &vault_id, 20_000);
     client.deposit(&user, &500);
 
-    let lp1_before = client.get_pools().get(0).unwrap().lp_shares;
-    let lp2_before = client.get_pools().get(1).unwrap().lp_shares;
     client.rebalance(); // should be a no-op since weights are aligned
-    let lp1_after = client.get_pools().get(0).unwrap().lp_shares;
-    let lp2_after = client.get_pools().get(1).unwrap().lp_shares;
-    assert!(lp1_after > 0);
-    assert!(lp2_after > 0);
+    let pools_after = client.get_pools();
+    assert!(pools_after.get(0).unwrap().lp_shares > 0);
+    assert!(pools_after.get(1).unwrap().lp_shares > 0);
 }
 
 #[test]
@@ -362,4 +357,88 @@ fn test_set_slippage() {
     let (client, _, _, _) = setup(&e);
     client.set_slippage(&200);
     assert_eq!(client.get_vault().slippage_bps, 200);
+}
+
+// ── Virtual-offset / inflation-attack regression tests ───────────────────────
+
+#[test]
+fn test_conversion_never_divides_by_zero_and_rounds_down() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, admin, deposit_token, vault_id) = setup(&e);
+
+    // Empty vault: virtual offsets keep both denominators >= 1.
+    assert_eq!(client.convert_to_shares(&1), VIRTUAL_SHARES);
+    assert_eq!(client.convert_to_assets(&VIRTUAL_SHARES), VIRTUAL_ASSETS);
+    assert_eq!(client.convert_to_shares(&0), 0);
+    assert_eq!(client.convert_to_assets(&0), 0);
+
+    // A large direct donation raises NAV; a 1-stroop deposit now rounds to 0
+    // shares and is rejected rather than becoming a free gift to holders.
+    mint(&e, &admin, &deposit_token, &vault_id, 1_000_000);
+    assert_eq!(client.total_assets(), 1_000_000);
+    assert_eq!(client.convert_to_shares(&1), 0);
+
+    let pool1 = register_mock_pool(&e, &admin, 10_000, 30);
+    let pool2 = register_mock_pool(&e, &admin, 10_000, 30);
+    client.register_pool(&pool1, &true);
+    client.register_pool(&pool2, &true);
+    client.set_weights(&soroban_sdk::vec![&e, 5_000, 5_000]);
+
+    let user = Address::generate(&e);
+    mint(&e, &admin, &deposit_token, &user, 1);
+    let result = client.try_deposit(&user, &1);
+    assert!(
+        result.is_err(),
+        "dust deposit minting zero shares must revert"
+    );
+}
+
+#[test]
+fn test_share_inflation_attack_is_resisted() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, admin, deposit_token, vault_id) = setup(&e);
+
+    let pool1 = register_mock_pool(&e, &admin, 10_000, 30);
+    let pool2 = register_mock_pool(&e, &admin, 10_000, 30);
+    client.register_pool(&pool1, &true);
+    client.register_pool(&pool2, &true);
+    client.set_weights(&soroban_sdk::vec![&e, 5_000, 5_000]);
+
+    let attacker = Address::generate(&e);
+    let victim = Address::generate(&e);
+
+    // 1. Attacker seeds an empty vault with a single stroop.
+    mint(&e, &admin, &deposit_token, &attacker, 1);
+    let attacker_shares = client.deposit(&attacker, &1);
+    assert_eq!(attacker_shares, VIRTUAL_SHARES);
+
+    // 2. Attacker donates tokens directly to the vault (no deposit call).
+    let donation = 100_000_000i128;
+    mint(&e, &admin, &deposit_token, &vault_id, donation);
+    assert_eq!(client.total_assets(), donation + 1);
+
+    // 3. Victim deposits; without virtual shares this would round to zero.
+    let victim_deposit = 1_000_000i128;
+    mint(&e, &admin, &deposit_token, &victim, victim_deposit);
+    let victim_shares = client.deposit(&victim, &victim_deposit);
+
+    let expected_victim_shares = victim_deposit
+        .saturating_mul(attacker_shares.saturating_add(VIRTUAL_SHARES))
+        / (donation + 1 + VIRTUAL_ASSETS);
+    assert_eq!(victim_shares, expected_victim_shares);
+    assert!(victim_shares > 0, "victim must receive non-zero shares");
+
+    // 4. The attacker's shares cannot claim the donated assets — the virtual
+    //    offset dilutes the donation so the attacker ends up at a loss.
+    let attacker_assets = client.convert_to_assets(&attacker_shares);
+    assert!(
+        attacker_assets < donation,
+        "attacker must not capture the direct donation"
+    );
+    assert!(
+        attacker_assets < donation + 1,
+        "attacker must not profit from the attack"
+    );
 }

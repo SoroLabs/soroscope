@@ -16,9 +16,11 @@ use soroban_sdk::xdr::{
     Uint256, VecM, WriteXdr,
 };
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use stellar_strkey::{Contract as StrkeyContract, Strkey};
 use thiserror::Error;
+use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
@@ -206,6 +208,45 @@ impl From<soroban_env_host::HostError> for SimulationError {
         ))
     }
 }
+
+/// RAII guard for a temporary `.wasm` file written to disk for a Soroban CLI
+/// subprocess.
+///
+/// The file is removed unconditionally when the guard is dropped — including
+/// when the surrounding async future is cancelled mid-execution (e.g. the
+/// client disconnects). This prevents `.wasm` files from leaking in `/tmp`.
+pub struct TempWasmFile {
+    path: PathBuf,
+}
+
+impl TempWasmFile {
+    /// Write `bytes` to a unique temporary `.wasm` path and return a guard that
+    /// owns (and will delete) it.
+    pub fn new(bytes: &[u8]) -> std::io::Result<Self> {
+        let unique = format!(
+            "soroscope-sim-{}-{}.wasm",
+            std::process::id(),
+            TEMP_WASM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::write(&path, bytes)?;
+        Ok(Self { path })
+    }
+
+    /// Path to the temporary `.wasm` file on disk.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempWasmFile {
+    fn drop(&mut self) {
+        // Best-effort cleanup; ignore errors (file may already be gone).
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+static TEMP_WASM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Ordered entry in a ledger key access trace.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -6014,6 +6055,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_kill_on_drop_terminates_child() {
+        // Verify that a Command configured with kill_on_drop(true) does not
+        // leave a zombie child behind when its future is dropped.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60").kill_on_drop(true);
+        let mut child = cmd.spawn().expect("failed to spawn sleep");
+        let pid = child.id();
+        assert!(pid.is_some());
+
+        // Dropping the child should kill it (kill_on_drop).
+        drop(child);
+
+        // Give the OS a moment to reap.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // If the process were still alive, `kill -0` would succeed; we simply
+        // assert we got here without leaking — the real assertion is that the
+        // test process exits cleanly. On Unix, verify the pid is gone.
+        #[cfg(unix)]
+        {
+            let alive = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.unwrap().to_string())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(!alive, "child process should have been killed on drop");
+        }
+    }
+
+    #[tokio::test]
     async fn test_simulate_from_contract_id_empty() {
         let engine = SimulationEngine::new("https://test.com".to_string());
         let result = engine
@@ -6188,6 +6259,46 @@ mod tests {
             assert_eq!(deps[0].key, key_xdr);
             assert_eq!(deps[0].source, DataSource::Injected);
         }
+    }
+
+    #[test]
+    fn test_temp_wasm_file_removed_on_drop() {
+        let guard = TempWasmFile::new(b"\0asm\x01\0\0\0").unwrap();
+        let path = guard.path().to_path_buf();
+        assert!(path.exists(), "temp wasm file should exist while guard is alive");
+        drop(guard);
+        assert!(
+            !path.exists(),
+            "temp wasm file should be removed when guard is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_temp_wasm_file_removed_on_early_future_drop() {
+        // Spawn an in-flight future that holds a TempWasmFile across an await
+        // point, then drop the future mid-execution. The guard's Drop must run
+        // and remove the file from disk.
+        let (path_tx, path_rx) = tokio::sync::oneshot::channel::<PathBuf>();
+        let handle = tokio::spawn(async move {
+            let guard = TempWasmFile::new(b"\0asm\x01\0\0\0").unwrap();
+            let path = guard.path().to_path_buf();
+            let _ = path_tx.send(path.clone());
+            // Park forever so the future is still in flight when dropped.
+            std::future::pending::<()>().await;
+            drop(guard);
+        });
+
+        let path = path_rx.await.unwrap();
+        assert!(path.exists(), "temp wasm file should exist while in flight");
+
+        // Cancel the in-flight future.
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            !path.exists(),
+            "temp wasm file should be removed after the future is dropped"
+        );
     }
 
     #[test]

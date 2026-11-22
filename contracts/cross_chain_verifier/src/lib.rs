@@ -33,14 +33,6 @@ pub struct SignedMessage {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    Admin,
-    StateRoot(u32),
-    NonceUsed(u64),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Payload {
     pub chain_id: u32,
     pub destination_contract: Address,
@@ -49,6 +41,7 @@ pub struct Payload {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
     StateRoot(u32),
@@ -74,37 +67,35 @@ impl CrossChainVerifier {
         env.storage().instance().set(&DataKey::SignerCount, &0u32);
     }
 
+    /// Admin-only: pause or unpause all verification operations.
+    pub fn set_paused(env: Env, paused: bool) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::VerifyPaused, &paused);
+    }
+
+    /// Returns true if verification is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::VerifyPaused)
+            .unwrap_or(false)
+    }
+
     pub fn update_root(env: Env, block_height: u32, new_root: BytesN<32>) {
-        /// Admin-only: pause or unpause all verification operations.
-        pub fn set_paused(env: Env, paused: bool) {
-            let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-            admin.require_auth();
-            env.storage()
-                .instance()
-                .set(&DataKey::VerifyPaused, &paused);
-        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::StateRoot(block_height), &new_root);
+    }
 
-        /// Returns true if verification is currently paused.
-        pub fn is_paused(env: Env) -> bool {
-            env.storage()
-                .instance()
-                .get(&DataKey::VerifyPaused)
-                .unwrap_or(false)
-        }
-
-        pub fn update_root(env: Env, block_height: u32, new_root: BytesN<32>) {
-            let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-            admin.require_auth();
-            env.storage()
-                .persistent()
-                .set(&DataKey::StateRoot(block_height), &new_root);
-        }
-
-        pub fn get_root(env: Env, block_height: u32) -> Option<BytesN<32>> {
-            env.storage()
-                .persistent()
-                .get(&DataKey::StateRoot(block_height))
-        }
+    pub fn get_root(env: Env, block_height: u32) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StateRoot(block_height))
     }
 
     /// Add an authorized signer for cross-chain message verification.
@@ -196,7 +187,6 @@ impl CrossChainVerifier {
         signed_message: SignedMessage,
         block_height: u32,
         proof: Vec<BytesN<32>>,
-        proof_flags: Vec<bool>,
     ) -> bool {
         if Self::is_paused(env.clone()) {
             panic!("verification paused");
@@ -212,7 +202,16 @@ impl CrossChainVerifier {
             return false;
         }
 
-        if !Self::verify_merkle_proof(&env, &message_hash, &block_height, &proof, &proof_flags) {
+        let expected_root: BytesN<32> = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::StateRoot(block_height))
+        {
+            Some(root) => root,
+            None => return false,
+        };
+        let leaf = Self::hash_leaf_hash(&env, &message_hash);
+        if !Self::verify_merkle_root(&env, &leaf, &expected_root, &proof) {
             return false;
         }
 
@@ -225,41 +224,46 @@ impl CrossChainVerifier {
         block_height: u32,
         payload: Payload,
         proof: Vec<BytesN<32>>,
-        proof_flags: Vec<bool>,
     ) -> bool {
         if Self::is_paused(env.clone()) {
             return false;
         }
-        if proof.is_empty() {
-            return false;
+
+        if Self::is_nonce_processed(env.clone(), payload.nonce) {
+            panic!("Nonce already used");
         }
-        Self::verify_merkle_proof(&env, &leaf, &block_height, &proof, &proof_flags)
+
+        let valid = Self::verify_merkle_proof(&env, &payload, &block_height, &proof);
+        if valid {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ProcessedNonce(payload.nonce), &true);
+        }
+        valid
     }
 
     pub fn verify_message_and_consume(
         env: Env,
         block_height: u32,
-        nonce: u64,
-        leaf: BytesN<32>,
+        payload: Payload,
         proof: Vec<BytesN<32>>,
-        proof_flags: Vec<bool>,
     ) -> bool {
         if Self::is_paused(env.clone()) {
             panic!("verification paused");
         }
 
-        if Self::is_nonce_processed(env.clone(), nonce) {
+        if Self::is_nonce_processed(env.clone(), payload.nonce) {
             panic!("nonce already processed");
         }
 
-        let valid = Self::verify_message(env.clone(), block_height, leaf, proof, proof_flags);
+        let valid = Self::verify_merkle_proof(&env, &payload, &block_height, &proof);
         if !valid {
             return false;
         }
 
         env.storage()
             .persistent()
-            .set(&DataKey::ProcessedNonce(nonce), &true);
+            .set(&DataKey::ProcessedNonce(payload.nonce), &true);
         true
     }
 
@@ -317,12 +321,44 @@ impl CrossChainVerifier {
         BytesN::from_array(env, &digest)
     }
 
+    /// Domain-separated leaf hash: SHA-256(0x00 || data).
+    fn hash_leaf(env: &Env, data: &Bytes) -> BytesN<32> {
+        let mut buf = Bytes::new(env);
+        buf.append(&Bytes::from_slice(env, &[0x00]));
+        buf.append(data);
+        env.crypto().sha256(&buf).into()
+    }
+
+    /// Domain-separated leaf hash for a 32-byte hash value.
+    fn hash_leaf_hash(env: &Env, hash: &BytesN<32>) -> BytesN<32> {
+        let data = Bytes::from_slice(env, &hash.to_array());
+        Self::hash_leaf(env, &data)
+    }
+
+    /// Domain-separated internal node hash: SHA-256(0x01 || min || max).
+    fn hash_internal(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut combined = [0u8; 65];
+        combined[0] = 0x01;
+        if left <= right {
+            combined[1..33].copy_from_slice(left);
+            combined[33..65].copy_from_slice(right);
+        } else {
+            combined[1..33].copy_from_slice(right);
+            combined[33..65].copy_from_slice(left);
+        }
+        env.crypto()
+            .sha256(&Bytes::from_slice(env, &combined))
+            .to_array()
+    }
+
+    /// Verify a Merkle proof for a payload. Uses domain-separated hashing:
+    /// leaf = SHA-256(0x00 || payload_hash), internal = SHA-256(0x01 || min || max).
+    /// Odd trailing nodes are promoted unchanged (no sibling duplication).
     fn verify_merkle_proof(
         env: &Env,
-        leaf: &BytesN<32>,
+        payload: &Payload,
         block_height: &u32,
         proof: &Vec<BytesN<32>>,
-        proof_flags: &Vec<bool>,
     ) -> bool {
         let expected_root: BytesN<32> = match env
             .storage()
@@ -333,47 +369,26 @@ impl CrossChainVerifier {
             None => return false,
         };
 
-        if proof.len() != proof_flags.len() {
-            return false;
-        }
+        let payload_hash = Self::compute_payload_hash(env, payload);
+        let leaf = Self::hash_leaf_hash(env, &payload_hash);
+        Self::verify_merkle_root(env, &leaf, &expected_root, proof)
+    }
 
-        // Replay protection: nonce must not have been used before
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::NonceUsed(payload.nonce))
-        {
-            panic!("Nonce already used");
-        }
-        env.storage()
-            .persistent()
-            .set(&DataKey::NonceUsed(payload.nonce), &true);
-
-        // Compute domain-separated leaf hash
-        let leaf = Self::compute_payload_hash(&env, &payload);
-        let mut current_hash = leaf.to_array();
+    /// Verify a pre-hashed leaf against a known root using domain-separated internal hashing.
+    fn verify_merkle_root(
+        env: &Env,
+        leaf_hash: &BytesN<32>,
+        expected_root: &BytesN<32>,
+        proof: &Vec<BytesN<32>>,
+    ) -> bool {
+        let mut current = leaf_hash.to_array();
         let mut i = 0;
         while i < proof.len() {
             let sibling = proof.get(i).unwrap().to_array();
-            // Deterministically order sibling hashes so the computed root
-            // matches the Soroban verifier's canonical Merkle ordering.
-            let (left, right) = if sibling <= current_hash {
-                (sibling, current_hash)
-            } else {
-                (current_hash, sibling)
-            };
-
-            let mut combined = [0u8; 64];
-            combined[0..32].copy_from_slice(&left);
-            combined[32..64].copy_from_slice(&right);
-
-            let combined_bytes = Bytes::from_slice(env, &combined);
-            current_hash = env.crypto().sha256(&combined_bytes).to_array();
+            current = Self::hash_internal(env, &current, &sibling);
             i += 1;
         }
-
-        let computed_root = BytesN::from_array(env, &current_hash);
-        computed_root == expected_root
+        BytesN::from_array(env, &current) == *expected_root
     }
 }
 
