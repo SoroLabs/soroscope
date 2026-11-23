@@ -6,13 +6,18 @@ Scans the repository for literal calls to `EmergencyGuard::initialize(..., vec![
 and reports cases where the threshold is zero or greater than the number of literal admins provided.
 
 Usage:
-    python3 scripts/audit_multisig_thresholds.py
+    python3 scripts/audit_multisig_thresholds.py [--help]
+
+The audit is fully local (no network calls). Filesystem errors, including errors from
+network-mounted paths, are reported as warnings instead of crashing the scan.
+The process exits with status 1 when any invalid threshold is found.
 
 This is best-effort static analysis; non-literal admin lists or thresholds will be reported as "unknown".
 """
+import argparse
 import re
-from pathlib import Path
 import sys
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -24,8 +29,9 @@ PATTERN = re.compile(
 
 def scan_file(path: Path):
     try:
-        txt = path.read_text()
-    except Exception:
+        txt = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        print(f"warning: could not read {path}: {exc}", file=sys.stderr)
         return []
 
     results = []
@@ -46,9 +52,19 @@ def scan_file(path: Path):
     return results
 
 
-def main():
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Audit literal EmergencyGuard::initialize thresholds."
+    )
+    parser.parse_args()
+
     print("Scanning for EmergencyGuard::initialize literal vec![] usages...\n")
-    files = list(ROOT.rglob("*.rs"))
+    try:
+        files = list(ROOT.rglob("*.rs"))
+    except OSError as exc:
+        print(f"error: could not scan {ROOT}: {exc}", file=sys.stderr)
+        return 1
+
     found = 0
     problems = 0
     for f in files:
@@ -85,7 +101,11 @@ def main():
     print(f"Scan complete. {found} literal initialize() calls found, {problems} potential problems.")
     if found == 0:
         print("No literal vec![] initializers found; consider reviewing docs or integration files.")
+    if problems:
+        print(f"ERROR: {problems} invalid multisig threshold(s) found.", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
