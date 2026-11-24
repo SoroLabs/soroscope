@@ -9,6 +9,49 @@ const assert = require('node:assert/strict');
 
 // ── Pure logic mirroring ErrorBoundary helper functions ───────────────────────
 
+function sanitizeTelemetry(text) {
+  if (!text) return '';
+  return text
+    .replace(/\bS[A-Z2-7]{55}\b/g, '[REDACTED_STELLAR_SECRET_KEY]')
+    .replace(/Bearer\s+[A-Za-z0-9\-_.~+/]+=*/gi, 'Bearer [REDACTED_BEARER_TOKEN]')
+    .replace(/(api[_-]?key|secret|token|password|auth|authorization)=["']?[^&"'\s]+/gi, '$1=[REDACTED]')
+    .replace(/\b(0x)?[0-9a-fA-F]{64}\b/g, '[REDACTED_HEX_KEY]');
+}
+
+function buildDiagnosticsReport(error, errorInfo) {
+  const lines = [
+    `Error: ${error.name || 'Error'}`,
+    `Message: ${sanitizeTelemetry(error.message || '(no message)')}`,
+    '',
+    'Stack Trace:',
+    sanitizeTelemetry(error.stack || '(no stack trace available)'),
+  ];
+
+  if (errorInfo?.componentStack) {
+    lines.push('', 'Component Stack:', sanitizeTelemetry(errorInfo.componentStack));
+  }
+
+  return lines.join('\n');
+}
+
+function generateCrashBundle(error, errorInfo) {
+  const bundle = {
+    appVersion: '1.0.0',
+    timestamp: new Date().toISOString(),
+    userAgent: 'test-agent',
+    url: 'http://localhost/test',
+    error: {
+      name: error.name || 'Error',
+      message: sanitizeTelemetry(error.message || ''),
+      stack: sanitizeTelemetry(error.stack || ''),
+    },
+    componentStack: errorInfo?.componentStack
+      ? sanitizeTelemetry(errorInfo.componentStack)
+      : null,
+  };
+  return JSON.stringify(bundle, null, 2);
+}
+
 function isRpcNetworkError(error) {
   if (!error) return false;
   const msg = (error.message || '').toLowerCase();
@@ -117,4 +160,39 @@ test('ErrorBoundary state: reset clears error and details toggle state', () => {
   assert.equal(state.error, null);
   assert.equal(state.errorInfo, null);
   assert.equal(state.showDetails, false);
+});
+
+// ── Telemetry Sanitizer & Crash Bundle Tests (#1453) ──────────────────────────
+
+test('sanitizeTelemetry: redacts Stellar secret keys, bearer tokens, and api keys', () => {
+  const rawText = 'Error connecting with Bearer eyJhbGciOi.token and api_key=secret123 and SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+  const sanitized = sanitizeTelemetry(rawText);
+
+  assert.ok(!sanitized.includes('secret123'));
+  assert.ok(!sanitized.includes('SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'));
+  assert.ok(!sanitized.includes('eyJhbGciOi.token'));
+  assert.ok(sanitized.includes('Bearer [REDACTED_BEARER_TOKEN]'));
+  assert.ok(sanitized.includes('[REDACTED_STELLAR_SECRET_KEY]'));
+  assert.ok(sanitized.includes('api_key=[REDACTED]'));
+});
+
+test('buildDiagnosticsReport: applies sanitization to message and stack trace', () => {
+  const err = new Error('Failed with token=supersecret123');
+  err.stack = 'Error: Failed with token=supersecret123\n at func (http://localhost/app.js)';
+  const report = buildDiagnosticsReport(err, { componentStack: 'at Component (token=secret)' });
+
+  assert.ok(!report.includes('supersecret123'));
+  assert.ok(report.includes('token=[REDACTED]'));
+});
+
+test('generateCrashBundle: returns valid sanitized JSON bundle', () => {
+  const err = new Error('RPC crash api_key=xyz');
+  const bundleJson = generateCrashBundle(err, null);
+  const parsed = JSON.parse(bundleJson);
+
+  assert.equal(parsed.appVersion, '1.0.0');
+  assert.ok(parsed.timestamp);
+  assert.equal(parsed.error.name, 'Error');
+  assert.ok(!parsed.error.message.includes('xyz'));
+  assert.ok(parsed.error.message.includes('api_key=[REDACTED]'));
 });
