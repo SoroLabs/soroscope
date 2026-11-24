@@ -2,9 +2,7 @@
 
 #[cfg(feature = "contract")]
 use soroban_sdk::{contract, contractimpl};
-use soroban_sdk::{
-    contracterror, contracttype, log, Address, Env, String, Vec,
-};
+use soroban_sdk::{contracterror, contracttype, log, Address, Env, String, Vec};
 
 /// Overall state of the emergency circuit breaker.
 #[contracttype]
@@ -420,7 +418,6 @@ impl EmergencyGuard {
             .map(|v: Vec<Address>| v.len())
             .unwrap_or(0)
     }
-
 
     /// Initialize admins and guardians separately. Guardian role changes are
     /// protected by the admin signature threshold.
@@ -847,7 +844,9 @@ impl EmergencyGuard {
             return Err(GuardError::AdminNotFound);
         }
 
-        new_admins.push_back(new_admin.clone());
+        if !new_admins.iter().any(|a| a == new_admin) {
+            new_admins.push_back(new_admin.clone());
+        }
 
         if (new_admins.len() as u32) < threshold {
             return Err(GuardError::InvalidThreshold);
