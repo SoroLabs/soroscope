@@ -16,12 +16,13 @@ pub enum Error {
     InvalidAmount = 3,
     InsufficientBalance = 4,
     TooManyRecipients = 5,
+    Overflow = 6,
 }
 
 /// Upper bound on recipients / transfers per batch. Oversized batches are
 /// rejected before any iteration so a caller cannot exhaust the
 /// transaction's CPU instruction budget by passing an unbounded batch.
-const MAX_RECIPIENTS: u32 = 100;
+pub const MAX_BATCH_SIZE: u32 = 100;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,6 +58,16 @@ pub struct TransferResult {
     pub failure: TransferFailure,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchSummary {
+    pub total_amount: i128,
+    pub succeeded: Vec<u32>,
+    pub skipped: Vec<u32>,
+}
+
+type RecipientGroups = Map<Address, (i128, Vec<u32>)>;
+
 #[soroban_sdk::contractclient(name = "BatchTokenClient")]
 pub trait BatchToken {
     fn balance(e: Env, id: Address) -> i128;
@@ -67,10 +78,63 @@ fn validate_batch_size(len: u32) -> Result<(), Error> {
     if len == 0 {
         return Err(Error::EmptyBatch);
     }
-    if len > MAX_RECIPIENTS {
+    if len > MAX_BATCH_SIZE {
         return Err(Error::TooManyRecipients);
     }
     Ok(())
+}
+
+fn validate_batch_shape(recipients_len: u32, amounts_len: u32) -> Result<(), Error> {
+    if recipients_len != amounts_len {
+        return Err(Error::LengthMismatch);
+    }
+    validate_batch_size(recipients_len)
+}
+
+fn is_zero_address(env: &Env, address: &Address) -> bool {
+    let zero_g = Address::from_string(&String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    let zero_c = Address::from_string(&String::from_str(
+        env,
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    ));
+    *address == zero_g || *address == zero_c
+}
+
+fn aggregate_recipients(
+    env: &Env,
+    recipients: &Vec<Address>,
+    amounts: &Vec<i128>,
+    strict: bool,
+) -> Result<(RecipientGroups, Vec<u32>, i128), Error> {
+    let mut groups: RecipientGroups = Map::new(env);
+    let mut skipped = Vec::new(env);
+    let mut total = 0i128;
+
+    for index in 0..recipients.len() {
+        let recipient = recipients.get(index).unwrap();
+        let amount = amounts.get(index).unwrap();
+        if amount <= 0 || is_zero_address(env, &recipient) {
+            if strict {
+                return Err(Error::InvalidAmount);
+            }
+            skipped.push_back(index);
+            continue;
+        }
+
+        let (group_amount, indices) = groups
+            .get(recipient.clone())
+            .unwrap_or((0i128, Vec::new(env)));
+        let updated_amount = group_amount.checked_add(amount).ok_or(Error::Overflow)?;
+        let mut updated_indices = indices;
+        updated_indices.push_back(index);
+        groups.set(recipient, (updated_amount, updated_indices));
+        total = total.checked_add(amount).ok_or(Error::Overflow)?;
+    }
+
+    Ok((groups, skipped, total))
 }
 
 fn process_batch(
@@ -194,6 +258,85 @@ impl BatchTransfer {
         mode: ExecutionMode,
     ) -> Result<Vec<TransferResult>, Error> {
         process_batch(&env, &token, &transfers, &mode, false)
+    }
+
+    /// Strict single-sender mode: validates the whole batch and the sender's
+    /// total balance before any transfer, then debits the sender once through
+    /// per-recipient aggregates. Any error reverts the entire batch.
+    pub fn batch_transfer_strict(
+        env: Env,
+        token: Address,
+        sender: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+    ) -> Result<BatchSummary, Error> {
+        sender.require_auth();
+        validate_batch_shape(recipients.len(), amounts.len())?;
+        let (groups, _, total) = aggregate_recipients(&env, &recipients, &amounts, true)?;
+
+        let token_client = BatchTokenClient::new(&env, &token);
+        let mut remaining = token_client.balance(&sender);
+        if remaining < total {
+            return Err(Error::InsufficientBalance);
+        }
+
+        let mut succeeded = Vec::new(&env);
+        for (recipient, (group_amount, indices)) in groups.iter() {
+            remaining = remaining.checked_sub(group_amount).ok_or(Error::Overflow)?;
+            token_client.transfer(&sender, &recipient, &group_amount);
+            for index in indices.iter() {
+                succeeded.push_back(index);
+            }
+        }
+
+        Ok(BatchSummary {
+            total_amount: total,
+            succeeded,
+            skipped: Vec::new(&env),
+        })
+    }
+
+    /// Best-effort single-sender mode: invalid amounts and recipients whose
+    /// aggregated amount exceeds the remaining balance are skipped and their
+    /// indices returned; all other transfers are executed.
+    pub fn batch_transfer_best_effort(
+        env: Env,
+        token: Address,
+        sender: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+    ) -> Result<BatchSummary, Error> {
+        sender.require_auth();
+        validate_batch_shape(recipients.len(), amounts.len())?;
+        let (groups, mut skipped, _) = aggregate_recipients(&env, &recipients, &amounts, false)?;
+
+        let token_client = BatchTokenClient::new(&env, &token);
+        let mut remaining = token_client.balance(&sender);
+        let mut succeeded = Vec::new(&env);
+        let mut total_amount = 0i128;
+
+        for (recipient, (group_amount, indices)) in groups.iter() {
+            if group_amount > remaining {
+                for index in indices.iter() {
+                    skipped.push_back(index);
+                }
+                continue;
+            }
+            token_client.transfer(&sender, &recipient, &group_amount);
+            remaining = remaining.checked_sub(group_amount).ok_or(Error::Overflow)?;
+            total_amount = total_amount
+                .checked_add(group_amount)
+                .ok_or(Error::Overflow)?;
+            for index in indices.iter() {
+                succeeded.push_back(index);
+            }
+        }
+
+        Ok(BatchSummary {
+            total_amount,
+            succeeded,
+            skipped,
+        })
     }
 
     /// Executes transfers from a single sender to multiple recipients.
