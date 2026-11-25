@@ -1104,13 +1104,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cross-call"
-version = "0.1.0"
-dependencies = [
- "soroban-sdk",
-]
-
-[[package]]
 name = "cross-chain-payload"
 version = "0.1.0"
 dependencies = [
@@ -1122,6 +1115,13 @@ name = "cross-chain-verifier"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "cross_call"
+version = "0.1.0"
+dependencies = [
  "soroban-sdk",
 ]
 

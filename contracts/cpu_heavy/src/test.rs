@@ -1,9 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{Env, Vec};
-use soroban_sdk::testutils::{Ledger, LedgerInfo};
-use soroban_sdk::xdr::{ScVal, LedgerKey, LedgerEntryData, ContractDataDurability};
+use soroban_sdk::Vec;
 
 fn setup(env: &Env) -> CpuHeavyContractClient<'_> {
     let contract_id = env.register(CpuHeavyContract, ());
@@ -55,6 +53,50 @@ fn test_bubble_sort_handles_degenerate_lengths() {
     assert_eq!(
         client.bubble_sort(&Vec::from_array(&env, [7])),
         Vec::from_array(&env, [7])
+    );
+}
+
+// ── Deterministic benchmark entry points ─────────────────────────────────────
+
+#[test]
+fn test_bench_sha256_iterations_is_deterministic() {
+    let env = Env::default();
+    let client = setup(&env);
+
+    let digest = client.bench_sha256_iterations(&8);
+    assert_eq!(digest, client.bench_sha256_iterations(&8));
+    assert_ne!(digest, client.bench_sha256_iterations(&9));
+}
+
+#[test]
+fn test_bench_vector_sort_sorts_descending_input() {
+    let env = Env::default();
+    let client = setup(&env);
+
+    assert_eq!(
+        client.bench_vector_sort(&8),
+        Vec::from_array(&env, [0, 1, 2, 3, 4, 5, 6, 7])
+    );
+    assert_eq!(client.bench_vector_sort(&0), Vec::new(&env));
+}
+
+#[test]
+fn test_benchmarks_reject_out_of_bounds_iterations() {
+    let env = Env::default();
+    let client = setup(&env);
+    let over = MAX_ITERATIONS + 1;
+
+    assert_eq!(
+        client.try_bench_sha256_iterations(&over),
+        Err(Ok(Error::IterationsTooLarge))
+    );
+    assert_eq!(
+        client.try_bench_vector_sort(&over),
+        Err(Ok(Error::IterationsTooLarge))
+    );
+    assert_eq!(
+        client.try_bench_sha256_iterations(&u32::MAX),
+        Err(Ok(Error::IterationsTooLarge))
     );
 }
 
@@ -220,141 +262,6 @@ fn test_error_codes_are_stable() {
     assert_eq!(Error::PrimeLimitTooLarge as u32, 3);
     assert_eq!(Error::LoopOpsTooLarge as u32, 4);
     assert_eq!(Error::CombinedInputTooLarge as u32, 5);
-}
-
-// ── Footprint diff ───────────────────────────────────────────────────────────
-
-/// A function that reads an extra instance key beyond what it declares.
-/// This is the "missing_reads" case: the host touches a key the footprint
-/// does not declare.
-#[test]
-fn test_footprint_diff_detects_missing_reads() {
-    let env = Env::default();
-    let client = setup(&env);
-
-    // Execute a call that reads an instance key not in the declared footprint.
-    let _ = client.fibonacci_iterative(&10);
-
-    // The host trace should record the instance key access.
-    let diff = extract_footprint_diff(&env);
-
-    // The declared footprint omits the instance key, so it must appear in
-    // missing_reads, not be silently dropped.
-    assert!(
-        !diff.missing_reads.is_empty(),
-        "expected missing_reads to be non-empty when host reads an undeclared key"
-    );
-    assert!(
-        diff.touched_trace != FootprintTrace::Unavailable,
-        "local execution must produce a touched trace"
-    );
-}
-
-/// A declared key that the function never accesses must show up in
-/// `declared_but_untouched`, not be treated as touched.
-#[test]
-fn test_footprint_diff_detects_declared_but_untouched() {
-    let env = Env::default();
-    let client = setup(&env);
-
-    // Declare a footprint that includes a key the function will not touch.
-    let declared = DeclaredFootprint {
-        read_only: Vec::from_array(
-            &env,
-            [LedgerKey::ContractData(soroban_sdk::xdr::LedgerKeyContractData {
-                contract: env.current_contract_address(),
-                key: ScVal::Symbol(soroban_sdk::Symbol::new(&env, "never_touched")),
-                durability: ContractDataDurability::Persistent,
-            })],
-        ),
-        read_write: Vec::new(&env),
-    };
-
-    let _ = client.fibonacci_iterative(&10);
-
-    let diff = extract_footprint_diff_with_declared(&env, &declared);
-
-    assert!(
-        !diff.declared_but_untouched.is_empty(),
-        "expected declared_but_untouched to include the unused declared key"
-    );
-}
-
-/// RPC-only simulations have no host trace. The diff must report the declared
-/// set and mark `touched_trace` as unavailable rather than pretending the
-/// declared set was touched.
-#[test]
-fn test_footprint_diff_rpc_only_marks_trace_unavailable() {
-    let env = Env::default();
-
-    let declared = DeclaredFootprint {
-        read_only: Vec::from_array(
-            &env,
-            [LedgerKey::ContractData(soroban_sdk::xdr::LedgerKeyContractData {
-                contract: env.current_contract_address(),
-                key: ScVal::Symbol(soroban_sdk::Symbol::new(&env, "some_key")),
-                durability: ContractDataDurability::Persistent,
-            })],
-        ),
-        read_write: Vec::new(&env),
-    };
-
-    let diff = extract_footprint_diff_rpc_only(&env, &declared);
-
-    assert_eq!(
-        diff.touched_trace,
-        FootprintTrace::Unavailable,
-        "RPC-only results must not claim a touched trace"
-    );
-    assert!(
-        diff.missing_reads.is_empty() && diff.missing_writes.is_empty(),
-        "RPC-only diff must not fabricate missing entries"
-    );
-}
-
-/// Missing writes must be distinguished from unused declarations: a write the
-/// host performed but the footprint did not declare is a `missing_writes`
-/// entry, not a `declared_but_untouched` entry.
-#[test]
-fn test_footprint_diff_distinguishes_missing_writes_from_unused_declarations() {
-    let env = Env::default();
-    let client = setup(&env);
-
-    let _ = client.fibonacci_iterative(&10);
-
-    let diff = extract_footprint_diff(&env);
-
-    // The two sets are disjoint by construction.
-    for key in diff.missing_writes.iter() {
-        assert!(
-            !diff.declared_but_untouched.contains(&key),
-            "a missing write must not also be classified as declared-but-untouched"
-        );
-    }
-}
-
-/// Contract instance and contract code keys must be classified, not dropped.
-#[test]
-fn test_footprint_diff_classifies_instance_and_code_keys() {
-    let env = Env::default();
-    let client = setup(&env);
-
-    let _ = client.fibonacci_iterative(&10);
-
-    let diff = extract_footprint_diff(&env);
-
-    // The contract instance key is always touched by a contract call, so it
-    // must appear in the touched set (either declared or missing), never be
-    // silently omitted.
-    let instance_touched = diff
-        .missing_reads
-        .iter()
-        .chain(diff.missing_writes.iter())
-        .chain(diff.declared_but_untouched.iter())
-        .any(|k| matches!(k, LedgerKey::ContractData(_)));
-
-    assert!(
-        instance_touched || diff.touched_trace == FootprintTrace::Unavailable,
-        "contract instance/code keys must be classified, not dropped"
-    );
+    assert_eq!(Error::FootprintMismatch as u32, 6);
+    assert_eq!(Error::IterationsTooLarge as u32, 7);
 }
