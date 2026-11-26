@@ -38,6 +38,15 @@ pub struct AppMetrics {
     /// Resource exhaustion alarm severity per resource: 0 normal, 1 warning,
     /// 2 critical (issue #1411).
     pub resource_alarm_severity: prometheus::IntGaugeVec,
+    /// Contract profile lookups served from the in-memory L1 (issue #1397).
+    pub cache_l1_hits_total: prometheus::IntCounter,
+    /// Contract profile lookups served from the shared L2 (issue #1397).
+    pub cache_l2_hits_total: prometheus::IntCounter,
+    /// Contract profile lookups that missed both tiers (issue #1397).
+    pub cache_misses_total: prometheus::IntCounter,
+    /// RPC provider circuit breaker transitions, by provider and target
+    /// state (`open`, `half_open`, `closed`) (issue #1398).
+    pub rpc_circuit_breaker_transitions_total: IntCounterVec,
 }
 
 /// The `resource_alarm_severity{resource}` gauge published by
@@ -150,6 +159,25 @@ impl AppMetrics {
             "worker_pool_shed_total",
             "Tasks shed by the bounded worker pool (queue full or queue wait exceeded)",
         )?;
+        let cache_l1_hits_total = prometheus::IntCounter::new(
+            "cache_l1_hits_total",
+            "Contract profile lookups served from the in-memory L1 cache",
+        )?;
+        let cache_l2_hits_total = prometheus::IntCounter::new(
+            "cache_l2_hits_total",
+            "Contract profile lookups served from the shared L2 cache",
+        )?;
+        let cache_misses_total = prometheus::IntCounter::new(
+            "cache_misses_total",
+            "Contract profile lookups that missed both cache tiers",
+        )?;
+        let rpc_circuit_breaker_transitions_total = IntCounterVec::new(
+            Opts::new(
+                "rpc_circuit_breaker_transitions_total",
+                "RPC provider circuit breaker state transitions",
+            ),
+            &["provider", "state"],
+        )?;
 
         registry.register(Box::new(simulation_latency_seconds.clone()))?;
         registry.register(Box::new(rpc_error_count_total.clone()))?;
@@ -169,6 +197,10 @@ impl AppMetrics {
         registry.register(Box::new(worker_pool_shed_total.clone()))?;
         let resource_alarm_severity = resource_alarm_severity_gauge()?;
         registry.register(Box::new(resource_alarm_severity.clone()))?;
+        registry.register(Box::new(cache_l1_hits_total.clone()))?;
+        registry.register(Box::new(cache_l2_hits_total.clone()))?;
+        registry.register(Box::new(cache_misses_total.clone()))?;
+        registry.register(Box::new(rpc_circuit_breaker_transitions_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -189,6 +221,10 @@ impl AppMetrics {
             worker_pool_queued_tasks,
             worker_pool_shed_total,
             resource_alarm_severity,
+            cache_l1_hits_total,
+            cache_l2_hits_total,
+            cache_misses_total,
+            rpc_circuit_breaker_transitions_total,
         })
     }
 

@@ -11,9 +11,13 @@
 //! a thread-safe in-memory LRU cache (`ledger_memory`, configurable TTL)
 //! sits in front of the Sled-backed `ledger_tree`, so repeated reads for
 //! hot ledger entries avoid hitting disk.
+//!
+//! [`tiered::TieredProfileCache`] applies the same L1/L2 read-through shape
+//! to contract profiles, with Redis as the L2 shared across instances.
 #![allow(unused_imports)]
 
 pub mod disk;
+pub mod tiered;
 
 use crate::simulation::SimulationResult;
 use moka::future::Cache;
@@ -236,4 +240,7 @@ pub enum CacheError {
 
     #[error("cache payload (de)serialisation error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("redis cache error: {0}")]
+    Redis(#[from] redis::RedisError),
 }

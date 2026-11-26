@@ -172,7 +172,7 @@ fn accepts_batch_at_max_recipient_limit() {
     let token = MockTokenClient::new(&env, &token_id);
 
     let mut transfers = Vec::new(&env);
-    for _ in 0..MAX_RECIPIENTS {
+    for _ in 0..MAX_BATCH_SIZE {
         transfers.push_back(Transfer {
             from: sender.clone(),
             to: Address::generate(&env),
@@ -182,8 +182,8 @@ fn accepts_batch_at_max_recipient_limit() {
 
     let results = batch.execute(&token_id, &transfers, &ExecutionMode::AllOrNothing);
 
-    assert_eq!(results.len(), MAX_RECIPIENTS);
-    assert_eq!(token.balance(&sender), 1_000 - MAX_RECIPIENTS as i128);
+    assert_eq!(results.len(), MAX_BATCH_SIZE);
+    assert_eq!(token.balance(&sender), 1_000 - MAX_BATCH_SIZE as i128);
 }
 
 #[test]
@@ -193,7 +193,7 @@ fn rejects_batch_over_max_recipient_limit() {
     let token = MockTokenClient::new(&env, &token_id);
 
     let mut transfers = Vec::new(&env);
-    for _ in 0..(MAX_RECIPIENTS + 1) {
+    for _ in 0..(MAX_BATCH_SIZE + 1) {
         transfers.push_back(Transfer {
             from: sender.clone(),
             to: Address::generate(&env),
@@ -360,6 +360,166 @@ fn execute_single_sender_convenience_works() {
     assert_eq!(token.balance(&sender), 500);
     assert_eq!(token.balance(&recipient_a), 300);
     assert_eq!(token.balance(&recipient_b), 200);
+}
+
+#[test]
+fn strict_batch_rejects_empty_mismatched_and_overflowing_inputs() {
+    let (env, batch_id, token_id, sender, recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let empty_recipients = Vec::new(&env);
+    let empty_amounts = Vec::new(&env);
+    assert_eq!(
+        batch.try_batch_transfer_strict(&token_id, &sender, &empty_recipients, &empty_amounts),
+        Err(Ok(Error::EmptyBatch))
+    );
+
+    let recipients = vec![&env, recipient_a.clone()];
+    let amounts = vec![&env, 1i128, 2i128];
+    assert_eq!(
+        batch.try_batch_transfer_strict(&token_id, &sender, &recipients, &amounts),
+        Err(Ok(Error::LengthMismatch))
+    );
+
+    let overflow_recipients = vec![&env, recipient_a.clone(), Address::generate(&env)];
+    let overflow_amounts = vec![&env, i128::MAX, 1i128];
+    assert_eq!(
+        batch.try_batch_transfer_strict(
+            &token_id,
+            &sender,
+            &overflow_recipients,
+            &overflow_amounts
+        ),
+        Err(Ok(Error::Overflow))
+    );
+}
+
+#[test]
+fn strict_batch_dedups_recipients_and_checks_total_before_transfer() {
+    let (env, batch_id, token_id, sender, recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = MockTokenClient::new(&env, &token_id);
+    let recipient_b = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        recipient_a.clone(),
+        recipient_b.clone(),
+        recipient_a.clone(),
+    ];
+    let amounts = vec![&env, 100i128, 300i128, 200i128];
+
+    let summary = batch.batch_transfer_strict(&token_id, &sender, &recipients, &amounts);
+    assert_eq!(summary.total_amount, 600);
+    let mut succeeded: std::vec::Vec<u32> = summary.succeeded.iter().collect();
+    succeeded.sort();
+    assert_eq!(succeeded, std::vec![0, 1, 2]);
+    assert_eq!(summary.skipped.len(), 0);
+
+    assert_eq!(token.balance(&sender), 400);
+    assert_eq!(token.balance(&recipient_a), 300);
+    assert_eq!(token.balance(&recipient_b), 300);
+}
+
+#[test]
+fn strict_batch_rejects_insufficient_total_without_mutation() {
+    let (env, batch_id, token_id, sender, recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = MockTokenClient::new(&env, &token_id);
+    let recipients = vec![&env, recipient_a.clone(), Address::generate(&env)];
+    let amounts = vec![&env, 700i128, 400i128];
+
+    assert_eq!(
+        batch.try_batch_transfer_strict(&token_id, &sender, &recipients, &amounts),
+        Err(Ok(Error::InsufficientBalance))
+    );
+    assert_eq!(token.balance(&sender), 1_000);
+    assert_eq!(token.balance(&recipient_a), 0);
+}
+
+#[test]
+fn strict_batch_rejects_oversized_batch_before_iteration() {
+    let (env, batch_id, token_id, sender, _) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let mut recipients = Vec::new(&env);
+    let mut amounts = Vec::new(&env);
+    for _ in 0..=MAX_BATCH_SIZE {
+        recipients.push_back(Address::generate(&env));
+        amounts.push_back(1i128);
+    }
+
+    assert_eq!(
+        batch.try_batch_transfer_strict(&token_id, &sender, &recipients, &amounts),
+        Err(Ok(Error::TooManyRecipients))
+    );
+}
+
+#[test]
+fn strict_batch_executes_fifty_recipients() {
+    let (env, batch_id, token_id, sender, _) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = MockTokenClient::new(&env, &token_id);
+    let mut recipients = Vec::new(&env);
+    let mut amounts = Vec::new(&env);
+    let mut expected_total = 0i128;
+    for _ in 0..50 {
+        recipients.push_back(Address::generate(&env));
+        amounts.push_back(1i128);
+        expected_total += 1i128;
+    }
+
+    let summary = batch.batch_transfer_strict(&token_id, &sender, &recipients, &amounts);
+    assert_eq!(summary.total_amount, expected_total);
+    assert_eq!(summary.succeeded.len(), 50);
+    assert_eq!(token.balance(&sender), 1_000 - expected_total);
+}
+
+#[test]
+fn best_effort_batch_skips_invalid_amounts_and_aggregates_duplicates() {
+    let (env, batch_id, token_id, sender, recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = MockTokenClient::new(&env, &token_id);
+    let recipient_b = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        recipient_a.clone(),
+        recipient_b.clone(),
+        recipient_a.clone(),
+    ];
+    let amounts = vec![&env, 400i128, -1i128, 100i128];
+
+    let summary = batch.batch_transfer_best_effort(&token_id, &sender, &recipients, &amounts);
+    assert_eq!(summary.total_amount, 500);
+    let mut succeeded: std::vec::Vec<u32> = summary.succeeded.iter().collect();
+    succeeded.sort();
+    assert_eq!(succeeded, std::vec![0, 2]);
+    let skipped: std::vec::Vec<u32> = summary.skipped.iter().collect();
+    assert_eq!(skipped, std::vec![1]);
+    assert_eq!(token.balance(&sender), 500);
+    assert_eq!(token.balance(&recipient_a), 500);
+    assert_eq!(token.balance(&recipient_b), 0);
+}
+
+#[test]
+fn best_effort_batch_skips_groups_above_remaining_balance() {
+    let (env, batch_id, token_id, sender, recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = MockTokenClient::new(&env, &token_id);
+    let recipient_b = Address::generate(&env);
+    let recipients = vec![&env, recipient_a.clone(), recipient_b.clone()];
+    let amounts = vec![&env, 1_000i128, 2_000i128];
+
+    let summary = batch.batch_transfer_best_effort(&token_id, &sender, &recipients, &amounts);
+    assert_eq!(summary.total_amount, 1_000);
+    assert_eq!(
+        summary.succeeded.iter().collect::<std::vec::Vec<u32>>(),
+        std::vec![0]
+    );
+    assert_eq!(
+        summary.skipped.iter().collect::<std::vec::Vec<u32>>(),
+        std::vec![1]
+    );
+    assert_eq!(token.balance(&sender), 0);
+    assert_eq!(token.balance(&recipient_a), 1_000);
+    assert_eq!(token.balance(&recipient_b), 0);
 }
 
 #[test]

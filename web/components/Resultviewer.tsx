@@ -1,6 +1,7 @@
 import { Suspense, useState } from 'react';
 import type { InvocationResult } from '../lib/sorobantypes';
 import { exportReport } from '../lib/exportReport';
+import { formatAmount, stringifyResult } from '../lib/bigIntFormat';
 
 import { buildShareUrl, isValidSimulationId } from '../lib/shareLinks';
 
@@ -289,9 +290,9 @@ export function ResultViewer({ result, contractId }: ResultViewerProps) {
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
               <strong style={{ color: 'var(--text-secondary)' }}>Result:</strong>
-              <CopyButton text={JSON.stringify(result.result, null, 2)} label="Copy Result" tooltipPosition="left" />
+              <CopyButton text={stringifyResult(result.result)} label="Copy Result" tooltipPosition="left" />
             </div>
-            {JSON.stringify(result.result, null, 2)}
+            {stringifyResult(result.result)}
           </div>
         )
       )}
@@ -300,7 +301,7 @@ export function ResultViewer({ result, contractId }: ResultViewerProps) {
         <NetworkComparisonView
           contractId={contractId}
           functionName={result.functionName}
-          args={Object.values(result.inputs ?? {}).map((value) => String(value))}
+          args={Object.values(result.inputs ?? {}).map((value) => formatAmount(value))}
           runKey={result.id}
         />
       )}

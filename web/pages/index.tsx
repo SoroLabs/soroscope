@@ -50,6 +50,7 @@ import {
   type TransactionStatus,
 } from "../lib/sorobantypes";
 import { DEFAULT_TRANSACTION_FILTER, type TransactionFilter } from "../lib/transactionFilters";
+import { decodePermalinkState, encodePermalinkState } from "../lib/permalinkState";
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   let binary = "";
@@ -89,6 +90,9 @@ export default function Home() {
   const [wasmFile, setWasmFile] = useState<File | null>(null);
   const [wasmData, setWasmData] = useState<string | null>(null);
   const [toastNotifications, setToastNotifications] = useState<ToastItem[]>([]);
+  // Encoded argument values for the currently selected function, used to
+  // rebuild shareable permalinks.
+  const [lastInputs, setLastInputs] = useState<Record<string, string>>({});
 
   const [uploadResetKey, setUploadResetKey] = useState(0);
   const mockTransactions = useMemo(() => generateMockTransactions(47), []);
@@ -116,6 +120,38 @@ export default function Home() {
   useEffect(() => {
     setContractId(network.defaultContractId);
   }, [network]);
+
+  // Hydrate simulator state from a shareable `?state=` permalink. Malformed or
+  // tampered payloads decode to `null` and are ignored so we fall back to the
+  // default state without crashing.
+  useEffect(() => {
+    if (!router.isReady) return;
+    const requested = router.query.state;
+    const value = Array.isArray(requested) ? requested[0] : requested;
+    if (!value) return;
+
+    const decoded = decodePermalinkState(value);
+    if (!decoded) return;
+
+    if (decoded.contractId) {
+      setContractId(decoded.contractId);
+    }
+
+    const match = MOCK_CONTRACT_FUNCTIONS.find((fn) => fn.name === decoded.fnName);
+    if (match) {
+      setSelectedFunction(match);
+    }
+
+    if (decoded.args) {
+      setLastInputs(decoded.args);
+    }
+
+    if (decoded.viewTab && VALID_TABS.includes(decoded.viewTab as NavTab)) {
+      setTab(decoded.viewTab as NavTab);
+    }
+    // Only re-run when the permalink parameter itself changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [router.isReady, router.query.state]);
 
   // Gas golfing state
   const [gasGolfingSuggestions, setGasGolfingSuggestions] = useState<GasGolfingSuggestion[]>([]);
@@ -182,6 +218,17 @@ export default function Home() {
   const handleSimulate = async (inputs: Record<string, any>, customWasmData?: string) => {
     setLoading(true);
     let errorType: string | undefined;
+
+    // Remember the submitted arguments so a permalink can reproduce this run.
+    try {
+      const serialized: Record<string, string> = {};
+      for (const [key, value] of Object.entries(inputs ?? {})) {
+        serialized[key] = typeof value === "string" ? value : JSON.stringify(value);
+      }
+      setLastInputs(serialized);
+    } catch {
+      // Ignore unserializable inputs; permalink will simply omit them.
+    }
 
     try {
       const activeWasmData = customWasmData ?? wasmData;
@@ -253,6 +300,22 @@ export default function Home() {
     clearLatestAnalysis();
     setUploadResetKey((k) => k + 1);
   }, []);
+
+  // Build a shareable permalink that restores the current simulator state.
+  const permalink = useMemo(() => {
+    const encoded = encodePermalinkState({
+      network: network.id,
+      contractId,
+      fnName: selectedFunction.name,
+      args: lastInputs,
+      viewTab: tab,
+    });
+    const base =
+      typeof window !== "undefined"
+        ? `${window.location.origin}${window.location.pathname}`
+        : "";
+    return `${base}?state=${encoded}`;
+  }, [network.id, contractId, selectedFunction.name, lastInputs, tab]);
 
   const handleWasmReady = async (file: File) => {
     setGasGolfingLoading(true);
@@ -331,6 +394,21 @@ export default function Home() {
         <HeaderNav tab={tab} setTab={navigateToTab} />
 
         <section className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8">
+          {/* Simulator header with shareable permalink */}
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h1 className="text-lg font-semibold text-slate-100">Simulation Report</h1>
+              <p className="text-xs text-slate-400">
+                Share this exact configuration with a teammate via a permalink.
+              </p>
+            </div>
+            <CopyButton
+              text={permalink}
+              label="Share Permalink"
+              tooltipPosition="left"
+            />
+          </div>
+
           {/* WASM Upload Zone */}
           <div className="mb-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
             <ErrorBoundary

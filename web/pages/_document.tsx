@@ -1,21 +1,31 @@
 import { Head, Html, Main, NextScript } from "next/document";
 
 const themeInitializer = `
-(function() {
+(function () {
   try {
     var storageKey = "theme";
-    var defaultTheme = "dark";
-    var theme = localStorage.getItem(storageKey) || defaultTheme;
+    var storedTheme = localStorage.getItem(storageKey);
+    var validThemes = ["light", "dark", "system"];
+    var theme = validThemes.indexOf(storedTheme) !== -1
+      ? storedTheme
+      : "dark";
 
     if (theme === "system") {
-      theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      theme = window.matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light";
     }
 
     var root = document.documentElement;
     root.classList.remove("light", "dark");
     root.classList.add(theme);
     root.style.colorScheme = theme;
-  } catch (_) {}
+  } catch (error) {
+    // Keep the default dark theme if storage or browser APIs are unavailable.
+    document.documentElement.classList.remove("light");
+    document.documentElement.classList.add("dark");
+    document.documentElement.style.colorScheme = "dark";
+  }
 })();
 `;
 

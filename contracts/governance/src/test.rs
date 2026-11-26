@@ -287,6 +287,189 @@ fn transferred_voting_units_snapshot_prevents_double_vote() {
     assert_eq!(err, Err(Ok(Error::InsufficientVotingUnits)));
 }
 
+fn approvals(env: &Env, admin_a: &Address, admin_b: &Address) -> Vec<Address> {
+    Vec::from_array(env, [admin_a.clone(), admin_b.clone()])
+}
+
+#[test]
+fn delegation_checkpoint_is_fixed_at_proposal_start_ledger() {
+    let (env, contract_id, _admin, voter_a, voter_b) = setup(false);
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    let voter_c = Address::generate(&env);
+    client.register_voter(&voter_a, &25, &make_identity(&env, 31));
+    client.register_voter(&voter_b, &16, &make_identity(&env, 32));
+    client.register_voter(&voter_c, &16, &make_identity(&env, 33));
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 5);
+    client.delegate(&voter_b, &voter_a);
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
+    let first = client.create_proposal(
+        &String::from_str(&env, "Checkpointed delegation"),
+        &String::from_str(&env, "Snapshot taken at start ledger"),
+        &20,
+    );
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 11);
+    client.delegate(&voter_b, &voter_c);
+
+    assert_eq!(
+        client.cast_vote(&first.id, &voter_a, &true, &36).votes_cast,
+        6
+    );
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
+    let second = client.create_proposal(
+        &String::from_str(&env, "Updated delegation"),
+        &String::from_str(&env, "New snapshot uses the new delegate"),
+        &30,
+    );
+    assert_eq!(
+        client.try_cast_vote(&second.id, &voter_a, &true, &36),
+        Err(Ok(Error::InsufficientVotingUnits))
+    );
+}
+
+#[test]
+fn abstain_counts_toward_quorum_without_counting_as_for() {
+    let (env, contract_id, admin_a, admin_b, _) = setup_multisig();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    let voter_for = Address::generate(&env);
+    let voter_abstain = Address::generate(&env);
+    client.register_voter(&voter_for, &9, &make_identity(&env, 41));
+    client.register_voter(&voter_abstain, &9, &make_identity(&env, 42));
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
+    let proposal = client.create_proposal(
+        &String::from_str(&env, "Abstain-assisted quorum"),
+        &String::from_str(&env, "For plus abstain meets quorum"),
+        &11,
+    );
+    client.cast_vote_with_support(&proposal.id, &voter_for, &VoteSupport::For, &1);
+    client.cast_vote_with_support(&proposal.id, &voter_abstain, &VoteSupport::Abstain, &1);
+
+    let tallies = client.get_proposal(&proposal.id);
+    assert_eq!(tallies.for_votes, 1);
+    assert_eq!(tallies.abstain_votes, 1);
+    assert_eq!(tallies.against_votes, 0);
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
+    let executed = client.execute_proposal(&proposal.id, &approvals(&env, &admin_a, &admin_b));
+    assert_eq!(executed.state, ProposalState::Executed);
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 20);
+    let abstain_only = client.create_proposal(
+        &String::from_str(&env, "Abstain-only proposal"),
+        &String::from_str(&env, "Quorum without a for majority"),
+        &21,
+    );
+    client.cast_vote_with_support(&abstain_only.id, &voter_for, &VoteSupport::Abstain, &1);
+    client.cast_vote_with_support(&abstain_only.id, &voter_abstain, &VoteSupport::Abstain, &1);
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 22);
+    assert_eq!(
+        client.try_execute_proposal(&abstain_only.id, &approvals(&env, &admin_a, &admin_b)),
+        Err(Ok(Error::ProposalNotPassed))
+    );
+}
+
+#[test]
+fn queued_proposal_executes_only_inside_grace_window() {
+    let (env, contract_id, admin_a, admin_b, _) = setup_multisig();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    client.set_grace_period(&5);
+    assert_eq!(client.get_grace_period(), 5);
+
+    let voter = Address::generate(&env);
+    client.register_voter(&voter, &9, &make_identity(&env, 51));
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
+    let proposal = client.create_proposal(
+        &String::from_str(&env, "Queued proposal"),
+        &String::from_str(&env, "Timelocked execution"),
+        &11,
+    );
+    client.cast_vote(&proposal.id, &voter, &true, &4);
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
+    let queued = client.queue_proposal(&proposal.id, &15);
+    assert_eq!(queued.state, ProposalState::Queued);
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 14);
+    assert_eq!(
+        client.try_execute_proposal(&proposal.id, &approvals(&env, &admin_a, &admin_b)),
+        Err(Ok(Error::QueueNotReady))
+    );
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 15);
+    let executed = client.execute_proposal(&proposal.id, &approvals(&env, &admin_a, &admin_b));
+    assert_eq!(executed.state, ProposalState::Executed);
+}
+
+#[test]
+fn expired_queued_proposal_is_rejected() {
+    let (env, contract_id, admin_a, admin_b, _) = setup_multisig();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    client.set_grace_period(&5);
+
+    let voter = Address::generate(&env);
+    client.register_voter(&voter, &9, &make_identity(&env, 61));
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
+    let proposal = client.create_proposal(
+        &String::from_str(&env, "Expiring proposal"),
+        &String::from_str(&env, "Grace period elapsed"),
+        &11,
+    );
+    client.cast_vote(&proposal.id, &voter, &true, &4);
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
+    client.queue_proposal(&proposal.id, &15);
+
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 21);
+    assert_eq!(
+        client.try_execute_proposal(&proposal.id, &approvals(&env, &admin_a, &admin_b)),
+        Err(Ok(Error::QueueExpired))
+    );
+    assert_eq!(
+        client.expire_proposal(&proposal.id).state,
+        ProposalState::Expired
+    );
+    assert_eq!(
+        client.try_execute_proposal(&proposal.id, &approvals(&env, &admin_a, &admin_b)),
+        Err(Ok(Error::ProposalClosed))
+    );
+}
+
+#[test]
+fn veto_guardian_can_veto_a_queued_proposal() {
+    let (env, contract_id, admin_a, admin_b, _) = setup_multisig();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    let guardian = Address::generate(&env);
+    client.set_veto_guardian(&guardian);
+    assert_eq!(client.get_veto_guardian(), guardian);
+
+    let voter = Address::generate(&env);
+    client.register_voter(&voter, &9, &make_identity(&env, 71));
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 10);
+    let proposal = client.create_proposal(
+        &String::from_str(&env, "Vetoed proposal"),
+        &String::from_str(&env, "Guardian intervention"),
+        &11,
+    );
+    client.cast_vote(&proposal.id, &voter, &true, &4);
+    env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
+    client.queue_proposal(&proposal.id, &15);
+
+    assert_eq!(
+        client.try_veto_proposal(&admin_a, &proposal.id),
+        Err(Ok(Error::NotVetoGuardian))
+    );
+    assert_eq!(
+        client.veto_proposal(&guardian, &proposal.id).state,
+        ProposalState::Vetoed
+    );
+    assert_eq!(
+        client.try_execute_proposal(&proposal.id, &approvals(&env, &admin_a, &admin_b)),
+        Err(Ok(Error::ProposalClosed))
+    );
+}
+
 #[test]
 fn execute_proposal_fails_when_quorum_met_but_majority_against() {
     let (env, contract_id, admin_a, admin_b, _) = setup_multisig();
