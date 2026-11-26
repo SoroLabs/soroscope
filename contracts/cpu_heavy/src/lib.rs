@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, Bytes, BytesN, Env, Vec};
 
 #[cfg(test)]
 mod test;
@@ -28,6 +28,8 @@ pub enum Error {
     CombinedInputTooLarge = 5,
     /// The declared footprint did not match the keys the host touched.
     FootprintMismatch = 6,
+    /// `iterations` exceeded [`MAX_ITERATIONS`].
+    IterationsTooLarge = 7,
 }
 
 // Hard caps. These sit below the point where a benchmark would exhaust the
@@ -51,6 +53,10 @@ pub const MAX_PRIME: u32 = 20_000;
 /// Largest `outer * inner` product accepted by
 /// [`CpuHeavyContract::nested_loop_burn`].
 pub const MAX_LOOP_OPS: u32 = 500_000;
+/// Largest iteration count accepted by the deterministic benchmark entry
+/// points. The guard runs before any work so an oversized request cannot burn
+/// the host budget.
+pub const MAX_ITERATIONS: u32 = 100_000;
 
 // Sub-caps for `combined_benchmark`, which pays for all three workloads in one
 // invocation and so has to stay well inside each individual cap.
@@ -66,82 +72,6 @@ pub struct CpuHeavyContract;
 
 #[contractimpl]
 impl CpuHeavyContract {
-    /// Compares the declared footprint against the keys the host actually
-    /// touched during local execution.
-    ///
-    /// Returns a [`FootprintDiff`] describing:
-    /// - `missing_reads`: keys the host read but were not declared read-only.
-    /// - `missing_writes`: keys the host wrote but were not declared read-write.
-    /// - `undeclared_but_touched`: keys touched that were not declared at all.
-    /// - `declared_but_untouched`: keys declared that the host never accessed.
-    ///
-    /// For RPC-only simulations, where the host trace is unavailable, the
-    /// declared set is returned and `touched_trace` is set to
-    /// `TouchedTrace::Unavailable` instead of pretending the declared set was
-    /// touched.
-    pub fn diff_footprint(
-        env: Env,
-        declared_read_only: Vec<LedgerKey>,
-        declared_read_write: Vec<LedgerKey>,
-    ) -> Result<FootprintDiff, Error> {
-        let touched = match env.host_trace() {
-            Some(trace) => trace,
-            None => {
-                return Ok(FootprintDiff {
-                    missing_reads: Vec::new(&env),
-                    missing_writes: Vec::new(&env),
-                    undeclared_but_touched: Vec::new(&env),
-                    declared_but_untouched: declared_read_only
-                        .iter()
-                        .chain(declared_read_write.iter())
-                        .collect(),
-                    touched_trace: TouchedTrace::Unavailable,
-                });
-            }
-        };
-
-        let mut missing_reads = Vec::new(&env);
-        let mut missing_writes = Vec::new(&env);
-        let mut undeclared_but_touched = Vec::new(&env);
-        let mut declared_but_untouched = Vec::new(&env);
-
-        for access in touched.iter() {
-            let declared = declared_read_only.contains(&access.key)
-                || declared_read_write.contains(&access.key);
-            if !declared {
-                undeclared_but_touched.push_back(access.key.clone());
-            }
-            match access.kind {
-                AccessKind::Read => {
-                    if !declared_read_only.contains(&access.key)
-                        && !declared_read_write.contains(&access.key)
-                    {
-                        missing_reads.push_back(access.key.clone());
-                    }
-                }
-                AccessKind::Write => {
-                    if !declared_read_write.contains(&access.key) {
-                        missing_writes.push_back(access.key.clone());
-                    }
-                }
-            }
-        }
-
-        for key in declared_read_only.iter().chain(declared_read_write.iter()) {
-            if !touched.iter().any(|a| a.key == key) {
-                declared_but_untouched.push_back(key.clone());
-            }
-        }
-
-        Ok(FootprintDiff {
-            missing_reads,
-            missing_writes,
-            undeclared_but_touched,
-            declared_but_untouched,
-            touched_trace: TouchedTrace::Available,
-        })
-    }
-
     /// Iterative Fibonacci, wrapping on `u64` overflow.
     ///
     /// Returns [`Error::FibonacciInputTooLarge`] if `n` exceeds [`MAX_FIB`].
@@ -264,82 +194,76 @@ impl CpuHeavyContract {
 
         Ok(results)
     }
+
+    /// Deterministic SHA-256 benchmark: hashes a fixed seed `iterations`
+    /// times, feeding each digest into the next round.
+    ///
+    /// Returns [`Error::IterationsTooLarge`] if `iterations` exceeds
+    /// [`MAX_ITERATIONS`], before doing any hashing.
+    pub fn bench_sha256_iterations(env: Env, iterations: u32) -> Result<BytesN<32>, Error> {
+        if iterations > MAX_ITERATIONS {
+            return Err(Error::IterationsTooLarge);
+        }
+
+        let mut digest = env.crypto().sha256(&Bytes::from_array(&env, b"soroscope"));
+        for _ in 0..iterations {
+            digest = env
+                .crypto()
+                .sha256(&Bytes::from_array(&env, &digest.to_array()));
+        }
+        Ok(digest.into())
+    }
+
+    /// Deterministic vector-sort benchmark: builds a descending list of
+    /// `iterations` elements and sorts it ascending with heapsort.
+    ///
+    /// Returns [`Error::IterationsTooLarge`] if `iterations` exceeds
+    /// [`MAX_ITERATIONS`], before allocating the list.
+    pub fn bench_vector_sort(env: Env, iterations: u32) -> Result<Vec<u32>, Error> {
+        if iterations > MAX_ITERATIONS {
+            return Err(Error::IterationsTooLarge);
+        }
+
+        let mut values = Vec::new(&env);
+        for i in (0..iterations).rev() {
+            values.push_back(i);
+        }
+
+        let n = values.len();
+        for start in (0..n / 2).rev() {
+            sift_down(&mut values, start, n);
+        }
+        for end in (1..n).rev() {
+            let head = values.get(0).unwrap();
+            let tail = values.get(end).unwrap();
+            values.set(0, tail);
+            values.set(end, head);
+            sift_down(&mut values, 0, end);
+        }
+
+        Ok(values)
+    }
 }
 
-/// A single ledger access recorded by the host during local execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LedgerAccess {
-    /// The ledger key that was accessed.
-    pub key: LedgerKey,
-    /// Whether the access was a read or a write.
-    pub kind: AccessKind,
-    /// The durability of the accessed entry.
-    pub durability: Durability,
-}
-
-/// The kind of ledger access performed by the host.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AccessKind {
-    /// The host read the entry.
-    Read,
-    /// The host wrote the entry.
-    Write,
-}
-
-/// The durability of a ledger entry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Durability {
-    /// A temporary entry.
-    Temporary,
-    /// A persistent entry.
-    Persistent,
-}
-
-/// A ledger key, covering contract data, contract instance, and contract code.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LedgerKey {
-    /// A `ContractData` entry.
-    ContractData {
-        /// The contract address.
-        contract: soroban_sdk::Address,
-        /// The storage key.
-        key: soroban_sdk::Val,
-        /// The durability of the entry.
-        durability: Durability,
-    },
-    /// A `ContractInstance` entry.
-    ContractInstance {
-        /// The contract address.
-        contract: soroban_sdk::Address,
-    },
-    /// A `ContractCode` entry.
-    ContractCode {
-        /// The hash of the contract code.
-        hash: soroban_sdk::BytesN<32>,
-    },
-}
-
-/// Whether the host trace was available for the diff.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TouchedTrace {
-    /// The host trace was available and used.
-    Available,
-    /// The host trace was unavailable (e.g. RPC-only simulation).
-    Unavailable,
-}
-
-/// The result of diffing the declared footprint against the keys the host
-/// actually touched.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FootprintDiff {
-    /// Keys the host read but were not declared read-only.
-    pub missing_reads: Vec<LedgerKey>,
-    /// Keys the host wrote but were not declared read-write.
-    pub missing_writes: Vec<LedgerKey>,
-    /// Keys touched that were not declared at all.
-    pub undeclared_but_touched: Vec<LedgerKey>,
-    /// Keys declared that the host never accessed.
-    pub declared_but_untouched: Vec<LedgerKey>,
-    /// Whether the host trace was available.
-    pub touched_trace: TouchedTrace,
+/// Restores the heap property for `root` within `0..size`.
+fn sift_down(values: &mut Vec<u32>, mut root: u32, size: u32) {
+    loop {
+        let left = root * 2 + 1;
+        if left >= size {
+            return;
+        }
+        let mut largest = left;
+        let right = left + 1;
+        if right < size && values.get(right).unwrap() > values.get(left).unwrap() {
+            largest = right;
+        }
+        if values.get(root).unwrap() >= values.get(largest).unwrap() {
+            return;
+        }
+        let parent = values.get(root).unwrap();
+        let child = values.get(largest).unwrap();
+        values.set(root, child);
+        values.set(largest, parent);
+        root = largest;
+    }
 }
