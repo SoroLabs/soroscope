@@ -8,4 +8,5 @@ mod storage_types;
 #[cfg(test)]
 mod test;
 
-pub use crate::contract::{TimelockEscrow, TimelockEscrowClient};
+pub use crate::contract::{TimelockEscrow, TimelockEscrowClient, MIN_LOCK_LEDGERS};
+pub use crate::storage_types::Error;

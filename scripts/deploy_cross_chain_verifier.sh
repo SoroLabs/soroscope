@@ -19,9 +19,10 @@ Options:
   --network <name>                    Stellar network alias. Defaults to STELLAR_NETWORK or testnet.
   --rpc-url <url>                     RPC URL, useful when not using a configured network alias.
   --network-passphrase <value>        Network passphrase for --rpc-url deployments.
+  --cli <binary>                      Stellar CLI binary. Defaults to STELLAR_CLI, then stellar or soroban.
   --wasm <path>                       WASM path. Defaults to target/wasm32v1-none/release/cross_chain_verifier.wasm.
   --no-build                          Skip cargo build and deploy the existing WASM.
-  --dry-run                           Print the commands that would run.
+  --dry-run                           Print the commands that would run; no funded keys or CLI required.
   -h, --help                          Show this help.
 
 Environment:
@@ -29,6 +30,7 @@ Environment:
   STELLAR_NETWORK                     Default --network.
   STELLAR_RPC_URL                     Default --rpc-url.
   STELLAR_NETWORK_PASSPHRASE          Default --network-passphrase.
+  STELLAR_CLI                         Default --cli.
 USAGE
 }
 
@@ -95,6 +97,8 @@ SOURCE_ACCOUNT="${STELLAR_SOURCE_ACCOUNT:-}"
 NETWORK="${STELLAR_NETWORK:-testnet}"
 RPC_URL="${STELLAR_RPC_URL:-}"
 NETWORK_PASSPHRASE="${STELLAR_NETWORK_PASSPHRASE:-}"
+CLI="${STELLAR_CLI:-}"
+CLI_MISSING=0
 WASM="$REPO_ROOT/target/wasm32v1-none/release/cross_chain_verifier.wasm"
 BUILD=1
 DRY_RUN=0
@@ -104,35 +108,48 @@ ROOT_VALIDATOR_KEYS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --source-account|--source)
-      SOURCE_ACCOUNT="${2:-}"
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      SOURCE_ACCOUNT="$2"
       shift 2
       ;;
     --root-validator-key|--validator-key)
-      append_validator_keys "${2:-}"
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      append_validator_keys "$2"
       shift 2
       ;;
     --root-validator-keys-file|--validator-keys-file)
-      load_validator_keys_file "${2:-}"
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      load_validator_keys_file "$2"
       shift 2
       ;;
     --admin)
-      ADMIN="${2:-}"
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      ADMIN="$2"
       shift 2
       ;;
     --network)
-      NETWORK="${2:-}"
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      NETWORK="$2"
       shift 2
       ;;
     --rpc-url)
-      RPC_URL="${2:-}"
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      RPC_URL="$2"
       shift 2
       ;;
     --network-passphrase)
-      NETWORK_PASSPHRASE="${2:-}"
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      NETWORK_PASSPHRASE="$2"
+      shift 2
+      ;;
+    --cli)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      CLI="$2"
       shift 2
       ;;
     --wasm)
-      WASM="${2:-}"
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      WASM="$2"
       shift 2
       ;;
     --no-build)
@@ -153,8 +170,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$SOURCE_ACCOUNT" ]] || die "--source-account is required"
-[[ ${#ROOT_VALIDATOR_KEYS[@]} -gt 0 || -n "$ADMIN" ]] || die "provide --root-validator-key, --root-validator-keys-file, or --admin"
+if [[ ${#ROOT_VALIDATOR_KEYS[@]} -eq 0 && -z "$ADMIN" ]]; then
+  if [[ "$DRY_RUN" == "1" ]]; then
+    ADMIN="<admin-address>"
+  else
+    die "provide --root-validator-key, --root-validator-keys-file, or --admin"
+  fi
+fi
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  [[ -n "$SOURCE_ACCOUNT" ]] || SOURCE_ACCOUNT="<source-account>"
+else
+  [[ -n "$SOURCE_ACCOUNT" ]] || die "--source-account (or STELLAR_SOURCE_ACCOUNT) is required"
+fi
 
 if [[ -z "$ADMIN" ]]; then
   ADMIN="${ROOT_VALIDATOR_KEYS[0]}"
@@ -175,8 +203,20 @@ if [[ -n "$NETWORK_PASSPHRASE" ]]; then
   NETWORK_ARGS+=(--network-passphrase "$NETWORK_PASSPHRASE")
 fi
 
+if [[ -z "$CLI" ]]; then
+  if command -v stellar >/dev/null 2>&1; then
+    CLI="stellar"
+  elif command -v soroban >/dev/null 2>&1; then
+    CLI="soroban"
+  else
+    CLI="stellar"
+    CLI_MISSING=1
+  fi
+fi
+
 if [[ "$DRY_RUN" != "1" ]]; then
-  require_command stellar
+  [[ "$CLI_MISSING" != "1" ]] || die "neither 'stellar' nor 'soroban' CLI was found; install one or set STELLAR_CLI"
+  require_command "$CLI"
 fi
 
 if [[ "$BUILD" == "1" ]]; then
@@ -191,10 +231,10 @@ if [[ "$DRY_RUN" != "1" && ! -f "$WASM" ]]; then
 fi
 
 echo "Deploying cross-chain verifier..."
-CONTRACT_ID="$(capture_cmd stellar contract deploy --wasm "$WASM" --source-account "$SOURCE_ACCOUNT" "${NETWORK_ARGS[@]}")"
+CONTRACT_ID="$(capture_cmd "$CLI" contract deploy --wasm "$WASM" --source-account "$SOURCE_ACCOUNT" "${NETWORK_ARGS[@]}")"
 
 echo "Initializing verifier with admin: $ADMIN"
-run_cmd stellar contract invoke --id "$CONTRACT_ID" --source-account "$SOURCE_ACCOUNT" "${NETWORK_ARGS[@]}" -- initialize --admin "$ADMIN"
+run_cmd "$CLI" contract invoke --id "$CONTRACT_ID" --source-account "$SOURCE_ACCOUNT" "${NETWORK_ARGS[@]}" -- initialize --admin "$ADMIN"
 
 echo "Cross-chain verifier deployed and initialized."
 echo "Contract ID: $CONTRACT_ID"

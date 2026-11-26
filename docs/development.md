@@ -7,7 +7,7 @@ This guide covers setting up your environment and the development standards we f
 ### Prerequisites
 - **Rust** (latest stable)
 - **Node.js** (>= 18)
-- **Soroban CLI**
+- **Stellar CLI** (`stellar-cli`, the successor to the deprecated `soroban` CLI)
 
 ### Monorepo Setup
 1.  **Fork** the repository and clone it locally.
@@ -24,6 +24,15 @@ This guide covers setting up your environment and the development standards we f
     ```bash
     cargo build --target wasm32-unknown-unknown --release
     ```
+    You can also build and deploy contracts with the Stellar CLI:
+    ```bash
+    stellar contract build
+    stellar contract deploy \
+      --wasm target/wasm32-unknown-unknown/release/<contract_name>.wasm \
+      --source <identity> \
+      --network testnet
+    ```
+    > **Backwards compatibility:** The legacy `soroban contract build` and `soroban contract deploy` commands still work in older `soroban-cli` installations, but they are deprecated. Prefer the `stellar contract ...` equivalents above.
 
 ## 🛠️ Development Standards
 
@@ -38,7 +47,7 @@ This guide covers setting up your environment and the development standards we f
 - **Testing**: Run `npm test` within the `/web` directory to run unit tests.
 - **Components**: Keep components modular and placed in `/web/components`.
 - **Error Handling**: Standardized Soroban error codes (1..17 and domain codes 100+) are automatically decoded from raw `HostError` strings into human-readable user messages via `web/lib/errorHandling.ts` and displayed in invocation toasts.
-- **State Persistence**: See [Frontend Persistence](./FRONTEND_PERSISTENCE.md) for details on how analysis results are persisted across page refreshes.
+- **State Persistence**: See [Frontend Persistence](../web/FRONTEND_PERSISTENCE.md) for details on how analysis results are persisted across page refreshes.
 
 ### Contracts
 - Use **Soroban SDK v22.0.0** or higher.

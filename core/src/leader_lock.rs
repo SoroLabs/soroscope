@@ -19,6 +19,12 @@
 //! 4. **Mutual exclusion guarantee** — because both renewal and release are
 //!    Lua scripts executed atomically on Redis, there is no TOCTOU window
 //!    between checking the token and modifying the key.
+//! 5. **Fencing (Issue #1497)** — every leadership transition bumps a
+//!    monotonically increasing `fencing_token`.  The lease value stored in
+//!    Redis encodes both the `owner_id` and the `fencing_token`, so a paused
+//!    former leader whose lease was taken over cannot renew or release the new
+//!    leader's lock: both operations verify the full lease value and return
+//!    [`LockError::LeaseLost`] otherwise, without touching the key.
 //!
 //! ## Usage
 //!
@@ -30,7 +36,7 @@
 //! ));
 //!
 //! // Try to become leader (call periodically, e.g. every ttl/2).
-//! if lock.try_acquire_or_renew().await {
+//! if lock.try_acquire_or_renew().await.is_ok() {
 //!     run_leader_only_work().await;
 //! }
 //!
@@ -43,15 +49,43 @@
 //! ```
 
 use redis::{AsyncCommands, Client as RedisClient, ExistenceCheck, SetExpiry, SetOptions};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use uuid::Uuid;
 
+// ── Errors ────────────────────────────────────────────────────────────────────
+
+/// Errors returned by [`RedisLeaderLock`] operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockError {
+    /// The lease is no longer held by this instance: either it expired and was
+    /// taken over by another node, or the stored `owner_id` / `fencing_token`
+    /// no longer match ours.  The key was **not** modified.
+    LeaseLost,
+    /// The operation could not be completed because Redis was unreachable.
+    Backend(String),
+}
+
+impl fmt::Display for LockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LockError::LeaseLost => write!(f, "leader lock: lease lost to another node"),
+            LockError::Backend(msg) => write!(f, "leader lock: backend error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for LockError {}
+
 // ── Lua scripts ───────────────────────────────────────────────────────────────
 
-/// Renew TTL only when the stored token matches ours.
+/// Renew TTL only when the stored lease value matches ours exactly.
+///
+/// `ARGV[1]` is the full lease value (`owner_id:fencing_token`), so a stale
+/// leader whose lease was taken over by a newer fencing token cannot extend it.
 const RENEW_SCRIPT: &str = r#"
 if redis.call("GET", KEYS[1]) == ARGV[1] then
     return redis.call("PEXPIRE", KEYS[1], ARGV[2])
@@ -60,7 +94,7 @@ else
 end
 "#;
 
-/// Delete the key only when the stored token matches ours.
+/// Delete the key only when the stored lease value matches ours exactly.
 const RELEASE_SCRIPT: &str = r#"
 if redis.call("GET", KEYS[1]) == ARGV[1] then
     return redis.call("DEL", KEYS[1])
@@ -68,6 +102,11 @@ else
     return 0
 end
 "#;
+
+/// Encode the lease value stored in Redis: `<owner_id>:<fencing_token>`.
+fn lease_value(owner_id: &str, fencing_token: u64) -> String {
+    format!("{owner_id}:{fencing_token}")
+}
 
 // ── RedisLeaderLock ───────────────────────────────────────────────────────────
 
@@ -83,8 +122,11 @@ pub struct RedisLeaderLock {
 struct LockInner {
     redis: RedisClient,
     key: String,
-    /// Per-instance unique token stored in Redis to distinguish lease owners.
-    token: String,
+    /// Stable per-instance identity used to distinguish lease owners.
+    owner_id: String,
+    /// Monotonically increasing fencing token, bumped on every leadership
+    /// transition.  Guards against stale-lease takeover (Issue #1497).
+    fencing_token: std::sync::atomic::AtomicU64,
     /// Lease duration in milliseconds.
     ttl_ms: u64,
     /// Local monotonic deadline after which the lease is considered expired
@@ -105,7 +147,8 @@ impl RedisLeaderLock {
             inner: Arc::new(LockInner {
                 redis,
                 key: key.into(),
-                token: Uuid::new_v4().to_string(),
+                owner_id: Uuid::new_v4().to_string(),
+                fencing_token: std::sync::atomic::AtomicU64::new(0),
                 ttl_ms,
                 lease_deadline: std::sync::Mutex::new(None),
             }),
@@ -116,10 +159,14 @@ impl RedisLeaderLock {
 
     /// Attempt to become (or remain) leader.
     ///
-    /// Returns `true` if this instance holds the lease after the call,
-    /// `false` if another instance holds it or Redis is unreachable (callers
-    /// should treat an `false` return as non-leader and skip leader-only work).
-    pub async fn try_acquire_or_renew(&self) -> bool {
+    /// Returns `Ok(())` if this instance holds the lease after the call.
+    /// Returns `Err(LockError::LeaseLost)` if another instance holds the lease
+    /// (callers should treat this as non-leader and skip leader-only work), and
+    /// `Err(LockError::Backend)` if Redis is unreachable.
+    ///
+    /// Renewal and acquisition are each a single atomic Redis operation
+    /// (Lua compare-and-expire / `SET NX`), so there is no TOCTOU window.
+    pub async fn try_acquire_or_renew(&self) -> Result<(), LockError> {
         let inner = &self.inner;
 
         // Check whether our local deadline has already passed.
@@ -137,49 +184,93 @@ impl RedisLeaderLock {
                 .expect("leader lock deadline mutex poisoned") = None;
         }
 
-        let mut conn = match inner.redis.get_multiplexed_async_connection().await {
-            Ok(c) => c,
-            Err(e) => {
+        let mut conn = inner
+            .redis
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| {
                 tracing::warn!(error = %e, "leader lock: failed to connect to Redis");
-                return false;
-            }
-        };
+                LockError::Backend(e.to_string())
+            })?;
 
         // Try to renew first (cheaper — avoids a full round-trip SET).
-        let renewed: i64 = if expired {
-            0
-        } else {
-            redis::Script::new(RENEW_SCRIPT)
+        if !expired {
+            let current = inner.current_lease_value();
+            let renewed: i64 = redis::Script::new(RENEW_SCRIPT)
                 .key(&inner.key)
-                .arg(&inner.token)
+                .arg(&current)
                 .arg(inner.ttl_ms)
                 .invoke_async(&mut conn)
                 .await
-                .unwrap_or(0)
-        };
+                .unwrap_or(0);
 
-        if renewed == 1 {
-            inner.update_lease_deadline();
-            return true;
+            if renewed == 1 {
+                inner.update_lease_deadline();
+                return Ok(());
+            }
         }
 
         // Fresh acquisition attempt — fails atomically if another instance
-        // already holds the key (NX semantics).
+        // already holds the key (NX semantics).  Bump the fencing token so
+        // every leadership transition is strictly increasing.
+        let new_token = inner.next_fencing_token();
+        let value = lease_value(&inner.owner_id, new_token);
+
         let opts = SetOptions::default()
             .conditional_set(ExistenceCheck::NX)
             .with_expiration(SetExpiry::PX(inner.ttl_ms as usize));
 
         let acquired = conn
-            .set_options::<_, _, bool>(&inner.key, inner.token.as_str(), opts)
+            .set_options::<_, _, bool>(&inner.key, value.as_str(), opts)
             .await
             .unwrap_or(false);
 
         if acquired {
             inner.update_lease_deadline();
-            tracing::info!(key = %inner.key, "leader lock: acquired");
+            tracing::info!(
+                key = %inner.key,
+                fencing_token = new_token,
+                "leader lock: acquired"
+            );
+            Ok(())
+        } else {
+            Err(LockError::LeaseLost)
         }
+    }
 
-        acquired
+    /// Renew the lease, verifying that we still own it.
+    ///
+    /// Returns `Err(LockError::LeaseLost)` — without touching the key — if the
+    /// lease expired and was taken over by another node (different `owner_id`
+    /// or `fencing_token`).
+    pub async fn renew(&self) -> Result<(), LockError> {
+        let inner = &self.inner;
+        let mut conn = inner
+            .redis
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| LockError::Backend(e.to_string()))?;
+
+        let current = inner.current_lease_value();
+        let renewed: i64 = redis::Script::new(RENEW_SCRIPT)
+            .key(&inner.key)
+            .arg(&current)
+            .arg(inner.ttl_ms)
+            .invoke_async(&mut conn)
+            .await
+            .unwrap_or(0);
+
+        if renewed == 1 {
+            inner.update_lease_deadline();
+            Ok(())
+        } else {
+            // Lease was taken over (or expired); drop local validity.
+            *inner
+                .lease_deadline
+                .lock()
+                .expect("leader lock deadline mutex poisoned") = None;
+            Err(LockError::LeaseLost)
+        }
     }
 
     // ── Background keepalive ──────────────────────────────────────────────────
@@ -216,9 +307,10 @@ impl RedisLeaderLock {
                     }
                 };
 
+                let current = inner.current_lease_value();
                 let renewed: i64 = redis::Script::new(RENEW_SCRIPT)
                     .key(&inner.key)
-                    .arg(&inner.token)
+                    .arg(&current)
                     .arg(inner.ttl_ms)
                     .invoke_async(&mut conn)
                     .await
@@ -247,10 +339,15 @@ impl RedisLeaderLock {
 
     /// Release the lease immediately if still held by this instance.
     ///
+    /// The compare-and-delete Lua script verifies the full lease value
+    /// (`owner_id:fencing_token`), so a stale leader whose lease was taken over
+    /// by another node **cannot** delete the new leader's lock; in that case
+    /// `Err(LockError::LeaseLost)` is returned and the key is left untouched.
+    ///
     /// Best-effort — if Redis is unreachable the key simply expires after
     /// `ttl`.  Always call this during graceful shutdown **after** aborting the
     /// keepalive handle, so a restarted instance can elect a new leader quickly.
-    pub async fn release(&self) {
+    pub async fn release(&self) -> Result<(), LockError> {
         let inner = &self.inner;
 
         // Clear local deadline immediately so no further work is scheduled.
@@ -259,22 +356,29 @@ impl RedisLeaderLock {
             .lock()
             .expect("leader lock deadline mutex poisoned") = None;
 
-        let Ok(mut conn) = inner.redis.get_multiplexed_async_connection().await else {
-            tracing::warn!(key = %inner.key, "leader lock: release failed (Redis unreachable); TTL expiry will clean up");
-            return;
-        };
+        let mut conn = inner
+            .redis
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| {
+                tracing::warn!(key = %inner.key, "leader lock: release failed (Redis unreachable); TTL expiry will clean up");
+                LockError::Backend(e.to_string())
+            })?;
 
+        let current = inner.current_lease_value();
         let deleted: i64 = redis::Script::new(RELEASE_SCRIPT)
             .key(&inner.key)
-            .arg(&inner.token)
+            .arg(&current)
             .invoke_async(&mut conn)
             .await
             .unwrap_or(0);
 
         if deleted == 1 {
             tracing::info!(key = %inner.key, "leader lock: released");
+            Ok(())
         } else {
-            tracing::debug!(key = %inner.key, "leader lock: release skipped (not held or already expired)");
+            tracing::debug!(key = %inner.key, "leader lock: release skipped (lease lost or already expired)");
+            Err(LockError::LeaseLost)
         }
     }
 
@@ -299,9 +403,21 @@ impl RedisLeaderLock {
             .expect("leader lock deadline mutex poisoned")
     }
 
-    /// Return a reference to the unique per-instance token.
-    pub fn token(&self) -> &str {
-        &self.inner.token
+    /// Return the stable per-instance owner identity.
+    pub fn owner_id(&self) -> &str {
+        &self.inner.owner_id
+    }
+
+    /// Return the current fencing token (0 before the first acquisition).
+    pub fn fencing_token(&self) -> u64 {
+        self.inner
+            .fencing_token
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Return the lease value this instance would write to Redis.
+    pub fn lease_value(&self) -> String {
+        self.inner.current_lease_value()
     }
 
     /// Return the configured TTL in milliseconds.
@@ -319,6 +435,21 @@ impl LockInner {
             .lock()
             .expect("leader lock deadline mutex poisoned") =
             Some(Instant::now() + Duration::from_millis(self.ttl_ms));
+    }
+
+    /// The lease value currently associated with this instance.
+    fn current_lease_value(&self) -> String {
+        lease_value(
+            &self.owner_id,
+            self.fencing_token.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// Atomically bump the fencing token and return the new value.
+    fn next_fencing_token(&self) -> u64 {
+        self.fencing_token
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
     }
 }
 
@@ -346,11 +477,74 @@ mod tests {
     }
 
     #[test]
-    fn token_is_non_empty_and_unique() {
+    fn owner_id_is_non_empty_and_unique() {
         let a = make_lock(Duration::from_secs(5));
         let b = make_lock(Duration::from_secs(5));
-        assert!(!a.token().is_empty());
-        assert_ne!(a.token(), b.token(), "each lock instance must have a distinct token");
+        assert!(!a.owner_id().is_empty());
+        assert_ne!(a.owner_id(), b.owner_id(), "each lock instance must have a distinct owner id");
+    }
+
+    #[test]
+    fn fencing_token_starts_at_zero_and_increases() {
+        let lock = make_lock(Duration::from_secs(5));
+        assert_eq!(lock.fencing_token(), 0);
+        assert_eq!(lock.inner.next_fencing_token(), 1);
+        assert_eq!(lock.inner.next_fencing_token(), 2);
+        assert_eq!(lock.fencing_token(), 2);
+    }
+
+    #[test]
+    fn lease_value_encodes_owner_and_fencing_token() {
+        let lock = make_lock(Duration::from_secs(5));
+        lock.inner.next_fencing_token();
+        assert_eq!(lock.lease_value(), format!("{}:1", lock.owner_id()));
+    }
+
+    // ── Stale-lease takeover (Issue #1497) ───────────────────────────────────
+
+    /// Simulate: Node A acquires, its lease expires, Node B takes over with a
+    /// higher fencing token, then Node A's late release/renew must be rejected
+    /// without touching Node B's lock.
+    #[test]
+    fn stale_leader_cannot_release_or_renew_after_takeover() {
+        let node_a = make_lock(Duration::from_secs(5));
+        let node_b = make_lock(Duration::from_secs(5));
+
+        // Node A acquires leadership (fencing token 1).
+        let a_token = node_a.inner.next_fencing_token();
+        let a_value = lease_value(node_a.owner_id(), a_token);
+        assert_eq!(a_token, 1);
+
+        // Node A pauses; its lease expires and Node B takes over with a
+        // strictly greater fencing token.
+        let b_token = node_b.inner.next_fencing_token();
+        let b_value = lease_value(node_b.owner_id(), b_token);
+        assert!(b_token > a_token, "fencing tokens must strictly increase on transition");
+
+        // The stored lease is now Node B's.
+        let stored = b_value.clone();
+
+        // Node A's late release: compare-and-delete sees a mismatch and must
+        // not delete the key.
+        let a_release_matches = stored == a_value;
+        assert!(!a_release_matches, "stale release must not match the new lease");
+        assert_eq!(stored, b_value, "Node B's lock must remain untouched");
+
+        // Node A's late renew: compare-and-expire sees a mismatch and must not
+        // extend the key.
+        let a_renew_matches = stored == a_value;
+        assert!(!a_renew_matches, "stale renew must not match the new lease");
+        assert_eq!(stored, b_value, "Node B's lock must remain untouched");
+
+        // Node B can still renew/release its own lease.
+        assert_eq!(stored, lease_value(node_b.owner_id(), node_b.fencing_token()));
+    }
+
+    #[test]
+    fn lease_lost_error_is_reported() {
+        let err = LockError::LeaseLost;
+        assert_eq!(err, LockError::LeaseLost);
+        assert!(err.to_string().contains("lease lost"));
     }
 
     #[test]
@@ -417,17 +611,17 @@ mod tests {
     // ── Mutual-exclusion simulation (single process, two lock objects) ────────
 
     #[test]
-    fn two_locks_have_different_tokens() {
+    fn two_locks_have_different_owner_ids() {
         // If two instances try to acquire the same key, the one that arrives
-        // second will receive a different token and the NX SET will fail.
-        // We verify the token uniqueness invariant here; the full Redis
+        // second will receive a different owner id and the NX SET will fail.
+        // We verify the owner uniqueness invariant here; the full Redis
         // integration test is in core/tests/leader_lock_integration.rs.
         let lock_a = make_lock(Duration::from_secs(10));
         let lock_b = make_lock(Duration::from_secs(10));
         assert_ne!(
-            lock_a.token(),
-            lock_b.token(),
-            "distinct instances must carry distinct tokens to enforce mutual exclusion"
+            lock_a.owner_id(),
+            lock_b.owner_id(),
+            "distinct instances must carry distinct owner ids to enforce mutual exclusion"
         );
     }
 

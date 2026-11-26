@@ -121,3 +121,32 @@ test('does not link when the network has no public explorer', () => {
   assert.equal(link.tag, 'span');
   assert.equal(link.href, null);
 });
+
+// ── Copy-to-clipboard (Issue #1151) ─────────────────────────────────────────
+// The component's copy button delegates to lib/copyFeedback.js
+// (writeTextToClipboard) and shows a "✓ Copied!" Toast for 2 s.
+const { writeTextToClipboard, createCopyFeedback } = require('../lib/copyFeedback');
+
+test('copy button writes the full contract address to the clipboard', async () => {
+  let written = null;
+  const clipboard = { writeText: async (text) => { written = text; } };
+  const result = await writeTextToClipboard(CONTRACT_ID, { clipboard });
+  assert.equal(result, CONTRACT_ID);
+  assert.equal(written, CONTRACT_ID);
+});
+
+test('copy feedback shows "Copied!" for 2 s then resets', () => {
+  let now = 0;
+  const timers = [];
+  const feedback = createCopyFeedback({
+    timeout: 2000,
+    setTimeoutFn: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    clearTimeoutFn: () => {},
+  });
+  feedback.succeed();
+  assert.equal(feedback.isCopied, true);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 2000);
+  timers[0].fn();
+  assert.equal(feedback.isIdle, true);
+});

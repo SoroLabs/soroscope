@@ -102,22 +102,140 @@ function flattenGraph(graph) {
 }
 
 /**
- * Assign positions using a simple layered layout: depth drives the column,
- * order within a depth drives the row. Deterministic, so re-renders do not
- * shuffle the diagram.
+ * Assign positions using an improved layered layout that prevents the edge
+ * overlap and centre-clustering problems seen with >20 nodes (issue #1299).
+ *
+ * The algorithm:
+ * 1. Build a parent → children map so we know the subtree structure.
+ * 2. Walk the tree post-order to compute each node's "subtree height" — the
+ *    vertical space its descendants occupy.
+ * 3. Assign Y positions top-down: each child is placed relative to its
+ *    parent's centre, offset so siblings stack without overlap.
+ * 4. Levels are centred vertically against the tallest column.
+ *
+ * The result is deterministic (re-renders don't shuffle nodes) and keeps
+ * edges from crossing through unrelated subtrees.
  */
 function layoutNodes(flat) {
-  const rowsAtDepth = new Map();
+  if (flat.length === 0) return [];
 
+  // ── Tuning constants ───────────────────────────────────────────────────
+  // For large graphs (>20 nodes) we increase spacing so nodes don't crowd.
+  const isLarge = flat.length > 20;
+  const levelWidth = isLarge ? Math.round(LEVEL_WIDTH * 1.15) : LEVEL_WIDTH;
+  const rowHeight = isLarge ? Math.round(ROW_HEIGHT * 1.2) : ROW_HEIGHT;
+  // Vertical gap between sibling subtrees.
+  const siblingGap = isLarge ? 20 : 8;
+
+  // ── Build adjacency maps ──────────────────────────────────────────────
+  const childrenOf = new Map(); // parentId -> array of flat entries
+  const byId = new Map();       // id -> flat entry
+
+  for (const entry of flat) {
+    byId.set(entry.id, entry);
+    const parentKey = entry.parentId ?? '__root__';
+    if (!childrenOf.has(parentKey)) childrenOf.set(parentKey, []);
+    childrenOf.get(parentKey).push(entry);
+  }
+
+  // ── Post-order: compute subtree height for each node ───────────────────
+  // subtreeHeight = max(rowHeight, sum of children heights + gaps)
+  const subtreeHeights = new Map();
+
+  function computeSubtreeHeight(id) {
+    if (subtreeHeights.has(id)) return subtreeHeights.get(id);
+    const children = childrenOf.get(id) || [];
+    let h;
+    if (children.length === 0) {
+      h = rowHeight;
+    } else {
+      h = children.reduce((sum, child, i) => {
+        const childH = computeSubtreeHeight(child.id);
+        return sum + childH + (i > 0 ? siblingGap : 0);
+      }, 0);
+      // Ensure a parent is at least as tall as a single row.
+      h = Math.max(h, rowHeight);
+    }
+    subtreeHeights.set(id, h);
+    return h;
+  }
+
+  // Compute heights starting from root(s).
+  const roots = childrenOf.get('__root__') || [];
+  for (const root of roots) computeSubtreeHeight(root.id);
+
+  // ── Top-down: assign Y positions ───────────────────────────────────────
+  // Each parent is centred vertically within its subtree. Children are laid
+  // out top-to-bottom within the parent's allocated space.
+  const positions = new Map();
+
+  function assignPositions(id, topY) {
+    const height = subtreeHeights.get(id) || rowHeight;
+    const entry = byId.get(id);
+    const children = childrenOf.get(id) || [];
+
+    // Centre this node within its subtree height.
+    const centerY = topY + height / 2 - rowHeight / 2;
+
+    positions.set(id, { y: centerY });
+
+    // Lay out children top-to-bottom, each within its own subtree height.
+    let childY = topY;
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i];
+      const childH = subtreeHeights.get(child.id) || rowHeight;
+      assignPositions(child.id, childY);
+      childY += childH + siblingGap;
+    }
+  }
+
+  for (const root of roots) assignPositions(root.id, 0);
+
+  // ── Centre each depth level vertically ─────────────────────────────────
+  // Group by depth, find the max Y range per level, then shift so each level
+  // is centred against the tallest level.
+  const byDepth = new Map();
+  let maxDepth = 0;
+  for (const entry of flat) {
+    if (!byDepth.has(entry.depth)) byDepth.set(entry.depth, []);
+    byDepth.get(entry.depth).push(entry);
+    if (entry.depth > maxDepth) maxDepth = entry.depth;
+  }
+
+  // Compute the vertical span of each depth level.
+  const depthSpans = new Map();
+  for (const [depth, entries] of byDepth) {
+    let minTop = Infinity;
+    let maxBottom = -Infinity;
+    for (const entry of entries) {
+      const y = positions.get(entry.id)?.y ?? 0;
+      minTop = Math.min(minTop, y);
+      maxBottom = Math.max(maxBottom, y + rowHeight);
+    }
+    depthSpans.set(depth, { minTop, maxBottom, height: maxBottom - minTop });
+  }
+
+  // Find the tallest level so we can centre everything against it.
+  let maxLevelHeight = 0;
+  for (const span of depthSpans.values()) {
+    if (span.height > maxLevelHeight) maxLevelHeight = span.height;
+  }
+
+  // Shift each level so it is centred.
+  const depthOffsets = new Map();
+  for (const [depth, span] of depthSpans) {
+    depthOffsets.set(depth, (maxLevelHeight - span.height) / 2 - span.minTop);
+  }
+
+  // ── Build the final positioned array ───────────────────────────────────
   return flat.map((entry) => {
-    const row = rowsAtDepth.get(entry.depth) || 0;
-    rowsAtDepth.set(entry.depth, row + 1);
-
+    const pos = positions.get(entry.id) || { y: 0 };
+    const offset = depthOffsets.get(entry.depth) || 0;
     return {
       ...entry,
       position: {
-        x: entry.depth * LEVEL_WIDTH,
-        y: row * ROW_HEIGHT,
+        x: entry.depth * levelWidth,
+        y: pos.y + offset,
       },
     };
   });
@@ -133,7 +251,12 @@ function layoutNodes(flat) {
  * @returns {{nodes: Array, edges: Array}}
  */
 function buildFlowElements(graph) {
-  const positioned = layoutNodes(flattenGraph(graph));
+  const flat = flattenGraph(graph);
+  const positioned = layoutNodes(flat);
+
+  // Use smoothstep edges for large graphs (>20 nodes) so edges curve around
+  // intermediate nodes rather than drawing straight lines that overlap (issue #1299).
+  const edgeType = flat.length > 20 ? 'smoothstep' : 'default';
 
   const nodes = positioned.map((entry) => ({
     id: entry.id,
@@ -162,6 +285,7 @@ function buildFlowElements(graph) {
         id: `${entry.parentId}->${entry.id}`,
         source: entry.parentId,
         target: entry.id,
+        type: edgeType,
         animated: band === 'high',
         // A readable gas figure doubles as the edge label.
         label: entry.gas === null ? undefined : formatGas(entry.gas),

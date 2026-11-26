@@ -39,11 +39,6 @@ pub fn write_total_supply(e: &Env, amount: i128) {
     e.storage().instance().set(&key, &amount);
 }
 
-pub fn has_max_supply(e: &Env) -> bool {
-    let key = DataKey::MaxSupply;
-    e.storage().instance().has(&key)
-}
-
 pub fn read_max_supply(e: &Env) -> i128 {
     let key = DataKey::MaxSupply;
     e.storage().instance().get(&key).unwrap()

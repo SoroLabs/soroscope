@@ -246,3 +246,62 @@ fn test_nft_is_escrowed_on_initialize() {
     assert_eq!(fx.nft().balance(&fx.seller), 0);
     assert_eq!(fx.nft().balance(&fx.auction_id), 1);
 }
+
+#[test]
+fn test_reserve_not_met_cancels_auction_and_refunds_bidder() {
+    let fx = setup(200);
+
+    // Bidder 1 bids 150, which is below the reserve price of 200.
+    fx.auction().bid(&fx.bidder1, &150);
+    assert_eq!(fx.auction().get_highest_bid(), 150);
+    assert_eq!(fx.payment().balance(&fx.bidder1), 850);
+    assert_eq!(fx.payment().balance(&fx.auction_id), 150);
+
+    // Advance ledger to the auction end.
+    set_ledger(&fx.env, 200, 10_000);
+    fx.auction().end_auction();
+
+    // Since reserve was not met, bidder1 is refunded and NFT is returned to seller.
+    assert_eq!(fx.payment().balance(&fx.bidder1), 1_000);
+    assert_eq!(fx.payment().balance(&fx.auction_id), 0);
+    assert_eq!(fx.payment().balance(&fx.seller), 0);
+    assert_eq!(fx.nft().balance(&fx.seller), 1);
+    assert_eq!(fx.nft().balance(&fx.bidder1), 0);
+    assert_eq!(fx.nft().balance(&fx.auction_id), 0);
+}
+
+#[test]
+fn test_reserve_not_met_with_no_bids_returns_nft_to_seller() {
+    let fx = setup(200);
+
+    // No bids placed. Advance ledger to the auction end.
+    set_ledger(&fx.env, 200, 10_000);
+    fx.auction().end_auction();
+
+    // NFT is returned to seller.
+    assert_eq!(fx.nft().balance(&fx.seller), 1);
+    assert_eq!(fx.nft().balance(&fx.auction_id), 0);
+    assert_eq!(fx.payment().balance(&fx.seller), 0);
+}
+
+#[test]
+fn test_highest_bid_equal_to_reserve_price_executes_sale() {
+    let fx = setup(200);
+
+    // Bidder 1 bids exactly equal to the reserve price of 200.
+    fx.auction().bid(&fx.bidder1, &200);
+
+    set_ledger(&fx.env, 200, 10_000);
+    fx.auction().end_auction();
+
+    // Highest bid >= reserve price: sale executes.
+    assert_eq!(fx.payment().balance(&fx.seller), 200);
+    assert_eq!(fx.nft().balance(&fx.bidder1), 1);
+    assert_eq!(fx.nft().balance(&fx.auction_id), 0);
+}
+
+#[test]
+fn test_get_reserve_price() {
+    let fx = setup(200);
+    assert_eq!(fx.auction().get_reserve_price(), 200);
+}

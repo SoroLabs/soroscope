@@ -1,5 +1,4 @@
 use super::*;
-use crate::volatility::VolatilityConfig;
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Events, Ledger},

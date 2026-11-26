@@ -579,10 +579,68 @@ export function exportReportToCsv(
   return csvContent;
 }
 
+export interface TransactionHistoryRow {
+  hash?: unknown;
+  ledger?: unknown;
+  functionName?: unknown;
+  cpu_instructions?: unknown;
+  ram_bytes?: unknown;
+  fee?: unknown;
+  [key: string]: unknown;
+}
+
+const TRANSACTION_CSV_COLUMNS = ['hash', 'ledger', 'function', 'CPU', 'RAM', 'fee'] as const;
+
+function transactionCell(row: TransactionHistoryRow, column: string): unknown {
+  switch (column) {
+    case 'hash':
+      return row.hash ?? '';
+    case 'ledger':
+      return row.ledger ?? '';
+    case 'function':
+      return row.functionName ?? '';
+    case 'CPU':
+      return row.cpu_instructions ?? '';
+    case 'RAM':
+      return row.ram_bytes ?? '';
+    case 'fee':
+      return row.fee ?? '';
+    default:
+      return '';
+  }
+}
+
+/**
+ * Serialises the current (filtered) transaction history view to CSV.
+ * Includes all visible columns: hash, ledger, function, CPU, RAM, fee.
+ */
+export function generateTransactionsCsv(rows: TransactionHistoryRow[]): string {
+  const lines = [TRANSACTION_CSV_COLUMNS.join(',')];
+  for (const row of rows) {
+    lines.push(
+      TRANSACTION_CSV_COLUMNS.map((column) => escapeCsv(transactionCell(row, column))).join(','),
+    );
+  }
+  return lines.join('\r\n');
+}
+
+/**
+ * Serialises the given rows and triggers a browser download named
+ * `soroscope-txns-<timestamp>.csv`.
+ */
+export function exportTransactionsToCsv(rows: TransactionHistoryRow[], filename?: string): string {
+  const csvContent = generateTransactionsCsv(rows);
+  const finalFilename = filename || `soroscope-txns-${Date.now()}.csv`;
+  if (typeof window !== 'undefined') {
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    downloadBlob(blob, finalFilename);
+  }
+  return csvContent;
+}
+
 /**
  * Unified export report utility supporting PDF, CSV, or both.
- */
-export function exportReport(
+ */export function exportReport(
   result: InvocationResult,
   format: 'pdf' | 'csv' | 'both' = 'pdf',
   metadata?: ExportReportMetadata

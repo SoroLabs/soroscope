@@ -16,6 +16,7 @@ import {
   Calculator,
   BarChart3,
   Binary,
+  Wifi,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { ConnectButton } from "./ConnectButton";

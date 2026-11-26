@@ -2,9 +2,12 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  buildStakingQuery,
   calculateStakingYield,
+  parseStakingQuery,
   sanitizeNumericInput,
   STAKING_INPUT_LIMITS,
+  STAKING_QUERY_KEYS,
 } = require('../lib/stakingCalculator');
 
 // The widget's number fields funnel raw typed text through
@@ -146,4 +149,51 @@ test('StakingCalculator logic integration: milestone table contains monthly proj
   assert.equal(result.breakdownByMonth[0].month, 1);
   assert.equal(result.breakdownByMonth.at(-1).month, 6);
   assert.ok(result.breakdownByMonth.at(-1).balance > result.breakdownByMonth[0].balance);
+});
+
+test('StakingCalculator share link: query round-trips every parameter', () => {
+  const state = {
+    depositAmount: 2500,
+    baseApyPercentage: 8.5,
+    lockDurationMonths: 24,
+    compoundFrequency: 'weekly',
+    enableTierMultiplier: false,
+  };
+  const query = buildStakingQuery(state);
+  assert.deepEqual(Object.keys(query).sort(), [...STAKING_QUERY_KEYS].sort());
+  assert.deepEqual(query, {
+    deposit: '2500',
+    apy: '8.5',
+    duration: '24',
+    compoundFrequency: 'weekly',
+    tierMultiplier: 'false',
+  });
+  assert.deepEqual(parseStakingQuery(query), state);
+});
+
+test('StakingCalculator share link: missing params are left out', () => {
+  assert.deepEqual(parseStakingQuery({}), {});
+  assert.deepEqual(parseStakingQuery({ apy: '5', unrelated: 'x' }), { baseApyPercentage: 5 });
+});
+
+test('StakingCalculator share link: hostile values are clamped or ignored', () => {
+  const parsed = parseStakingQuery({
+    deposit: '-100',
+    apy: '9999',
+    duration: '99.6',
+    compoundFrequency: '__proto__',
+    tierMultiplier: 'yes',
+  });
+  assert.equal(parsed.depositAmount, STAKING_INPUT_LIMITS.depositAmount.min);
+  assert.equal(parsed.baseApyPercentage, STAKING_INPUT_LIMITS.baseApyPercentage.max);
+  assert.equal(parsed.lockDurationMonths, STAKING_INPUT_LIMITS.lockDurationMonths.max);
+  assert.equal(parsed.compoundFrequency, undefined);
+  assert.equal(parsed.enableTierMultiplier, undefined);
+
+  assert.equal(parseStakingQuery({ deposit: 'abc' }).depositAmount, 0);
+  assert.equal(parseStakingQuery({ duration: '6.4' }).lockDurationMonths, 6);
+});
+
+test('StakingCalculator share link: repeated params use the first value', () => {
+  assert.deepEqual(parseStakingQuery({ deposit: ['300', '900'] }), { depositAmount: 300 });
 });

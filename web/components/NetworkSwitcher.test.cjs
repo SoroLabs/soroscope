@@ -49,11 +49,18 @@ const NETWORKS = {
 
 /**
  * Simulated Network State & Dropdown Manager
+ *
+ * Models NetworkSwitcher and NetworkContext state management:
+ * - Reads persisted selection from storage on mount / initialization
+ * - Falls back to default if no valid saved network exists
+ * - Persists selection to storage on network switch
  */
-function createNetworkManager(initialNetworkId = 'testnet') {
-  let activeId = initialNetworkId;
+function createNetworkManager(initialNetworkId = 'testnet', storage = new Map()) {
   let isOpen = false;
-  const storage = new Map();
+
+  // Read persisted network on mount / initialization (matches NetworkSwitcher / NetworkContext logic)
+  const saved = storage.get('soroscope_selected_network');
+  let activeId = (saved && NETWORKS[saved]) ? saved : (NETWORKS[initialNetworkId] ? initialNetworkId : 'testnet');
 
   return {
     get activeNetworkId() {
@@ -129,6 +136,52 @@ test('NetworkSwitcher: selected network is persisted to storage', () => {
   const nm = createNetworkManager('testnet');
   nm.setNetwork('futurenet');
   assert.equal(nm.getStoredNetwork(), 'futurenet');
+});
+
+test('NetworkSwitcher: persists selected network across page refresh (reads on mount)', () => {
+  const sharedStorage = new Map();
+
+  // User initially selects Futurenet before page refresh
+  const initialManager = createNetworkManager('testnet', sharedStorage);
+  initialManager.setNetwork('futurenet');
+  assert.equal(initialManager.activeNetworkId, 'futurenet');
+  assert.equal(initialManager.getStoredNetwork(), 'futurenet');
+
+  // Page refreshes: new component mounts with existing localStorage state
+  const reloadedManager = createNetworkManager('testnet', sharedStorage);
+  assert.equal(
+    reloadedManager.activeNetworkId,
+    'futurenet',
+    'NetworkSwitcher should read persisted selection on mount instead of resetting to default'
+  );
+  assert.equal(reloadedManager.activeNetwork.name, 'Futurenet');
+  assert.equal(reloadedManager.activeNetwork.rpcUrl, 'https://rpc-futurenet.stellar.org');
+});
+
+test('NetworkSwitcher: falls back to default on mount if stored network is invalid', () => {
+  const sharedStorage = new Map();
+  sharedStorage.set('soroscope_selected_network', 'invalid_network_name');
+
+  const manager = createNetworkManager('testnet', sharedStorage);
+  assert.equal(
+    manager.activeNetworkId,
+    'testnet',
+    'Should fall back to default network when stored network ID is unknown'
+  );
+});
+
+test('NetworkSwitcher: persists all supported networks on reload', () => {
+  const sharedStorage = new Map();
+  const testNetworks = ['mainnet', 'futurenet', 'localhost', 'testnet'];
+
+  for (const netId of testNetworks) {
+    const session = createNetworkManager('testnet', sharedStorage);
+    session.setNetwork(netId);
+    assert.equal(session.activeNetworkId, netId);
+
+    const reloaded = createNetworkManager('testnet', sharedStorage);
+    assert.equal(reloaded.activeNetworkId, netId, `Should persist and restore ${netId} across mount`);
+  }
 });
 
 test('NetworkSwitcher: invalid network ID is ignored', () => {
