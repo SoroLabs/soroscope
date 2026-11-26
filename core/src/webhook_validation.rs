@@ -13,7 +13,11 @@
 //!
 //! **Constant-time comparison:** signature bytes are compared with
 //! [`hmac::Mac::verify_slice`], which is constant-time by construction and avoids
-//! timing-based forgery.
+//! timing-based forgery. The hex-decoding path is length-checked before any
+//! comparison so that malformed or truncated signatures are rejected without
+//! leaking information through variable-length work. Any raw secret/signature
+//! equality in this module goes through [`constant_time_eq`], which hashes both
+//! sides with SHA-256 (uniform 32-byte digests) and XOR-accumulates the digests.
 //!
 //! # Complexity
 //!
@@ -38,11 +42,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+use url::{Host, Url};
 
 use crate::webhooks::{DELIVERY_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER};
 
@@ -145,6 +151,30 @@ where
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Constant-time comparison helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compare two byte slices in constant time with respect to their contents.
+///
+/// Both inputs are hashed with SHA-256 first, so the comparison always operates
+/// on two uniform 32-byte digests regardless of the input lengths. This avoids
+/// leaking prefix-length information through short-circuiting equality and
+/// keeps the work independent of where (or whether) the inputs differ.
+///
+/// Note: differing input lengths are still observable (they are not secret in
+/// the HMAC path, where the expected digest length is fixed).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let digest_a = Sha256::digest(a);
+    let digest_b = Sha256::digest(b);
+
+    let mut diff: u8 = 0;
+    for (x, y) in digest_a.iter().zip(digest_b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Core verification logic
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -159,16 +189,31 @@ pub fn generate_signature(secret: &str, timestamp: &str, body: &[u8]) -> String 
 }
 
 /// Verify an HMAC-SHA256 signature.
+///
+/// The comparison is constant-time: [`hmac::Mac::verify_slice`] performs the
+/// final check without short-circuiting. The hex-decoding path is length-checked
+/// up front so that truncated or oversized signatures are rejected before any
+/// comparison work, without leaking timing information about the expected value.
 pub fn verify_signature(secret: &str, timestamp: &str, body: &[u8], signature: &str) -> bool {
     let hex_sig = match signature.strip_prefix("sha256=") {
         Some(h) => h,
         None => signature,
     };
 
+    // A SHA-256 HMAC is exactly 32 bytes, i.e. 64 hex characters. Reject any
+    // other length before decoding so the comparison always sees a fixed size.
+    if hex_sig.len() != 64 {
+        return false;
+    }
+
     let sig_bytes = match hex::decode(hex_sig) {
         Ok(b) => b,
         Err(_) => return false,
     };
+
+    if sig_bytes.len() != 32 {
+        return false;
+    }
 
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
@@ -177,6 +222,113 @@ pub fn verify_signature(secret: &str, timestamp: &str, body: &[u8], signature: &
     mac.update(body);
 
     mac.verify_slice(&sig_bytes).is_ok()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Outbound target URL validation (SSRF protection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Validate a user-supplied outbound webhook target URL to prevent SSRF.
+///
+/// # Rules
+///
+/// - The URL must parse and use `http` or `https`. Any other scheme
+///   (e.g. `file://`, `ftp://`, `gopher://`) is rejected.
+/// - In production (`allow_localhost_in_dev == false`) only `https://` is
+///   accepted. `http://` is permitted only when `allow_localhost_in_dev` is
+///   `true` (local development).
+/// - The host must not resolve to a loopback, link-local, private (RFC1918 /
+///   IPv6 unique-local), or unspecified address, and must not be `localhost`.
+///   This blocks cloud metadata endpoints such as `169.254.169.254` and
+///   internal LAN addresses.
+///
+/// Note: this validates the literal host only. Callers must additionally
+/// disable redirect following on the outbound HTTP client so that an external
+/// server cannot 302-redirect into an internal network.
+pub fn validate_webhook_target_url(
+    url: &str,
+    allow_localhost_in_dev: bool,
+) -> Result<Url, WebhookValidationError> {
+    let parsed = Url::parse(url)
+        .map_err(|e| WebhookValidationError::InvalidTargetUrl(format!("invalid URL: {e}")))?;
+
+    match parsed.scheme() {
+        "https" => {}
+        "http" if allow_localhost_in_dev => {}
+        "http" => {
+            return Err(WebhookValidationError::InvalidTargetUrl(
+                "http:// is not allowed; use https://".to_string(),
+            ));
+        }
+        other => {
+            return Err(WebhookValidationError::InvalidTargetUrl(format!(
+                "unsupported scheme '{other}'; only http(s) is allowed"
+            )));
+        }
+    }
+
+    let host = parsed
+        .host()
+        .ok_or_else(|| WebhookValidationError::InvalidTargetUrl("URL has no host".to_string()))?;
+
+    let blocked = match host {
+        Host::Domain(domain) => {
+            let domain = domain.to_ascii_lowercase();
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
+        Host::Ipv4(ip) => is_blocked_ipv4(ip),
+        Host::Ipv6(ip) => is_blocked_ipv6(ip),
+    };
+
+    if blocked {
+        return Err(WebhookValidationError::InvalidTargetUrl(
+            "target host resolves to a loopback, link-local, private, or unspecified address"
+                .to_string(),
+        ));
+    }
+
+    Ok(parsed)
+}
+
+/// Returns `true` for loopback, link-local, private (RFC1918), and unspecified
+/// IPv4 addresses.
+fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
+    ip.is_loopback()          // 127.0.0.0/8
+        || ip.is_link_local() // 169.254.0.0/16 (includes 169.254.169.254)
+        || ip.is_private()    // 10/8, 172.16/12, 192.168/16
+        || ip.is_unspecified() // 0.0.0.0
+        || ip.is_broadcast()  // 255.255.255.255
+}
+
+/// Returns `true` for loopback, link-local (fe80::/10), unique-local
+/// (fc00::/7), and unspecified IPv6 addresses.
+fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    ip.is_loopback()      // ::1
+        || ip.is_unspecified() // ::
+        || is_ipv6_unique_local(ip) // fc00::/7
+        || is_ipv6_link_local(ip) // fe80::/10
+        || ip
+            .to_ipv4_mapped()
+            .map(|v4| is_blocked_ipv4(v4))
+            .unwrap_or(false)
+}
+
+/// `fc00::/7` — IPv6 unique-local addresses.
+fn is_ipv6_unique_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
+/// `fe80::/10` — IPv6 link-local addresses.
+fn is_ipv6_link_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// Convenience helper for callers that already hold an [`IpAddr`].
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        IpAddr::V6(v6) => is_blocked_ipv6(v6),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -198,6 +350,8 @@ pub enum WebhookValidationError {
     BodyReadError,
     /// The pre-shared secret is not configured.
     MissingSecret,
+    /// The outbound webhook target URL failed SSRF validation.
+    InvalidTargetUrl(String),
 }
 
 impl IntoResponse for WebhookValidationError {
@@ -226,6 +380,10 @@ impl IntoResponse for WebhookValidationError {
             Self::MissingSecret => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Inbound webhook secret not configured".to_string(),
+            ),
+            Self::InvalidTargetUrl(reason) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid webhook target URL: {reason}"),
             ),
         };
 
@@ -422,5 +580,169 @@ mod tests {
         let generated = generate_signature(secret, ts, body);
         assert!(verify_signature(secret, ts, body, &generated));
         assert!(!verify_signature(secret, ts, b"tampered", &generated));
+    }
+
+    #[test]
+    fn constant_time_eq_equal_inputs() {
+        assert!(constant_time_eq(b"same-value", b"same-value"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn constant_time_eq_different_inputs() {
+        assert!(!constant_time_eq(b"same-value", b"other-value"));
+        // Differ only in the first byte.
+        assert!(!constant_time_eq(b"aame-value", b"bame-value"));
+        // Differ only in the last byte.
+        assert!(!constant_time_eq(b"same-valuX", b"same-valuY"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq(b"short", b"a-much-longer-value"));
+        assert!(!constant_time_eq(b"", b"non-empty"));
+    }
+
+    /// Flip a single bit in the hex signature at the given character index.
+    fn flip_hex_bit(hex_sig: &str, index: usize) -> String {
+        let mut chars: Vec<char> = hex_sig.chars().collect();
+        let digit = chars[index].to_digit(16).expect("valid hex digit");
+        let flipped = digit ^ 0b0001;
+        chars[index] = std::char::from_digit(flipped, 16).unwrap();
+        chars.into_iter().collect()
+    }
+
+    #[test]
+    fn single_bit_flip_at_start_is_rejected() {
+        let ts = now_str();
+        let sig = format!("sha256={}", sign(SECRET, &ts, BODY));
+        let hex_sig = sig.strip_prefix("sha256=").unwrap();
+        let tampered = format!("sha256={}", flip_hex_bit(hex_sig, 0));
+        assert!(!verify_signature(SECRET, &ts, BODY, &tampered));
+    }
+
+    #[test]
+    fn single_bit_flip_at_end_is_rejected() {
+        let ts = now_str();
+        let sig = format!("sha256={}", sign(SECRET, &ts, BODY));
+        let hex_sig = sig.strip_prefix("sha256=").unwrap();
+        let last = hex_sig.len() - 1;
+        let tampered = format!("sha256={}", flip_hex_bit(hex_sig, last));
+        assert!(!verify_signature(SECRET, &ts, BODY, &tampered));
+    }
+
+    #[test]
+    fn different_length_signature_is_rejected() {
+        let ts = now_str();
+        let sig = format!("sha256={}", sign(SECRET, &ts, BODY));
+        let hex_sig = sig.strip_prefix("sha256=").unwrap();
+
+        // Truncated signature.
+        let truncated = format!("sha256={}", &hex_sig[..hex_sig.len() - 2]);
+        assert!(!verify_signature(SECRET, &ts, BODY, &truncated));
+
+        // Extended signature.
+        let extended = format!("sha256={}00", hex_sig);
+        assert!(!verify_signature(SECRET, &ts, BODY, &extended));
+
+        // Empty signature.
+        assert!(!verify_signature(SECRET, &ts, BODY, "sha256="));
+    // ── SSRF target URL validation ──────────────────────────────────────────
+
+    #[test]
+    fn accepts_valid_https_endpoint() {
+        let url = validate_webhook_target_url("https://example.com/webhook", false)
+            .expect("valid https endpoint should be accepted");
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("example.com"));
+    }
+
+    #[test]
+    fn rejects_cloud_metadata_ip() {
+        let err = validate_webhook_target_url("http://169.254.169.254/latest/meta-data/", true)
+            .expect_err("cloud metadata IP must be blocked");
+        assert!(matches!(err, WebhookValidationError::InvalidTargetUrl(_)));
+
+        let err = validate_webhook_target_url("https://169.254.169.254/latest/meta-data/", false)
+            .expect_err("cloud metadata IP must be blocked even over https");
+        assert!(matches!(err, WebhookValidationError::InvalidTargetUrl(_)));
+    }
+
+    #[test]
+    fn rejects_private_lan_ips() {
+        for target in [
+            "https://10.0.0.1/hook",
+            "https://172.16.0.1/hook",
+            "https://172.31.255.255/hook",
+            "https://192.168.1.1/hook",
+            "https://127.0.0.1/hook",
+            "https://0.0.0.0/hook",
+        ] {
+            let err = validate_webhook_target_url(target, false)
+                .unwrap_or_else(|_| panic!("{target} must be blocked"));
+            let _ = err;
+        }
+    }
+
+    #[test]
+    fn rejects_private_lan_ips_returns_error() {
+        for target in [
+            "https://10.0.0.1/hook",
+            "https://172.16.0.1/hook",
+            "https://192.168.1.1/hook",
+            "https://127.0.0.1/hook",
+            "https://[::1]/hook",
+            "https://[fc00::1]/hook",
+            "https://[fe80::1]/hook",
+            "https://[::]/hook",
+        ] {
+            assert!(
+                validate_webhook_target_url(target, false).is_err(),
+                "{target} must be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_localhost_hostname() {
+        assert!(validate_webhook_target_url("https://localhost/hook", false).is_err());
+        assert!(validate_webhook_target_url("https://LOCALHOST/hook", false).is_err());
+        assert!(validate_webhook_target_url("https://foo.localhost/hook", false).is_err());
+    }
+
+    #[test]
+    fn rejects_non_http_schemes() {
+        for target in [
+            "file:///etc/passwd",
+            "ftp://example.com/hook",
+            "gopher://example.com/hook",
+            "javascript:alert(1)",
+        ] {
+            assert!(
+                validate_webhook_target_url(target, false).is_err(),
+                "{target} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_http_in_production() {
+        assert!(validate_webhook_target_url("http://example.com/hook", false).is_err());
+    }
+
+    #[test]
+    fn allows_http_in_dev_mode() {
+        assert!(validate_webhook_target_url("http://example.com/hook", true).is_ok());
+    }
+
+    #[test]
+    fn dev_mode_still_blocks_private_ips() {
+        assert!(validate_webhook_target_url("http://127.0.0.1/hook", true).is_err());
+        assert!(validate_webhook_target_url("http://169.254.169.254/hook", true).is_err());
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_ipv6_loopback() {
+        assert!(validate_webhook_target_url("https://[::ffff:127.0.0.1]/hook", false).is_err());
     }
 }

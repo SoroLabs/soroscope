@@ -116,3 +116,27 @@ test('CSS variables: accent colors are theme-agnostic', () => {
     assert.equal(color.length, 7, `${color} should be 7 characters`);
   }
 });
+
+test('theme persistence: toggle writes the preference to localStorage under key "theme"', () => {
+  const store = new Map();
+  const localStorage = {
+    setItem: (key, value) => store.set(key, String(value)),
+    getItem: (key) => (store.has(key) ? store.get(key) : null),
+  };
+
+  // Mirrors ThemeProvider.setTheme/toggleTheme in themeToggle.tsx.
+  let theme = 'dark';
+  const setTheme = (next) => {
+    theme = next;
+    localStorage.setItem('theme', next);
+  };
+  const toggleTheme = () => setTheme(theme === 'dark' ? 'light' : 'dark');
+
+  toggleTheme();
+  assert.equal(theme, 'light');
+  assert.equal(localStorage.getItem('theme'), 'light');
+
+  toggleTheme();
+  assert.equal(theme, 'dark');
+  assert.equal(localStorage.getItem('theme'), 'dark');
+});

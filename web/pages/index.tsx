@@ -1,86 +1,68 @@
 import Head from "next/head";
 import dynamic from "next/dynamic";
 import { useRouter } from "next/router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import React, { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { Code, FileCode, ChevronDown, ChevronRight } from "lucide-react";
 
 import { HeaderNav, type NavTab } from "../components/HeaderNav";
 import { SEARCH_COMMAND_EVENT } from "../components/GlobalSearchModal";
 import { ConnectButton } from "../components/ConnectButton";
-import { useState } from 'react';
-import Head from 'next/head';
-import { ResultViewer } from '../components/Resultviewer';
-import { InvocationHistory, useInvocationHistory } from '../components/InnovocationHistory';
-import { NutritionLabel } from '../components/NutritionLabel';
-import { FunctionSidebar } from '../components/FunctionSidebar';
-import { ContractInteraction } from '../components/ContractInteraction';
-import { MOCK_CONTRACT_FUNCTIONS, generateMockResult, generateMockResourceCost } from '../lib/sorobantypes';
-import type { ContractFunction, InvocationResult } from '../lib/sorobantypes';
-import { UploadZone } from '../components/upload-zone';
-import { extractErrorDetails, createUserFriendlyMessage } from '../lib/errorHandling';
-import { ErrorBoundary } from '../components/ErrorBoundary';
-import { ToastStack, type ToastItem } from '../components/Toast';
-import { dismissToast, enqueueToast } from '../lib/toastQueue.cjs';
-import { ContractInteraction } from "../components/ContractInteraction";
-import { ErrorBoundary } from "../components/ErrorBoundary";
-import { FunctionSidebar } from "../components/FunctionSidebar";
-import { TransactionHistoryTable } from "../components/TransactionHistoryTable";
-import { GasUsageChart } from "../components/GasUsageChart";
-import { InvocationHistory } from "../components/InnovocationHistory";
+import { ResultViewer } from "../components/Resultviewer";
+import { InvocationHistory, useInvocationHistory } from "../components/InnovocationHistory";
 import { NutritionLabel } from "../components/NutritionLabel";
 import { NutritionLabelSkeleton } from "../components/NutritionLabelSkeleton";
+import { FunctionSidebar } from "../components/FunctionSidebar";
+import { ContractInteraction } from "../components/ContractInteraction";
+import { GasGolfingSuggestionsTable } from "../components/GasGolfingSuggestionsTable";
+import { GasUsageChart } from "../components/GasUsageChart";
 import { ResourceHeatmap } from "../components/ResourceHeatmap";
-import { ResultViewer } from "../components/Resultviewer";
 import { ResultViewerSkeleton } from "../components/ResultViewerSkeleton";
 import { FeeEstimationPreview } from "../components/FeeEstimationPreview";
 import { SyntaxHighlighter } from "../components/SyntaxHighlighter";
-import { WasmDisassemblyViewer } from "../components/WasmDisassemblyViewer";
+import { BatchImportPanel } from "../components/BatchImportPanel";
 import { UploadZone } from "../components/upload-zone";
 import { CopyButton } from "../components/CopyButton";
 import { ContractAddressLink } from "../components/ContractAddressLink";
 import { WalletBalanceCard } from "../components/WalletBalanceCard";
 import { LiquidityPoolAnalytics } from "../components/LiquidityPoolAnalytics";
+import { StakingCalculator } from "../components/StakingCalculator";
 import { TransactionConfetti } from "../components/TransactionConfetti";
+import { TransactionHistoryTable } from "../components/TransactionHistoryTable";
+import { WalletModal } from "../components/WalletModal";
+import { ErrorBoundary } from "../components/ErrorBoundary";
+import { ToastStack, type ToastItem } from "../components/Toast";
+import { dismissToast, enqueueToast } from "../lib/toastQueue.cjs";
 import { useNetwork } from "../context/NetworkContext";
-import { clearLatestAnalysis } from "../lib/analysisStorage";
-import { analyzeService } from "../lib/api";
-import Head from 'next/head';
-import React, { useEffect, useState } from 'react';
-
-import { ConnectButton } from '../components/ConnectButton';
-import { ContractInteraction } from '../components/ContractInteraction';
-import { ErrorBoundary } from '../components/ErrorBoundary';
-import { FunctionSidebar } from '../components/FunctionSidebar';
-import { GasGolfingSuggestionsTable } from '../components/GasGolfingSuggestionsTable';
-import { GasUsageChart } from '../components/GasUsageChart';
-import { InvocationHistory, useInvocationHistory } from '../components/InnovocationHistory';
-import { NutritionLabel } from '../components/NutritionLabel';
-import { NutritionLabelSkeleton } from '../components/NutritionLabelSkeleton';
-import { ResourceHeatmap } from '../components/ResourceHeatmap';
-import { ResultViewer } from '../components/Resultviewer';
-import { ResultViewerSkeleton } from '../components/ResultViewerSkeleton';
-import { UploadZone } from '../components/upload-zone';
-
-import { ApiError, analyzeService, apiUrl } from '../lib/api';
-import { loadLatestAnalysis, saveLatestAnalysis } from '../lib/analysisStorage';
-import { createUserFriendlyMessage, extractErrorDetails, formatError } from '../lib/errorHandling';
-import type { GasGolfingSuggestion } from '../lib/gasGolfingSort';
+import { clearLatestAnalysis, loadLatestAnalysis, saveLatestAnalysis } from "../lib/analysisStorage";
+import { cacheAnalysis } from "../lib/offlineStorage";
+import { CachedResults } from "../components/CachedResults";
+import { ApiError, analyzeService, apiUrl } from "../lib/api";
+import { createUserFriendlyMessage, extractErrorDetails, formatError } from "../lib/errorHandling";
+import { normalizeGasGolfingSuggestions, type GasGolfingSuggestion } from "../lib/gasGolfingSort";
+import { ResourceHeatmapSkeleton } from "../components/ResourceHeatmapSkeleton";
+import { GasUsageChartSkeleton } from "../components/GasUsageChartSkeleton";
 import {
   MOCK_CONTRACT_FUNCTIONS,
   generateMockResult,
   generateMockTransactions,
   type ContractFunction,
   type InvocationResult,
-} from '../lib/sorobantypes';
+  type TransactionStatus,
+} from "../lib/sorobantypes";
+import { DEFAULT_TRANSACTION_FILTER, type TransactionFilter } from "../lib/transactionFilters";
+import { decodePermalinkState, encodePermalinkState } from "../lib/permalinkState";
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  let binary = '';
+  let binary = "";
   const bytes = new Uint8Array(buffer);
   const len = bytes.byteLength;
   for (let i = 0; i < len; i++) {
     binary += String.fromCharCode(bytes[i]);
   }
-  return typeof window !== 'undefined' ? window.btoa(binary) : Buffer.from(binary, 'binary').toString('base64');
+  return typeof window !== "undefined"
+    ? window.btoa(binary)
+    : Buffer.from(binary, "binary").toString("base64");
+}
 
 // React Flow measures real DOM nodes, so the visualizer is client-only.
 const SchemaVisualizer = dynamic(
@@ -93,32 +75,29 @@ const SchemaVisualizer = dynamic(
   },
 );
 
-const VALID_TABS: NavTab[] = ["explorer", "schema", "disassembly", "history", "transactions"];
-  type TransactionStatus,
-} from "../lib/sorobantypes";
-import { DEFAULT_TRANSACTION_FILTER, type TransactionFilter } from "../lib/transactionFilters";
+const VALID_TABS: NavTab[] = ["explorer", "schema", "disassembly", "history", "transactions", "analytics"];
 
 export default function Home() {
   const router = useRouter();
   const { network } = useNetwork();
-  const [tab, setTab] = useState<NavTab>('explorer');
+  const [tab, setTab] = useState<NavTab>("explorer");
   const [contractId, setContractId] = useState(network.defaultContractId);
-  const [contractId, setContractId] = useState(
-    'CAEZJVJ4N7P7GRUVD5NG5LYYH23AQHJUKQEUHW54LR5PGQX3V7FXD7Q'
-  );
   const [selectedFunction, setSelectedFunction] = useState<ContractFunction>(
-    MOCK_CONTRACT_FUNCTIONS[0]
+    MOCK_CONTRACT_FUNCTIONS[0],
   );
   const [currentResult, setCurrentResult] = useState<InvocationResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [wasmFile, setWasmFile] = useState<File | null>(null);
   const [wasmData, setWasmData] = useState<string | null>(null);
   const [toastNotifications, setToastNotifications] = useState<ToastItem[]>([]);
+  // Encoded argument values for the currently selected function, used to
+  // rebuild shareable permalinks.
+  const [lastInputs, setLastInputs] = useState<Record<string, string>>({});
 
   const [uploadResetKey, setUploadResetKey] = useState(0);
   const mockTransactions = useMemo(() => generateMockTransactions(47), []);
 
-  const [transactionStatusFilter, setTransactionStatusFilter] = useState<TransactionStatus | 'all'>(
+  const [transactionStatusFilter, setTransactionStatusFilter] = useState<TransactionStatus | "all">(
     DEFAULT_TRANSACTION_FILTER.status,
   );
   const [transactionFunctionFilter, setTransactionFunctionFilter] = useState(
@@ -130,7 +109,7 @@ export default function Home() {
     [transactionStatusFilter, transactionFunctionFilter],
   );
 
-  const handleTransactionStatusFilterChange = useCallback((status: TransactionStatus | 'all') => {
+  const handleTransactionStatusFilterChange = useCallback((status: TransactionStatus | "all") => {
     setTransactionStatusFilter(status);
   }, []);
 
@@ -141,7 +120,38 @@ export default function Home() {
   useEffect(() => {
     setContractId(network.defaultContractId);
   }, [network]);
-  const [tab, setTab] = useState<'explorer' | 'history'>('explorer');
+
+  // Hydrate simulator state from a shareable `?state=` permalink. Malformed or
+  // tampered payloads decode to `null` and are ignored so we fall back to the
+  // default state without crashing.
+  useEffect(() => {
+    if (!router.isReady) return;
+    const requested = router.query.state;
+    const value = Array.isArray(requested) ? requested[0] : requested;
+    if (!value) return;
+
+    const decoded = decodePermalinkState(value);
+    if (!decoded) return;
+
+    if (decoded.contractId) {
+      setContractId(decoded.contractId);
+    }
+
+    const match = MOCK_CONTRACT_FUNCTIONS.find((fn) => fn.name === decoded.fnName);
+    if (match) {
+      setSelectedFunction(match);
+    }
+
+    if (decoded.args) {
+      setLastInputs(decoded.args);
+    }
+
+    if (decoded.viewTab && VALID_TABS.includes(decoded.viewTab as NavTab)) {
+      setTab(decoded.viewTab as NavTab);
+    }
+    // Only re-run when the permalink parameter itself changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [router.isReady, router.query.state]);
 
   // Gas golfing state
   const [gasGolfingSuggestions, setGasGolfingSuggestions] = useState<GasGolfingSuggestion[]>([]);
@@ -160,7 +170,8 @@ export default function Home() {
   }, []);
 
   // Keep the active tab in sync with `?tab=` so the Cmd+K palette (and plain
-  // links) can deep-link straight to a panel.
+  // links) can deep-link straight to a panel, including browser back/forward
+  // navigation (fixes #1291).
   useEffect(() => {
     const requested = router.query.tab;
     const value = Array.isArray(requested) ? requested[0] : requested;
@@ -168,6 +179,21 @@ export default function Home() {
       setTab(value as NavTab);
     }
   }, [router.query.tab]);
+
+  /**
+   * Navigate to a tab and write the new value into the URL query string with a
+   * shallow replace so the browser back/forward buttons can restore it. The
+   * `router.query.tab` effect above then picks up the change and calls
+   * `setTab`, which keeps both sources of truth in sync.
+   */
+  const navigateToTab = useCallback(
+    (nextTab: NavTab) => {
+      void router.replace({ query: { ...router.query, tab: nextTab } }, undefined, {
+        shallow: true,
+      });
+    },
+    [router],
+  );
 
   // Non-navigation commands from the global search overlay.
   useEffect(() => {
@@ -182,7 +208,7 @@ export default function Home() {
 
       setSelectedFunction(match);
       setCurrentResult(null);
-      setTab("explorer");
+      navigateToTab("explorer");
     };
 
     window.addEventListener(SEARCH_COMMAND_EVENT, handleCommand);
@@ -192,6 +218,17 @@ export default function Home() {
   const handleSimulate = async (inputs: Record<string, any>, customWasmData?: string) => {
     setLoading(true);
     let errorType: string | undefined;
+
+    // Remember the submitted arguments so a permalink can reproduce this run.
+    try {
+      const serialized: Record<string, string> = {};
+      for (const [key, value] of Object.entries(inputs ?? {})) {
+        serialized[key] = typeof value === "string" ? value : JSON.stringify(value);
+      }
+      setLastInputs(serialized);
+    } catch {
+      // Ignore unserializable inputs; permalink will simply omit them.
+    }
 
     try {
       const activeWasmData = customWasmData ?? wasmData;
@@ -215,6 +252,7 @@ export default function Home() {
         resourceCost: report,
         stateSnapshot: report.state_snapshot,
         callGraphMermaid: report.call_graph_mermaid ?? undefined,
+        simulationId: report.simulation_id ?? undefined,
         timestamp: Date.now(),
         success: true,
       };
@@ -222,7 +260,8 @@ export default function Home() {
       setCurrentResult(result);
       addToHistory(result);
       saveLatestAnalysis(result);
-      if (typeof window !== 'undefined' && (window as any).triggerConfetti) {
+      cacheAnalysis(result, wasmFile?.name);
+      if (typeof window !== "undefined" && (window as any).triggerConfetti) {
         (window as any).triggerConfetti();
       }
     } catch (error) {
@@ -236,19 +275,20 @@ export default function Home() {
         id: Math.random().toString(36).substring(7),
         functionName: selectedFunction.name,
         inputs,
-        error: formatted.message || 'Analysis failed',
-        errorType: errorType || 'ANALYSIS_ERROR',
+        error: formatted.message || "Analysis failed",
+        errorType: errorType || "ANALYSIS_ERROR",
         timestamp: Date.now(),
         success: false,
       };
       setCurrentResult(errorResult);
       addToHistory(errorResult);
-      setToastNotifications((current) => enqueueToast(current, {
-        id: `${Date.now()}-${Math.random()}`,
-        message: errorMessage,
-        type: 'error',
-      }));
-      });
+      setToastNotifications((current) =>
+        enqueueToast(current, {
+          id: `${Date.now()}-${Math.random()}`,
+          message: formatted.message || "Simulation failed",
+          type: "error",
+        }),
+      );
     } finally {
       setLoading(false);
     }
@@ -261,7 +301,22 @@ export default function Home() {
     setUploadResetKey((k) => k + 1);
   }, []);
 
-  const analysisReport = currentResult?.analysisReport;
+  // Build a shareable permalink that restores the current simulator state.
+  const permalink = useMemo(() => {
+    const encoded = encodePermalinkState({
+      network: network.id,
+      contractId,
+      fnName: selectedFunction.name,
+      args: lastInputs,
+      viewTab: tab,
+    });
+    const base =
+      typeof window !== "undefined"
+        ? `${window.location.origin}${window.location.pathname}`
+        : "";
+    return `${base}?state=${encoded}`;
+  }, [network.id, contractId, selectedFunction.name, lastInputs, tab]);
+
   const handleWasmReady = async (file: File) => {
     setGasGolfingLoading(true);
     setGasGolfingError(null);
@@ -271,12 +326,12 @@ export default function Home() {
       const bytes = await file.arrayBuffer();
       const base64Bytes = arrayBufferToBase64(bytes);
 
-      const res = await fetch(apiUrl('/analyze/gas-golfing'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      const res = await fetch(apiUrl("/analyze/gas-golfing"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           wasm_bytes: base64Bytes,
-          contract_name: file.name.replace(/\.wasm$/i, ''),
+          contract_name: file.name.replace(/\.wasm$/i, ""),
         }),
       });
 
@@ -286,40 +341,39 @@ export default function Home() {
       }
 
       const data = await res.json();
-      setGasGolfingSuggestions(
-        (data?.report?.suggestions ?? []) as GasGolfingSuggestion[]
-      );
+      setGasGolfingSuggestions(normalizeGasGolfingSuggestions(data?.report?.suggestions));
     } catch (e) {
-      setGasGolfingError(e instanceof Error ? e.message : 'Failed to analyze WASM');
+      setGasGolfingError(e instanceof Error ? e.message : "Failed to analyze WASM");
     } finally {
       setGasGolfingLoading(false);
+    }
   };
 
   const analysisReport = currentResult?.analysisReport ?? currentResult?.resourceCost;
 
   const { pageTitle, seoDescription } = useMemo(() => {
     switch (tab) {
-      case 'analytics':
+      case "analytics":
         return {
-          pageTitle: 'SoroScope | Liquidity Pool APY & TVL Analytics',
-          seoDescription: 'Explore historical APY, TVL, and volume charts for the XLM/USDC liquidity pool.',
+          pageTitle: "SoroScope | Liquidity Pool APY & TVL Analytics",
+          seoDescription: "Explore historical APY, TVL, and volume charts for the XLM/USDC liquidity pool.",
         };
-      case 'transactions':
+      case "transactions":
         return {
-          pageTitle: 'SoroScope | Transaction History Telemetry',
-          seoDescription: 'Monitor real-time Soroban contract events, transaction fees, and telemetry records.',
+          pageTitle: "SoroScope | Transaction History Telemetry",
+          seoDescription: "Monitor real-time Soroban contract events, transaction fees, and telemetry records.",
         };
-      case 'disassembly':
+      case "disassembly":
         return {
-          pageTitle: 'SoroScope | WASM Disassembly Viewer',
-          seoDescription: 'Decode Soroban contract WASM bytecode and cross-highlight opcodes against the Rust source.',
+          pageTitle: "SoroScope | WASM Disassembly Viewer",
+          seoDescription: "Decode Soroban contract WASM bytecode and cross-highlight opcodes against the Rust source.",
         };
-      case 'history':
+      case "history":
         return {
-          pageTitle: 'SoroScope | Invocation History Analysis',
-          seoDescription: 'Review previous Soroban contract runs and CPU/RAM instruction summaries.',
+          pageTitle: "SoroScope | Invocation History Analysis",
+          seoDescription: "Review previous Soroban contract runs and CPU/RAM instruction summaries.",
         };
-      case 'explorer':
+      case "explorer":
       default:
         return {
           pageTitle: `SoroScope | ${selectedFunction.name} - Contract Analyzer`,
@@ -331,58 +385,32 @@ export default function Home() {
   return (
     <>
       <Head>
-        <title>SoroScope - Soroban Smart Contract Resource Analyzer</title>
-        <meta
-          name="description"
-          content="Explore, test, and analyze the CPU, RAM, and ledger footprint of Soroban smart contracts with absolute precision, utilizing live node queries and direct WASM bytecode analysis."
-        />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <link rel="icon" href="/favicon.ico" />
         <title>{pageTitle}</title>
         <meta name="description" content={seoDescription} />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <link rel="icon" href="/favicon.ico" />
       </Head>
       <main className="min-h-screen bg-slate-950 text-slate-100">
-        <HeaderNav tab={tab} setTab={setTab} />
+        <HeaderNav tab={tab} setTab={navigateToTab} />
 
-      <div style={{ minHeight: '100vh', backgroundColor: '#0f1117' }}>
-        {/* Header */}
-        <header className="sticky top-0 z-[100] flex flex-col gap-4 border-b border-[#30363d] bg-[#1a1f26] px-6 py-6 sm:flex-row sm:items-center sm:justify-between sm:px-10 lg:pl-[140px] lg:pr-[125px]">
-          <div className="max-w-[1200px]">
-            <h1 style={{ margin: '0 0 12px 0', fontSize: '28px', fontWeight: '700', color: '#00d9ff', letterSpacing: '0.5px' }}>
-              SoroScope
-            </h1>
-            <p style={{ margin: '0', color: '#8b949e', fontSize: '14px' }}>
-              Explore and test Soroban smart contracts with precision
-            </p>
-          </div>
-
-          {/* Wallet Connection */}
-          <div>
-            <ConnectButton />
-        </header>
-
-        {/* Main Content */}
-        <main className="mx-auto max-w-[1200px] px-4 py-6 sm:px-6">
-
-          {/* WASM Upload Zone */}
-          <div
-            style={{
-              backgroundColor: '#161b22',
-              borderRadius: '12px',
-              padding: '28px',
-              marginBottom: '24px',
-              border: '1px solid #30363d',
-            }}
-          >
-            <div style={{ marginBottom: '16px' }}>
-              <h2 style={{ margin: '0 0 4px 0', fontSize: '16px', fontWeight: '600', color: '#c9d1d9' }}>
-                Upload Contract
-              </h2>
-              <p style={{ margin: '0', fontSize: '13px', color: '#8b949e' }}>
-                Drop a compiled Soroban contract (.wasm) to analyze its resource usage
+        <section className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8">
+          {/* Simulator header with shareable permalink */}
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h1 className="text-lg font-semibold text-slate-100">Simulation Report</h1>
+              <p className="text-xs text-slate-400">
+                Share this exact configuration with a teammate via a permalink.
               </p>
             </div>
+            <CopyButton
+              text={permalink}
+              label="Share Permalink"
+              tooltipPosition="left"
+            />
+          </div>
 
+          {/* WASM Upload Zone */}
+          <div className="mb-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
             <ErrorBoundary
               fallback={(error, reset) => (
                 <div className="rounded-lg border border-red-800/60 bg-red-950/30 p-6 text-center text-red-100">
@@ -402,9 +430,7 @@ export default function Home() {
             >
               <UploadZone
                 key={uploadResetKey}
-                onFileReady={(file) => {
-                  void file;
-                backendUrl={apiUrl('/analyze/wasm')}
+                backendUrl={apiUrl("/analyze/wasm")}
                 enableBackendValidation={true}
                 onFileReady={async (file) => {
                   setWasmFile(file);
@@ -428,73 +454,34 @@ export default function Home() {
           </div>
 
           {/* Side-by-side Rust/WASM panes need the full content width. */}
-          {tab === 'disassembly' && (
+          {tab === "disassembly" && (
             <section className="mb-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
               <WasmDisassemblyViewer wasmFile={wasmFile} />
             </section>
           )}
 
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-            <div className="space-y-4">
+          {/* Batch import panel — only shown on the explorer tab (closes #1294). */}
+          {tab === 'explorer' && (
+            <BatchImportPanel />
+          )}
           {/* Gas Golfing Suggestions Table */}
-          <div style={{ marginBottom: '24px' }}>
-            {gasGolfingLoading ? (
-              <div className="rounded-lg border border-[#30363d] bg-[#0d1117] p-4 text-sm text-[#8b949e]">
-                Analyzing WASM for Gas Golfing suggestions…
-              </div>
-            ) : gasGolfingError ? (
-              <div className="rounded-lg border border-[#fb8500] bg-[#0d1117] p-4 text-sm text-[#f0883e]">
-                {gasGolfingError}
-            ) : gasGolfingSuggestions.length > 0 ? (
+          {gasGolfingLoading ? (
+            <div className="mb-6 rounded-lg border border-slate-800 bg-slate-900 p-4 text-sm text-slate-300">
+              Analyzing WASM for Gas Golfing suggestions…
+            </div>
+          ) : gasGolfingError ? (
+            <div className="mb-6 rounded-lg border border-amber-800 bg-amber-950/40 p-4 text-sm text-amber-200">
+              {gasGolfingError}
+            </div>
+          ) : gasGolfingSuggestions.length > 0 ? (
+            <div className="mb-6">
               <GasGolfingSuggestionsTable suggestions={gasGolfingSuggestions} />
-            ) : null}
+            </div>
+          ) : null}
 
-          {/* Contract ID Input */}
-          <div
-            style={{
-              backgroundColor: '#161b22',
-              borderRadius: '8px',
-              padding: '24px',
-              marginBottom: '24px',
-              border: '1px solid #30363d',
-            }}
-          >
-            <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#c9d1d9' }}>
-              Contract ID
-            </label>
-            <input
-              type="text"
-              value={contractId}
-              onChange={(e) => setContractId(e.target.value)}
-              placeholder="Enter Soroban contract ID"
-                width: '100%',
-                padding: '12px 16px',
-                borderRadius: '6px',
-                fontSize: '14px',
-                fontFamily: 'monospace',
-                boxSizing: 'border-box',
-                backgroundColor: '#0d1117',
-                color: '#c9d1d9',
-            />
-            <p style={{ margin: '8px 0 0 0', fontSize: '12px', color: '#8b949e' }}>
-              Contract ID: <code style={{ color: '#00d9ff' }}>{contractId.substring(0, 20)}...</code>
-            </p>
-            {wasmFile && (
-                  marginTop: '16px',
-                  padding: '12px',
-                  backgroundColor: 'rgba(52, 211, 153, 0.08)',
-                  border: '1px solid rgba(52, 211, 153, 0.25)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '8px',
-                <span style={{ color: '#34d399', fontSize: '12px', fontWeight: '600' }}>Active WASM:</span>
-                <code style={{ color: '#c9d1d9', fontSize: '12px', fontFamily: 'monospace' }}>{wasmFile.name}</code>
-                <span style={{ color: '#8b949e', fontSize: '11px' }}>({(wasmFile.size / 1024).toFixed(1)} KB)</span>
-            )}
-
-          <div className="mb-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             {/* Left Column - Function Selection & Form */}
-            <div>
+            <div className="space-y-4">
               <WalletBalanceCard />
               <FunctionSidebar
                 functions={MOCK_CONTRACT_FUNCTIONS}
@@ -506,14 +493,17 @@ export default function Home() {
               />
               <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
                 <div className="mb-2 flex items-center justify-between">
-                  <label className="text-sm font-medium text-slate-300">
+                  <label htmlFor="contract-id-input" className="text-sm font-medium text-slate-300">
                     Contract ID
                   </label>
                   <CopyButton text={contractId} label="Copy ID" tooltipPosition="left" />
                 </div>
                 <input
+                  id="contract-id-input"
                   value={contractId}
                   onChange={(e) => setContractId(e.target.value)}
+                  placeholder="Enter Soroban contract ID"
+                  aria-label="Soroban contract ID"
                   className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
                 />
                 <div className="mt-2 flex items-center gap-3 text-xs">
@@ -523,9 +513,16 @@ export default function Home() {
                     label={null}
                     className="text-xs"
                   />
-                  <span className="text-slate-600">&middot;</span>
-                  <span className="text-slate-500">opens on the active network explorer</span>
+                  <span className="text-slate-500">&middot;</span>
+                  <span className="text-slate-400">opens on the active network explorer</span>
                 </div>
+                {wasmFile && (
+                  <div className="mt-3 flex items-center gap-2 rounded-lg border border-emerald-500/25 bg-emerald-500/10 p-2 text-xs">
+                    <span className="font-semibold text-emerald-400">Active WASM:</span>
+                    <code className="font-mono text-slate-200">{wasmFile.name}</code>
+                    <span className="text-slate-400">({(wasmFile.size / 1024).toFixed(1)} KB)</span>
+                  </div>
+                )}
               </div>
               <ContractInteraction
                 selectedFunction={selectedFunction}
@@ -534,8 +531,9 @@ export default function Home() {
               />
             </div>
 
+            {/* Right Column - Results / Schema / Transactions / History / Analytics */}
             <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
-              {tab === 'explorer' ? (
+              {tab === "explorer" ? (
                 loading ? (
                   <>
                     <ResultViewerSkeleton />
@@ -544,20 +542,28 @@ export default function Home() {
                     </div>
                   </>
                 ) : currentResult ? (
-                    <ResultViewer result={currentResult} />
+                  <>
+                    <ResultViewer result={currentResult} contractId={wasmData ? undefined : contractId} />
                     {analysisReport && (
                       <div className="mt-4 flex flex-col gap-4">
-                        <ResourceHeatmap resourceCost={{
-                          cpu_instructions: analysisReport.cpu_instructions,
-                          ram_bytes: analysisReport.ram_bytes,
-                          ledger_read_bytes: analysisReport.ledger_read_bytes,
-                          ledger_write_bytes: analysisReport.ledger_write_bytes,
-                          transaction_size_bytes: analysisReport.transaction_size_bytes,
-                          cost_stroops: analysisReport.cost_stroops,
-                          state_snapshot: currentResult.stateSnapshot
-                        }} />
+                        <Suspense fallback={<ResourceHeatmapSkeleton />}>
+                          <ResourceHeatmap
+                            resourceCost={{
+                              cpu_instructions: analysisReport.cpu_instructions,
+                              ram_bytes: analysisReport.ram_bytes,
+                              ledger_read_bytes: analysisReport.ledger_read_bytes,
+                              ledger_write_bytes: analysisReport.ledger_write_bytes,
+                              transaction_size_bytes: analysisReport.transaction_size_bytes,
+                              cost_stroops: analysisReport.cost_stroops,
+                              state_snapshot: currentResult.stateSnapshot,
+                            }}
+                          />
+                        </Suspense>
+                      </div>
                     )}
+                    {analysisReport && (
                       <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                        <Suspense fallback={<NutritionLabelSkeleton />}>
                         <NutritionLabel
                           cpu_instructions={analysisReport.cpu_instructions}
                           ram_bytes={analysisReport.ram_bytes}
@@ -565,17 +571,18 @@ export default function Home() {
                           ledger_write_bytes={analysisReport.ledger_write_bytes}
                           transaction_size_bytes={analysisReport.transaction_size_bytes}
                         />
+                        </Suspense>
+                        <Suspense fallback={<GasUsageChartSkeleton />}>
                         <GasUsageChart
-                          cost_stroops={(analysisReport as any).cost_stroops}
-                          testnetAverages={(analysisReport as any).testnet_averages}
                           cpu_instructions={analysisReport.cpu_instructions}
                           ram_bytes={analysisReport.ram_bytes}
                           ledger_read_bytes={analysisReport.ledger_read_bytes}
                           ledger_write_bytes={analysisReport.ledger_write_bytes}
                           transaction_size_bytes={analysisReport.transaction_size_bytes}
-                          cost_stroops={analysisReport.cost_stroops}
-                          testnetAverages={analysisReport.testnet_averages}
+                          cost_stroops={(analysisReport as any).cost_stroops}
+                          testnetAverages={(analysisReport as any).testnet_averages}
                         />
+                        </Suspense>
                       </div>
                     )}
                     {analysisReport && analysisReport.cost_stroops !== undefined && (
@@ -583,131 +590,70 @@ export default function Home() {
                         <FeeEstimationPreview
                           costStroops={analysisReport.cost_stroops}
                           loading={loading}
+                        />
+                      </div>
+                    )}
                     <button
                       type="button"
                       onClick={handleClearAnalysis}
-                      className="mt-4 px-4 py-2 bg-slate-800 text-slate-300 rounded hover:bg-slate-700 transition"
+                      className="mt-4 px-4 py-2 bg-slate-800 text-slate-200 rounded hover:bg-slate-700 transition"
+                      aria-label="Clear current analysis"
                     >
                       Clear analysis
                     </button>
+                  </>
                 ) : (
-                  <p className="text-slate-500 text-center py-8">
+                  <p className="text-slate-400 text-center py-8">
                     Run an analysis to see results
                   </p>
                 )
-              ) : tab === 'schema' ? (
+              ) : tab === "schema" ? (
                 <SchemaVisualizer report={analysisReport} />
-              ) : tab === 'disassembly' ? (
-                <p className="py-8 text-center text-slate-500">Disassembly is shown above.</p>
-              ) : tab === 'transactions' ? (
-                <TransactionHistoryTable transactions={mockTransactions} />
-              ) : tab === 'analytics' ? (
-                <LiquidityPoolAnalytics />
+              ) : tab === "disassembly" ? (
+                <p className="py-8 text-center text-slate-400">Disassembly is shown above.</p>
+              ) : tab === "transactions" ? (
                 <TransactionHistoryTable
                   transactions={mockTransactions}
                   filter={transactionFilter}
                   onStatusFilterChange={handleTransactionStatusFilterChange}
                   onFunctionFilterChange={handleTransactionFunctionFilterChange}
                 />
+              ) : tab === "analytics" ? (
+                <LiquidityPoolAnalytics />
               ) : (
-                <InvocationHistory onSelectResult={(result) => {
-                  setCurrentResult(result);
-                  setTab('explorer');
-            {/* Right Column - Results & History Tabs */}
-            <div>
-              {/* Tabs Header */}
-              <div
-                style={{
-                  display: 'flex',
-                  borderBottom: '1px solid #30363d',
-                  marginBottom: '24px',
-                  backgroundColor: '#161b22',
-                  borderRadius: '8px 8px 0 0',
-                }}
-                  onClick={() => setTab('explorer')}
-                    flex: 1,
-                    padding: '12px 16px',
-                    backgroundColor: 'transparent',
-                    border: 'none',
-                    borderBottom: tab === 'explorer' ? '2px solid #00d9ff' : '2px solid transparent',
-                    cursor: 'pointer',
-                    fontSize: '14px',
-                    fontWeight: tab === 'explorer' ? '600' : '500',
-                    color: tab === 'explorer' ? '#00d9ff' : '#8b949e',
-                    transition: 'color 0.2s, border-bottom-color 0.2s',
-                  Result
-                  onClick={() => setTab('history')}
-                    borderBottom: tab === 'history' ? '2px solid #00d9ff' : '2px solid transparent',
-                    fontWeight: tab === 'history' ? '600' : '500',
-                    color: tab === 'history' ? '#00d9ff' : '#8b949e',
-                  History ({history.length})
-
-              {/* Tab Content Body */}
-                  borderRadius: '0 0 8px 8px',
-                  padding: '24px',
-                  border: '1px solid #30363d',
-                  borderTop: 'none',
-                      {currentResult?.resourceCost && (
-                          <ResourceHeatmap
-                            resourceCost={{
-                              cpu_instructions: currentResult.resourceCost.cpu_instructions,
-                              ram_bytes: currentResult.resourceCost.ram_bytes,
-                              ledger_read_bytes: currentResult.resourceCost.ledger_read_bytes,
-                              ledger_write_bytes: currentResult.resourceCost.ledger_write_bytes,
-                              transaction_size_bytes: currentResult.resourceCost.transaction_size_bytes,
-                              cost_stroops: (currentResult.resourceCost as any).cost_stroops,
-                              state_snapshot: currentResult.stateSnapshot,
-
-                            <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
-                                cpu_instructions={currentResult.resourceCost.cpu_instructions}
-                                ram_bytes={currentResult.resourceCost.ram_bytes}
-                                ledger_read_bytes={currentResult.resourceCost.ledger_read_bytes}
-                                ledger_write_bytes={currentResult.resourceCost.ledger_write_bytes}
-                                transaction_size_bytes={currentResult.resourceCost.transaction_size_bytes}
-                                cost_stroops={currentResult.resourceCost.cost_stroops}
-                                testnetAverages={currentResult.resourceCost.testnet_averages}
-
-                            onClick={() => {
-                              setCurrentResult(null);
-                              setWasmFile(null);
-                              setWasmData(null);
-                            className="mt-4 rounded bg-slate-800 px-4 py-2 text-slate-300 transition hover:bg-slate-700"
+                <>
                   <InvocationHistory
                     onSelectResult={(result) => {
-
-          {/* Info Cards */}
-              display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-              gap: '16px',
-                borderRadius: '8px',
-                padding: '16px',
-                borderLeft: '4px solid #00d9ff',
-              <h3 style={{ margin: '0 0 8px 0', fontSize: '14px', fontWeight: '600', color: '#00d9ff' }}>
-                Simulate
-              </h3>
-              <p style={{ margin: '0', fontSize: '13px', color: '#8b949e' }}>
-                Preview contract execution without signing or spending XLM
-
-                borderLeft: '4px solid #a371f7',
-              <h3 style={{ margin: '0 0 8px 0', fontSize: '14px', fontWeight: '600', color: '#a371f7' }}>
-                Invoke
-                Execute real transactions via your connected wallet (Freighter/xBull)
-
-                borderLeft: '4px solid #fb8500',
-              <h3 style={{ margin: '0 0 8px 0', fontSize: '14px', fontWeight: '600', color: '#fb8500' }}>
-                History
-                Track all function calls with full details and resource costs
+                      setCurrentResult(result);
+                      setTab("explorer");
+                    }}
+                  />
+                  <div className="mt-4">
+                    <CachedResults
+                      onSelectResult={(result) => {
+                        setCurrentResult(result);
+                        setTab("explorer");
+                      }}
+                    />
+                  </div>
+                </>
+              )}
             </div>
           </div>
-        </main>
-      </div>
 
           {/* Staking & Yield Calculator Widget Section */}
           <section className="mt-8">
             <StakingCalculator />
           </section>
-        <TransactionConfetti />
-      {/* Wallet Modal */}
+
+          {/* Contract Source & XDR Viewer Section */}
+          <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
+            <SourceCodeViewer currentResult={currentResult} />
+          </div>
+        </section>
+      </main>
+
+      <TransactionConfetti />
       <WalletModal />
       <ToastStack
         toasts={toastNotifications}
@@ -717,15 +663,13 @@ export default function Home() {
   );
 }
 
-          {/* Contract Source & XDR Viewer Section */}
-          <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
-            <SourceCodeViewer currentResult={currentResult} />
-
 // ──────────────────────────────────────────────
 // Source Code & XDR Viewer Sub-component
+// ──────────────────────────────────────────────
 
 interface SourceCodeViewerProps {
   currentResult: InvocationResult | null;
+}
 
 function SourceCodeViewer({ currentResult }: SourceCodeViewerProps) {
   const [expanded, setExpanded] = useState(false);
@@ -740,6 +684,7 @@ pub trait LiquidityPool {
     fn swap(e: Env, from: Address, token_in: Address, token_out: Address, amount_in: u128) -> u128;
     fn get_balance(e: Env, account: Address) -> u128;
     fn get_reserves(e: Env) -> (u128, u128);
+}
 
 #[contract]
 pub struct LiquidityPoolContract;
@@ -765,11 +710,14 @@ impl LiquidityPoolContract {
 
         Self::mint_lp_tokens(&env, &from, &lp_amount);
         true
+    }
 
     pub fn get_reserves(env: Env) -> (u128, u128) {
         let reserve_a: u128 = env.storage().instance().get(&symbol_short!("res_a")).unwrap_or(0);
         let reserve_b: u128 = env.storage().instance().get(&symbol_short!("res_b")).unwrap_or(0);
         (reserve_a, reserve_b)
+    }
+}
 
 fn calculate_swap_output(
     amount_in: u128,
@@ -817,21 +765,26 @@ F1Rlc3QgU29yb2JhbiBUcmFuc2ZlcgAAAAAACgAAAAV4U29sAAAAAAAAAAAAAAAAAWVl9MAA`;
         className="flex w-full items-center justify-between text-left"
         aria-expanded={expanded}
         aria-controls="source-code-panel"
+        aria-label="Toggle contract source code and raw XDR transaction panel"
       >
         <div className="flex items-center gap-3">
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-800">
-            <Code className="h-4 w-4 text-cyan-400" />
+            <Code className="h-4 w-4 text-cyan-400" aria-hidden="true" />
+          </div>
+          <div>
             <h3 className="text-sm font-semibold text-slate-200">
               Contract Source &amp; XDR
             </h3>
-            <p className="text-xs text-slate-500">
+            <p className="text-xs text-slate-400">
               View contract source code and raw XDR transaction data
             </p>
-        <span className="text-slate-500">
+          </div>
+        </div>
+        <span className="text-slate-400">
           {expanded ? (
-            <ChevronDown className="h-5 w-5" />
+            <ChevronDown className="h-5 w-5" aria-hidden="true" />
           ) : (
-            <ChevronRight className="h-5 w-5" />
+            <ChevronRight className="h-5 w-5" aria-hidden="true" />
           )}
         </span>
       </button>
@@ -839,19 +792,36 @@ F1Rlc3QgU29yb2JhbiBUcmFuc2ZlcgAAAAAACgAAAAV4U29sAAAAAAAAAAAAAAAAAWVl9MAA`;
       {expanded && (
         <div id="source-code-panel" className="mt-4 space-y-4">
           {/* View toggle */}
-          <div className="flex items-center gap-2 border-b border-slate-800 pb-3">
+          <div className="flex items-center gap-2 border-b border-slate-800 pb-3" role="tablist" aria-label="Source code view options">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={viewMode === "contract"}
               onClick={() => setViewMode("contract")}
               className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
                 viewMode === "contract"
                   ? "bg-cyan-500/10 text-cyan-400 border border-cyan-500/30"
                   : "text-slate-400 hover:text-slate-300 border border-transparent"
               }`}
-              <FileCode className="h-3.5 w-3.5" />
+            >
+              <FileCode className="h-3.5 w-3.5" aria-hidden="true" />
               Contract Source
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={viewMode === "xdr"}
               onClick={() => setViewMode("xdr")}
+              className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
                 viewMode === "xdr"
-              <Code className="h-3.5 w-3.5" />
+                  ? "bg-cyan-500/10 text-cyan-400 border border-cyan-500/30"
+                  : "text-slate-400 hover:text-slate-300 border border-transparent"
+              }`}
+            >
+              <Code className="h-3.5 w-3.5" aria-hidden="true" />
               XDR View
+            </button>
+          </div>
 
           {/* Syntax highlighted code */}
           <SyntaxHighlighter
@@ -860,3 +830,8 @@ F1Rlc3QgU29yb2JhbiBUcmFuc2ZlcgAAAAAACgAAAAV4U29sAAAAAAAAAAAAAAAAAWVl9MAA`;
             showLineNumbers
             maxHeight="480px"
           />
+        </div>
+      )}
+    </div>
+  );
+}

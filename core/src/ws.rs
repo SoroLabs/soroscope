@@ -327,8 +327,24 @@ async fn handle_socket(mut socket: WebSocket, job_id: String, state: Arc<crate::
 
     let mut rx = state.simulation_bus.subscribe();
 
+    // Observe the shutdown coordinator so we can send a Close frame and stop
+    // subscribing to new events as soon as a drain begins.
+    let mut shutdown_rx = state.shutdown_coordinator.subscribe();
+
     loop {
         tokio::select! {
+            // Shutdown signalled: stop consuming events and close gracefully.
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    tracing::info!(
+                        job_id = %job_id,
+                        "Server shutting down — sending WebSocket Close frame"
+                    );
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+
             // Receive next event from the bus
             result = rx.recv() => {
                 match result {
@@ -446,27 +462,40 @@ impl WsConnectionManager {
     }
 
     pub fn register_connection(&self, is_reconnect: bool) {
-        self.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.active_connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.total_connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if is_reconnect {
-            self.total_reconnects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.total_reconnects
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     pub fn unregister_connection(&self) {
-        self.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.active_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn record_buffered_messages(&self, count: u64) {
-        self.total_messages_buffered.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        self.total_messages_buffered
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn stats(&self) -> WsConnectionStats {
         WsConnectionStats {
-            active_connections: self.active_connections.load(std::sync::atomic::Ordering::Relaxed),
-            total_connections: self.total_connections.load(std::sync::atomic::Ordering::Relaxed),
-            total_reconnects: self.total_reconnects.load(std::sync::atomic::Ordering::Relaxed),
-            total_messages_buffered: self.total_messages_buffered.load(std::sync::atomic::Ordering::Relaxed),
+            active_connections: self
+                .active_connections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_connections: self
+                .total_connections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_reconnects: self
+                .total_reconnects
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_messages_buffered: self
+                .total_messages_buffered
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -553,7 +582,11 @@ mod tests {
         let fake_id = JobId::new();
 
         for percent in 0..=BUS_CAPACITY_MIN {
-            bus.publish(SimulationBus::progress(&fake_id, percent as i32, "progress"));
+            bus.publish(SimulationBus::progress(
+                &fake_id,
+                percent as i32,
+                "progress",
+            ));
         }
 
         let received = rx.recv().await;
@@ -578,7 +611,11 @@ mod tests {
         let fake_id = JobId::new();
 
         for percent in 0..=BUS_CAPACITY_MIN {
-            bus.publish(SimulationBus::progress(&fake_id, percent as i32, "progress"));
+            bus.publish(SimulationBus::progress(
+                &fake_id,
+                percent as i32,
+                "progress",
+            ));
         }
 
         assert!(matches!(

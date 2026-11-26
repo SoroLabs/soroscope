@@ -75,6 +75,10 @@ pub struct VaultState {
     pub admin: Address,
     /// Total vault shares outstanding.
     pub total_shares: i128,
+    /// Net deposit-token assets deployed into pools and backing `total_shares`.
+    /// Tracked separately from the idle token balance so donations and pool
+    /// positions are both reflected in the effective NAV.
+    pub total_assets: i128,
     /// Maximum slippage tolerated on rebalance withdrawals, in bps.
     pub slippage_bps: i128,
     /// Assumed daily volume as a fraction of pool reserve, in bps (default 10_000 = 100%).
@@ -112,6 +116,14 @@ pub const TTL_LEDGERS: u32 = 17_280;
 pub const DEFAULT_SLIPPAGE_BPS: i128 = 100; // 1 %
 pub const DEFAULT_VOLUME_PROXY_BPS: i128 = 10_000; // 100 % of reserve
 
+/// Virtual shares offset mirroring OpenZeppelin's ERC-4626 `10**_decimalsOffset()`
+/// (six decimals). The offset makes the initial price per share very small so a
+/// direct token donation cannot round a victim's minted shares down to zero.
+pub const VIRTUAL_SHARES: i128 = 1_000_000;
+/// Virtual assets offset. Keeps every conversion denominator >= 1 so an empty
+/// vault can never divide by zero.
+pub const VIRTUAL_ASSETS: i128 = 1;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn load_vault(e: &Env) -> Result<VaultState, Error> {
@@ -136,6 +148,43 @@ fn save_pools(e: &Env, pools: &Vec<PoolAllocation>) {
     e.storage().instance().set(&DataKey::Pools, pools);
 }
 
+/// Effective assets backing outstanding shares.
+///
+/// `total_assets` tracks amounts routed into pools, while the vault's token
+/// balance captures idle funds and direct token donations. Taking the larger
+/// of the two avoids double counting in mock/AMM setups where deposits stay in
+/// the vault, while still making donations visible to share pricing.
+fn effective_total_assets(e: &Env, vault: &VaultState) -> i128 {
+    let idle = soroban_sdk::token::Client::new(e, &vault.deposit_token)
+        .balance(&e.current_contract_address());
+    vault.total_assets.max(idle)
+}
+
+/// `shares = assets * (total_shares + VIRTUAL_SHARES) / (total_assets + VIRTUAL_ASSETS)`.
+///
+/// Integer division truncates toward zero, so the result always rounds down in
+/// favour of the vault. The `+ VIRTUAL_ASSETS` term guarantees a non-zero
+/// denominator even when the vault is empty.
+fn convert_to_shares_inner(total_shares: i128, total_assets: i128, assets: i128) -> i128 {
+    if assets <= 0 {
+        return 0;
+    }
+    assets.saturating_mul(total_shares.saturating_add(VIRTUAL_SHARES))
+        / total_assets.saturating_add(VIRTUAL_ASSETS)
+}
+
+/// `assets = shares * (total_assets + VIRTUAL_ASSETS) / (total_shares + VIRTUAL_SHARES)`.
+///
+/// Mirrors [`convert_to_shares_inner`] and likewise rounds down so redeeming
+/// shareholders never receive more than their pro-rata NAV.
+fn convert_to_assets_inner(total_shares: i128, total_assets: i128, shares: i128) -> i128 {
+    if shares <= 0 {
+        return 0;
+    }
+    shares.saturating_mul(total_assets.saturating_add(VIRTUAL_ASSETS))
+        / total_shares.saturating_add(VIRTUAL_SHARES)
+}
+
 /// Estimate APR in bps for the deposit token in a given pool.
 ///
 /// apr_bps = fee_bps * volume_proxy_bps / 10_000
@@ -148,6 +197,7 @@ fn estimate_apr_bps(fee_bps: i128, volume_proxy_bps: i128) -> i128 {
 }
 
 /// How much of the deposit token the vault has in a given pool allocation.
+#[allow(dead_code)] // retained for NAV-aware routing once total LP supply is exposed
 fn deposit_value_in_pool(e: &Env, alloc: &PoolAllocation) -> i128 {
     if alloc.lp_shares == 0 {
         return 0;
@@ -210,6 +260,7 @@ impl MultiYieldVault {
                 deposit_token,
                 admin,
                 total_shares: 0,
+                total_assets: 0,
                 slippage_bps,
                 volume_proxy_bps,
             },
@@ -297,8 +348,23 @@ impl MultiYieldVault {
         from.require_auth();
         let mut vault = load_vault(&e)?;
         let pools = load_pools(&e);
-        if pools.len() == 0 {
+        if pools.is_empty() {
             return Err(Error::PoolNotFound);
+        }
+
+        // Price shares against the pre-deposit NAV. Computing this before the
+        // token transfer keeps the depositor's own assets out of the ratio and
+        // prevents a 1-stroop first deposit from receiving a disproportionate
+        // number of shares.
+        let shares = convert_to_shares_inner(
+            vault.total_shares,
+            effective_total_assets(&e, &vault),
+            amount,
+        );
+        if shares <= 0 {
+            // Reject dust deposits that would mint zero shares so they cannot
+            // become a free donation to existing holders.
+            return Err(Error::InvalidAmount);
         }
 
         // Pull deposit token from user into vault.
@@ -365,13 +431,6 @@ impl MultiYieldVault {
         }
         save_pools(&e, &pools_mut);
 
-        // Mint vault shares proportional to deposit.
-        let shares = if vault.total_shares == 0 {
-            amount
-        } else {
-            amount // 1:1 for simplicity; production would use NAV-based pricing
-        };
-
         let bal_key = DataKey::Balance(from.clone());
         let cur: i128 = e.storage().persistent().get(&bal_key).unwrap_or(0);
         e.storage().persistent().set(&bal_key, &(cur + shares));
@@ -380,6 +439,7 @@ impl MultiYieldVault {
             .extend_ttl(&bal_key, TTL_LEDGERS, TTL_LEDGERS);
 
         vault.total_shares += shares;
+        vault.total_assets += amount;
         save_vault(&e, &vault);
 
         Ok(shares)
@@ -399,39 +459,45 @@ impl MultiYieldVault {
             return Err(Error::InsufficientShares);
         }
 
-        // Proportional share of total vault assets.
+        // Price the redemption with the virtual offset. Truncation rounds down,
+        // so the redeemer always receives slightly less than the pro-rata NAV
+        // and the remainder stays with the remaining shareholders.
+        let assets = convert_to_assets_inner(
+            vault.total_shares,
+            effective_total_assets(&e, &vault),
+            shares,
+        );
+        if assets <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Burn the caller's pro-rata LP shares in every pool.
         let fraction_num = shares;
         let fraction_den = vault.total_shares;
-
         let mut pools = load_pools(&e);
-        let mut total_received: i128 = 0;
 
         for i in 0..pools.len() {
             let mut alloc = pools.get(i).unwrap();
             if alloc.lp_shares == 0 {
                 continue;
             }
-            // Withdraw proportional LP shares from this pool.
             let lp_to_burn = alloc.lp_shares * fraction_num / fraction_den;
             if lp_to_burn == 0 {
                 continue;
             }
 
             let client = AmmPoolClient::new(&e, &alloc.pool);
-            let (out_a, out_b) = client.withdraw(&e.current_contract_address(), &lp_to_burn);
-
-            let received = if alloc.deposit_is_a { out_a } else { out_b };
-            total_received += received;
+            let _ = client.withdraw(&e.current_contract_address(), &lp_to_burn);
             alloc.lp_shares -= lp_to_burn;
             pools.set(i, alloc);
         }
         save_pools(&e, &pools);
 
-        // Send deposit token to user.
+        // Send the virtual-offset-adjusted amount to the user.
         soroban_sdk::token::Client::new(&e, &vault.deposit_token).transfer(
             &e.current_contract_address(),
             &to,
-            &total_received,
+            &assets,
         );
 
         e.storage().persistent().set(&bal_key, &(cur - shares));
@@ -440,9 +506,10 @@ impl MultiYieldVault {
             .extend_ttl(&bal_key, TTL_LEDGERS, TTL_LEDGERS);
 
         vault.total_shares -= shares;
+        vault.total_assets = vault.total_assets.saturating_sub(assets);
         save_vault(&e, &vault);
 
-        Ok(total_received)
+        Ok(assets)
     }
 
     // ── Rebalancing ───────────────────────────────────────────────────────────
@@ -545,7 +612,8 @@ impl MultiYieldVault {
 
         save_pools(&e, &pools);
 
-        e.events().publish((Symbol::new(&e, "rebalance"),), (last_idx as u32, total_to_move));
+        e.events()
+            .publish((Symbol::new(&e, "rebalance"),), (last_idx, total_to_move));
         Ok(())
     }
 
@@ -566,6 +634,32 @@ impl MultiYieldVault {
             .unwrap_or(0)
     }
 
+    /// Effective assets backing vault shares (deployed assets plus idle/donated tokens).
+    pub fn total_assets(e: Env) -> Result<i128, Error> {
+        let vault = load_vault(&e)?;
+        Ok(effective_total_assets(&e, &vault))
+    }
+
+    /// ERC-4626 style preview of shares minted for `assets`, using virtual offsets.
+    pub fn convert_to_shares(e: Env, assets: i128) -> Result<i128, Error> {
+        let vault = load_vault(&e)?;
+        Ok(convert_to_shares_inner(
+            vault.total_shares,
+            effective_total_assets(&e, &vault),
+            assets,
+        ))
+    }
+
+    /// ERC-4626 style preview of assets returned for `shares`, using virtual offsets.
+    pub fn convert_to_assets(e: Env, shares: i128) -> Result<i128, Error> {
+        let vault = load_vault(&e)?;
+        Ok(convert_to_assets_inner(
+            vault.total_shares,
+            effective_total_assets(&e, &vault),
+            shares,
+        ))
+    }
+
     /// Returns the estimated APR (in bps) for each registered pool, in order.
     pub fn get_aprs(e: Env) -> Result<Vec<i128>, Error> {
         let vault = load_vault(&e)?;
@@ -583,6 +677,7 @@ impl MultiYieldVault {
     // ── Internal ──────────────────────────────────────────────────────────────
 
     /// Returns the index of the pool with the highest estimated APR.
+    #[allow(dead_code)] // reserved for APR-driven deposit routing
     fn best_pool_idx(e: &Env, pools: &Vec<PoolAllocation>, vault: &VaultState) -> u32 {
         let mut best_idx = 0u32;
         let mut best_apr: i128 = -1;

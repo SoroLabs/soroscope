@@ -89,6 +89,13 @@ pub struct PausedEvent {
     pub paused: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct AdminWithdrawEvent {
+    pub admin: Address,
+    pub amount: i128,
+}
+
 // ── Helper Math Functions ─────────────────────────────────────
 
 fn fixed_pow_int(base: Fixed, mut exp: u32) -> Result<Fixed, ContractError> {
@@ -319,6 +326,23 @@ pub struct StakingRewards;
 #[contractimpl]
 impl StakingRewards {
     /// Initializes the staking rewards contract with the config.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `owner` - Address of the contract owner.
+    /// * `staking_token` - Address of the token to be staked.
+    /// * `reward_token` - Address of the token distributed as rewards.
+    /// * `initial_rate` - Initial emission rate at epoch 0 (18 decimals fixed point).
+    /// * `epoch_decay_percent` - Rate reduction percentage per epoch (18 decimals fixed point).
+    /// * `epoch_length` - Number of blocks in each epoch.
+    /// * `start_block` - Ledger sequence block when rewards begin.
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful initialization.
+    ///
+    /// # Errors
+    /// * `ContractError::AlreadyInitialized` - If the contract has already been configured.
+    /// * `ContractError::InvalidInput` - If decay percentage, epoch length, or initial rate are invalid.
     pub fn initialize(
         e: Env,
         owner: Address,
@@ -380,6 +404,19 @@ impl StakingRewards {
     }
 
     /// Stakes primary tokens in the contract.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `user` - The address of the staker depositing tokens.
+    /// * `amount` - Amount of tokens to stake.
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful staking.
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If staking operation is paused.
+    /// * `ContractError::InvalidInput` - If amount is non-positive.
+    /// * `ContractError::Overflow` - If addition exceeds numerical bounds.
     pub fn stake(e: Env, user: Address, amount: i128) -> Result<(), ContractError> {
         // Check if staking is paused using granular pause control
         DefaultEmergencyGuard::check_not_paused(&e, PauseType::STAKE)
@@ -436,6 +473,20 @@ impl StakingRewards {
     }
 
     /// Withdraws staked principal tokens.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `user` - The address of the staker withdrawing tokens.
+    /// * `amount` - Amount of tokens to withdraw.
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful withdrawal.
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If staking operation is paused.
+    /// * `ContractError::InvalidInput` - If amount is non-positive.
+    /// * `ContractError::InsufficientBalance` - If requested amount exceeds user staked principal.
+    /// * `ContractError::Overflow` - If subtraction underflows or math errors occur.
     pub fn withdraw(e: Env, user: Address, amount: i128) -> Result<(), ContractError> {
         // Check if staking is paused using granular pause control
         DefaultEmergencyGuard::check_not_paused(&e, PauseType::STAKE)
@@ -502,6 +553,17 @@ impl StakingRewards {
     }
 
     /// Claims accrued rewards.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `user` - The address of the staker claiming accrued rewards.
+    ///
+    /// # Returns
+    /// `Result<i128, ContractError>` - Total amount of reward tokens claimed.
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If staking or claim operations are paused.
+    /// * `ContractError::NotInitialized` - If contract is uninitialized.
     pub fn claim(e: Env, user: Address) -> Result<i128, ContractError> {
         // Check if staking is paused using granular pause control
         DefaultEmergencyGuard::check_not_paused(&e, PauseType::STAKE)
@@ -557,6 +619,17 @@ impl StakingRewards {
 
     /// Emergency withdraw: pulls all principal stakings and forfeits all rewards.
     /// Operates even when paused or if the reward token pool is completely dry.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `user` - The address of the staker performing emergency withdrawal.
+    ///
+    /// # Returns
+    /// `Result<i128, ContractError>` - Net payout of staked principal returned to user after penalties.
+    ///
+    /// # Errors
+    /// * `ContractError::NotInitialized` - If contract is uninitialized.
+    /// * `ContractError::Overflow` - If subtraction underflow occurs.
     pub fn emergency_withdraw(e: Env, user: Address) -> Result<i128, ContractError> {
         user.require_auth();
 
@@ -620,7 +693,73 @@ impl StakingRewards {
         Ok(payout)
     }
 
+    /// Withdraws surplus reward tokens (admin only).
+    /// Prevents draining staked principal tokens.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `amount` - Amount of reward tokens to withdraw.
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful withdrawal.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidInput` - If amount is non-positive.
+    /// * `ContractError::WithdrawExceedsSurplus` - If amount exceeds available surplus reward tokens.
+    /// * `ContractError::NotInitialized` - If contract is uninitialized.
+    pub fn admin_withdraw(e: Env, amount: i128) -> Result<(), ContractError> {
+        let config = Self::get_config(e.clone())?;
+        config.owner.require_auth();
+
+        if amount <= 0 {
+            return Err(ContractError::InvalidInput);
+        }
+
+        let total_reward_tokens =
+            token::Client::new(&e, &config.reward_token).balance(&e.current_contract_address());
+        let total_staked_principal: i128 = if config.staking_token == config.reward_token {
+            e.storage()
+                .instance()
+                .get(&DataKey::TotalStaked)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let max_withdrawable = total_reward_tokens - total_staked_principal;
+        if amount > max_withdrawable {
+            return Err(ContractError::WithdrawExceedsSurplus);
+        }
+
+        token::Client::new(&e, &config.reward_token).transfer(
+            &e.current_contract_address(),
+            &config.owner,
+            &amount,
+        );
+
+        e.events().publish(
+            (Symbol::new(&e, "admin_withdraw"), config.owner.clone()),
+            AdminWithdrawEvent {
+                admin: config.owner,
+                amount,
+            },
+        );
+
+        Ok(())
+    }
+
     /// Sets emergency unbonding penalty fee in basis points (owner only, max 10000 = 100%).
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `fee_bps` - Unbonding penalty fee in basis points (e.g. 500 = 5%).
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful fee update.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidInput` - If fee_bps exceeds 10000.
+    /// * `ContractError::NotInitialized` - If contract is uninitialized.
     pub fn set_penalty_fee(e: Env, fee_bps: u32) -> Result<(), ContractError> {
         let config = Self::get_config(e.clone())?;
         config.owner.require_auth();
@@ -636,6 +775,12 @@ impl StakingRewards {
     }
 
     /// Gets emergency unbonding penalty fee in basis points.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    ///
+    /// # Returns
+    /// `u32` - Emergency unbonding penalty fee in basis points.
     pub fn get_penalty_fee(e: Env) -> u32 {
         e.storage()
             .instance()
@@ -644,6 +789,16 @@ impl StakingRewards {
     }
 
     /// Pause staking operations (admin only).
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful pause.
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If unable to update pause state.
+    /// * `ContractError::NotInitialized` - If contract is uninitialized.
     pub fn pause_staking(e: Env) -> Result<(), ContractError> {
         let config = Self::get_config(e.clone())?;
         config.owner.require_auth();
@@ -660,6 +815,16 @@ impl StakingRewards {
     }
 
     /// Resume staking operations (admin only).
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful resume.
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If unable to update pause state.
+    /// * `ContractError::NotInitialized` - If contract is uninitialized.
     pub fn resume_staking(e: Env) -> Result<(), ContractError> {
         let config = Self::get_config(e.clone())?;
         config.owner.require_auth();
@@ -676,6 +841,16 @@ impl StakingRewards {
     }
 
     /// Emergency pause all operations (requires multi-sig approval).
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `approvers` - Vector of admin addresses signing the pause.
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful pause.
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If multi-sig verification or execution fails.
     pub fn emergency_pause_all(e: Env, approvers: Vec<Address>) -> Result<(), ContractError> {
         DefaultEmergencyGuard::emergency_pause_all(&e, approvers)
             .map_err(|_| ContractError::Paused)?;
@@ -689,6 +864,16 @@ impl StakingRewards {
     }
 
     /// Resume all paused operations (requires multi-sig approval).
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `approvers` - Vector of admin addresses signing the resume.
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful resume.
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If multi-sig verification or execution fails.
     pub fn resume_all(e: Env, approvers: Vec<Address>) -> Result<(), ContractError> {
         DefaultEmergencyGuard::resume_all(&e, approvers).map_err(|_| ContractError::Paused)?;
 
@@ -700,12 +885,24 @@ impl StakingRewards {
         Ok(())
     }
 
-    /// Get current pause state.
+    /// Get current pause state bitmask.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    ///
+    /// # Returns
+    /// `u32` - Bitmask representing currently paused operations.
     pub fn get_pause_state(e: Env) -> u32 {
         DefaultEmergencyGuard::get_pause_state(&e)
     }
 
     /// Check if staking is paused.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    ///
+    /// # Returns
+    /// `bool` - True if staking is paused, false otherwise.
     pub fn is_staking_paused(e: Env) -> bool {
         let state = DefaultEmergencyGuard::get_pause_state(&e);
         let pause_type = PauseType::new(state);
@@ -713,16 +910,39 @@ impl StakingRewards {
     }
 
     /// Get list of admins.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    ///
+    /// # Returns
+    /// `Vec<Address>` - List of configured emergency admin addresses.
     pub fn get_admins(e: Env) -> Vec<Address> {
         DefaultEmergencyGuard::get_admins(&e)
     }
 
     /// Get multi-sig threshold.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    ///
+    /// # Returns
+    /// `u32` - Minimum number of admin signatures required for multi-sig operations.
     pub fn get_threshold(e: Env) -> u32 {
         DefaultEmergencyGuard::get_threshold(&e)
     }
 
     /// Add new admin (multi-sig required).
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `approvers` - List of existing admin addresses authorizing the action.
+    /// * `new_admin` - Address of the admin to add.
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful admin addition.
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If threshold/signature authorization fails.
     pub fn add_admin(
         e: Env,
         approvers: Vec<Address>,
@@ -733,6 +953,17 @@ impl StakingRewards {
     }
 
     /// Remove admin (multi-sig required).
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `approvers` - List of existing admin addresses authorizing the removal.
+    /// * `admin` - Address of the admin to remove.
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful admin removal.
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If threshold/signature authorization fails.
     pub fn remove_admin(
         e: Env,
         approvers: Vec<Address>,
@@ -742,6 +973,18 @@ impl StakingRewards {
     }
 
     /// Rotate admin (multi-sig required).
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `approvers` - List of existing admin addresses authorizing the rotation.
+    /// * `old_admin` - Address of the current admin to replace.
+    /// * `new_admin` - Address of the new admin to install.
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful admin rotation.
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If threshold/signature authorization fails.
     pub fn rotate_admin(
         e: Env,
         approvers: Vec<Address>,
@@ -755,6 +998,17 @@ impl StakingRewards {
     /// Granularly pause or unpause the claim_rewards operation (owner only).
     /// This is independent of the global `is_paused` flag and uses the
     /// embedded EmergencyGuard bitmask (PauseType::CLAIM_REWARDS).
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `paused` - True to pause claims, false to resume.
+    ///
+    /// # Returns
+    /// `Result<(), ContractError>` - Ok on successful pause state change.
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If owner check or pause setting fails.
+    /// * `ContractError::NotInitialized` - If contract is uninitialized.
     pub fn set_claim_rewards_paused(e: Env, paused: bool) -> Result<(), ContractError> {
         let config = Self::get_config(e.clone())?;
         // `EmergencyGuard::set_pause` performs the ownership auth check itself,
@@ -767,6 +1021,13 @@ impl StakingRewards {
     // ── View Functions ──────────────────────────────────────────
 
     /// Returns the staked principal balance of the user.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `user` - User address to query.
+    ///
+    /// # Returns
+    /// `i128` - Amount of principal tokens currently staked by user.
     pub fn get_staked_balance(e: Env, user: Address) -> i128 {
         let state_key = DataKey::UserState(user);
         if e.storage().persistent().has(&state_key) {
@@ -778,6 +1039,13 @@ impl StakingRewards {
     }
 
     /// Returns the accrued rewards saved during the last update.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `user` - User address to query.
+    ///
+    /// # Returns
+    /// `i128` - Accrued reward amount stored during previous interaction.
     pub fn get_accrued_rewards(e: Env, user: Address) -> i128 {
         let state_key = DataKey::UserState(user);
         if e.storage().persistent().has(&state_key) {
@@ -789,6 +1057,13 @@ impl StakingRewards {
     }
 
     /// Returns the real-time pending rewards (accrued + interest accumulated since last update).
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    /// * `user` - User address to query.
+    ///
+    /// # Returns
+    /// `i128` - Real-time total rewards pending claim.
     pub fn get_pending_rewards(e: Env, user: Address) -> i128 {
         let config_res = Self::get_config(e.clone());
         if config_res.is_err() {
@@ -823,6 +1098,15 @@ impl StakingRewards {
     }
 
     /// Returns the contract's configuration.
+    ///
+    /// # Arguments
+    /// * `e` - The execution environment.
+    ///
+    /// # Returns
+    /// `Result<StakingConfig, ContractError>` - Staking configuration struct.
+    ///
+    /// # Errors
+    /// * `ContractError::NotInitialized` - If configuration has not been initialized.
     pub fn get_config(e: Env) -> Result<StakingConfig, ContractError> {
         e.storage()
             .instance()

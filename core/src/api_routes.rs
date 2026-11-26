@@ -20,6 +20,9 @@ use crate::sac_transfer::{
     self, SacBalanceSource, SacBalances, SacTransferReport, SacTransferRequest,
 };
 use crate::simulation::SimulationEngine;
+use crate::webhooks::{
+    DlqEntry, ReplayOutcome, SubscriptionRegistry, WebhookConfig, WebhookDlq, WebhookError,
+};
 
 /// `GET /fee/config` — the checked-in fee parameters a quote is based on.
 ///
@@ -167,6 +170,53 @@ async fn get_fee_config() -> Result<Json<FeeConfigResponse>, AppError> {
     }))
 }
 
+/// State for the webhook dead-letter queue endpoints (#1399).
+#[derive(Clone)]
+pub struct WebhookDlqState {
+    pub dlq: WebhookDlq,
+    pub registry: SubscriptionRegistry,
+    pub client: reqwest::Client,
+    pub config: WebhookConfig,
+}
+
+/// `GET /api/v1/webhooks/dlq` and `POST /api/v1/webhooks/dlq/:id/replay`.
+///
+/// These expose failed deliveries and re-send them, so mount the router inside
+/// the authenticated (`auth::auth_middleware`) part of the application.
+pub fn webhook_dlq_routes(state: WebhookDlqState) -> Router {
+    Router::new()
+        .route("/api/v1/webhooks/dlq", axum::routing::get(list_webhook_dlq))
+        .route("/api/v1/webhooks/dlq/:id/replay", post(replay_webhook_dlq))
+        .with_state(state)
+}
+
+async fn list_webhook_dlq(
+    axum::extract::State(state): axum::extract::State<WebhookDlqState>,
+) -> Result<Json<Vec<DlqEntry>>, AppError> {
+    state.dlq.list().map(Json).map_err(dlq_error)
+}
+
+async fn replay_webhook_dlq(
+    axum::extract::State(state): axum::extract::State<WebhookDlqState>,
+    axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+) -> Result<Json<ReplayOutcome>, AppError> {
+    state
+        .dlq
+        .replay(id, &state.registry, &state.client, &state.config)
+        .await
+        .map(Json)
+        .map_err(dlq_error)
+}
+
+fn dlq_error(error: WebhookError) -> AppError {
+    match error {
+        WebhookError::DlqEntryNotFound(_) | WebhookError::SubscriptionNotFound(_) => {
+            AppError::NotFound(error.to_string())
+        }
+        other => AppError::Internal(other.to_string()),
+    }
+}
+
 /// Quote a completed simulation, using the rent the node reported for it.
 ///
 /// The result still comes back with a `null` refund when the durability split is
@@ -194,6 +244,64 @@ mod tests {
             .await
             .expect("body reads");
         serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    fn dlq_state() -> WebhookDlqState {
+        WebhookDlqState {
+            dlq: WebhookDlq::in_memory().unwrap(),
+            registry: SubscriptionRegistry::default(),
+            client: reqwest::Client::new(),
+            config: WebhookConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn webhooks_dlq_endpoint_lists_failed_deliveries() {
+        let state = dlq_state();
+        let entry = DlqEntry {
+            id: uuid::Uuid::new_v4(),
+            subscription_id: uuid::Uuid::new_v4(),
+            event_id: uuid::Uuid::new_v4(),
+            target_url: "https://example.com/events".to_string(),
+            payload: serde_json::json!({"event": "transfer"}),
+            last_status: Some(503),
+            error: "HTTP 503 Service Unavailable".to_string(),
+            attempts: 5,
+            failed_at: chrono::Utc::now(),
+        };
+        state.dlq.insert(&entry).unwrap();
+
+        let response = webhook_dlq_routes(state)
+            .oneshot(
+                Request::get("/api/v1/webhooks/dlq")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_of(response).await;
+        assert_eq!(json[0]["id"], entry.id.to_string());
+        assert_eq!(json[0]["last_status"], 503);
+        assert_eq!(json[0]["attempts"], 5);
+    }
+
+    #[tokio::test]
+    async fn webhooks_dlq_replay_of_unknown_entry_is_not_found() {
+        let response = webhook_dlq_routes(dlq_state())
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/webhooks/dlq/{}/replay",
+                    uuid::Uuid::new_v4()
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

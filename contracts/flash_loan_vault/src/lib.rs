@@ -68,6 +68,8 @@ pub enum Error {
     BorrowPaused = 11,
     /// Receiver contract does not implement the FlashLoanReceiver interface.
     InvalidReceiver = 12,
+    /// Token is not supported by this vault.
+    UnsupportedToken = 13,
 }
 
 // Event types
@@ -103,6 +105,21 @@ pub struct FeeChangedEvent {
     pub new_fee_bps: i128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeesCollectedEvent {
+    pub admin: Address,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeExemptUpdatedEvent {
+    pub admin: Address,
+    pub account: Address,
+    pub exempt: bool,
+}
+
 // Storage keys
 
 #[contracttype]
@@ -122,6 +139,10 @@ pub enum DataKey {
     TotalDeposited,
     /// Temporary record of the last borrow for a borrower address.
     BorrowRecord(Address),
+    /// Accumulated flash loan fees claimable by the admin.
+    AccumulatedFees,
+    /// Fee-exempt addresses (e.g. internal protocol liquidators).
+    FeeExempt(Address),
 }
 
 // Flash loan receiver interface
@@ -146,10 +167,11 @@ pub trait FlashLoanReceiver {
 // Constants
 
 /// Maximum fee in basis points (1%).
-pub const MAX_FEE_BPS: i128 = 100;
+pub const MAX_FEE_BPS: u32 = 100;
 
-/// Default fee: 0 bps (free flash loans).
-pub const DEFAULT_FEE_BPS: i128 = 0;
+/// Default fee: 5 bps (0.05%).
+pub const DEFAULT_FEE_BPS: u32 = 5;
+pub const DEFAULT_FLASH_FEE_BPS: u32 = 5;
 
 // Helpers
 
@@ -175,11 +197,24 @@ fn load_token(e: &Env) -> Result<Address, Error> {
         .ok_or(Error::NotInitialized)
 }
 
-fn get_fee_bps(e: &Env) -> i128 {
+fn get_fee_bps(e: &Env) -> u32 {
     e.storage()
         .instance()
         .get(&DataKey::FeeBps)
         .unwrap_or(DEFAULT_FEE_BPS)
+}
+
+fn get_accumulated_fees(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get(&DataKey::AccumulatedFees)
+        .unwrap_or(0)
+}
+
+fn set_accumulated_fees(e: &Env, amount: i128) {
+    e.storage()
+        .instance()
+        .set(&DataKey::AccumulatedFees, &amount);
 }
 
 #[contracttype]
@@ -192,7 +227,7 @@ pub struct BorrowRecord {
 /// Helper: calculate fee for a given amount using configured bps.
 /// Uses ceiling division when fee_bps > 0 to prevent fee evasion on small amounts.
 fn calculate_fee(e: &Env, amount: i128) -> i128 {
-    let fee_bps = get_fee_bps(e);
+    let fee_bps = get_fee_bps(e) as i128;
     if fee_bps == 0 || amount <= 0 {
         0
     } else {
@@ -245,6 +280,13 @@ fn set_borrow_paused(e: &Env, paused: bool) {
     e.storage().instance().set(&DataKey::BorrowPaused, &paused);
 }
 
+fn is_fee_exempt_internal(e: &Env, account: &Address) -> bool {
+    e.storage()
+        .instance()
+        .get(&DataKey::FeeExempt(account.clone()))
+        .unwrap_or(false)
+}
+
 // Contract
 
 #[contract]
@@ -256,7 +298,7 @@ impl FlashLoanVault {
 
     /// Initialize the vault with an admin and the token to lend.
     ///
-    /// Can only be called once. Sets the fee to 0 bps by default.
+    /// Can only be called once. Sets the fee to DEFAULT_FEE_BPS (5 bps) by default.
     pub fn initialize(e: Env, admin: Address, token: Address) -> Result<(), Error> {
         if e.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -272,6 +314,7 @@ impl FlashLoanVault {
             .set(&DataKey::ReentrancyLock, &false);
         e.storage().instance().set(&DataKey::BorrowPaused, &false);
         e.storage().instance().set(&DataKey::TotalDeposited, &0i128);
+        e.storage().instance().set(&DataKey::AccumulatedFees, &0i128);
 
         Ok(())
     }
@@ -348,28 +391,98 @@ impl FlashLoanVault {
     }
 
     /// Admin-only: set the flash loan fee in basis points (0–100).
-    pub fn set_fee(e: Env, fee_bps: i128) -> Result<(), Error> {
+    pub fn set_flash_fee_bps(e: Env, flash_fee_bps: u32) -> Result<(), Error> {
         check_no_flash_loan_active(&e)?;
 
-        if !(0..=MAX_FEE_BPS).contains(&fee_bps) {
+        if flash_fee_bps > MAX_FEE_BPS {
             return Err(Error::InvalidFee);
         }
         let admin = load_admin(&e)?;
         admin.require_auth();
 
         let old_fee = get_fee_bps(&e);
-        e.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        e.storage().instance().set(&DataKey::FeeBps, &flash_fee_bps);
 
         e.events().publish(
             (Symbol::new(&e, "fee_changed"), admin.clone()),
             FeeChangedEvent {
                 admin,
-                old_fee_bps: old_fee,
-                new_fee_bps: fee_bps,
+                old_fee_bps: old_fee as i128,
+                new_fee_bps: flash_fee_bps as i128,
             },
         );
 
         Ok(())
+    }
+
+    /// Admin-only: set the flash loan fee in basis points (0–100). Alias for `set_flash_fee_bps`.
+    pub fn set_fee(e: Env, fee_bps: u32) -> Result<(), Error> {
+        Self::set_flash_fee_bps(e, fee_bps)
+    }
+
+    /// Admin-only: claim all accumulated flash loan fees and transfer them to the admin.
+    pub fn collect_fees(e: Env) -> Result<i128, Error> {
+        let admin = load_admin(&e)?;
+        Self::collect_fees_to(e, admin)
+    }
+
+    /// Admin-only: claim all accumulated flash loan fees and transfer them to `to`.
+    pub fn collect_fees_to(e: Env, to: Address) -> Result<i128, Error> {
+        check_no_flash_loan_active(&e)?;
+
+        let admin = load_admin(&e)?;
+        admin.require_auth();
+
+        let fees = get_accumulated_fees(&e);
+        if fees <= 0 {
+            return Ok(0);
+        }
+
+        let token_addr = load_token(&e)?;
+        soroban_sdk::token::Client::new(&e, &token_addr).transfer(
+            &e.current_contract_address(),
+            &to,
+            &fees,
+        );
+
+        set_accumulated_fees(&e, 0);
+
+        e.events().publish(
+            (Symbol::new(&e, "collect_fees"), admin),
+            FeesCollectedEvent {
+                admin: to,
+                amount: fees,
+            },
+        );
+
+        Ok(fees)
+    }
+
+    /// Admin-only: configure fee exemption for an address (e.g. internal protocol liquidators).
+    pub fn set_fee_exempt(e: Env, account: Address, exempt: bool) -> Result<(), Error> {
+        check_no_flash_loan_active(&e)?;
+        let admin = load_admin(&e)?;
+        admin.require_auth();
+
+        e.storage()
+            .instance()
+            .set(&DataKey::FeeExempt(account.clone()), &exempt);
+
+        e.events().publish(
+            (Symbol::new(&e, "fee_exempt_updated"), admin.clone()),
+            FeeExemptUpdatedEvent {
+                admin,
+                account,
+                exempt,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Check whether an address is exempt from flash loan fees.
+    pub fn is_fee_exempt(e: Env, account: Address) -> bool {
+        is_fee_exempt_internal(&e, &account)
     }
 
     /// Admin-only: pause or unpause flash loan operations.
@@ -452,11 +565,6 @@ impl FlashLoanVault {
         // 4. Auth: the initiator must have signed.
         initiator.require_auth();
 
-        // 4b. Verify receiver implements the flash loan callback interface.
-        if !receiver.is_contract() {
-            return Err(Error::InvalidReceiver);
-        }
-
         let token_addr = load_token(&e)?;
         let token = soroban_sdk::token::Client::new(&e, &token_addr);
 
@@ -466,8 +574,12 @@ impl FlashLoanVault {
             return Err(Error::InsufficientVaultBalance);
         }
 
-        // 6. Calculate fee using configured basis points with ceiling division.
-        let fee = calculate_fee(&e, amount);
+        // 6. Calculate fee using configured basis points with ceiling division (or 0 if exempt).
+        let fee = if is_fee_exempt_internal(&e, &initiator) || is_fee_exempt_internal(&e, &receiver) {
+            0
+        } else {
+            calculate_fee(&e, amount)
+        };
 
         // 7. Set reentrancy guard.
         set_flash_loan_active(&e, true);
@@ -488,7 +600,7 @@ impl FlashLoanVault {
         // 10. Verify repayment: after lending `amount`, the receiver must
         // return `amount + fee`, leaving the vault contract address with its original balance
         // plus the dynamically verified fee.
-        let expected_fee = calculate_fee(&e, amount);
+        let expected_fee = fee;
         let required_balance = pre_balance + expected_fee;
         let post_balance = token.balance(&e.current_contract_address());
         if post_balance < required_balance {
@@ -500,10 +612,10 @@ impl FlashLoanVault {
         // 11. Clear reentrancy guard.
         set_flash_loan_active(&e, false);
 
-        // 12. If fee was collected, update total deposited to reflect new capital.
+        // 12. If fee was collected, accumulate fees in the vault.
         if fee > 0 {
-            let deposited = get_total_deposited(&e);
-            set_total_deposited(&e, deposited + fee);
+            let accumulated = get_accumulated_fees(&e);
+            set_accumulated_fees(&e, accumulated + fee);
         }
 
         // 13. Emit event.
@@ -545,9 +657,6 @@ impl FlashLoanVault {
 
         // 3b. Auth & receiver validation.
         borrower.require_auth();
-        if !borrower.is_contract() {
-            return Err(Error::InvalidReceiver);
-        }
 
         let token_addr = load_token(&e)?;
         let token = soroban_sdk::token::Client::new(&e, &token_addr);
@@ -558,8 +667,12 @@ impl FlashLoanVault {
             return Err(Error::InsufficientVaultBalance);
         }
 
-        // 5. Calculate fee and total repayment.
-        let fee = calculate_fee(&e, amount);
+        // 5. Calculate fee and total repayment (or 0 if exempt).
+        let fee = if is_fee_exempt_internal(&e, &borrower) {
+            0
+        } else {
+            calculate_fee(&e, amount)
+        };
         let total_repayment = amount + fee;
 
         // 6. Effects: set reentrancy guard and store borrow record.
@@ -593,7 +706,7 @@ impl FlashLoanVault {
         }
 
         // 9. Verify repayment: vault balance must be >= pre_balance + expected_fee.
-        let expected_fee = calculate_fee(&e, amount);
+        let expected_fee = fee;
         let required_balance = pre_balance + expected_fee;
         let post_balance = token.balance(&e.current_contract_address());
         if post_balance < required_balance {
@@ -608,11 +721,21 @@ impl FlashLoanVault {
             return Err(Error::LoanNotRepaid);
         }
 
-        // ── Views ────────────────────────────────────────────────────────────────
+        // 10. Clear reentrancy guard and borrow record.
+        set_flash_loan_active(&e, false);
+        // Overwrite the temporary record with zeros to avoid stale data.
+        e.storage().instance().set(
+            &DataKey::BorrowRecord(borrower.clone()),
+            &BorrowRecord {
+                fee: 0,
+                total_repayment: 0,
+            },
+        );
 
-        /// Returns the current fee in basis points.
-        pub fn get_fee(e: Env) -> i128 {
-            get_fee_bps(&e)
+        // 11. If fee was collected, accumulate fees in the vault.
+        if fee > 0 {
+            let accumulated = get_accumulated_fees(&e);
+            set_accumulated_fees(&e, accumulated + fee);
         }
 
         // 12. Emit same event as flash_loan for observability.
@@ -626,16 +749,78 @@ impl FlashLoanVault {
             },
         );
 
-        /// Returns the token address this vault lends.
-        pub fn get_token(e: Env) -> Result<Address, Error> {
-            load_token(&e)
-        }
+        Ok(fee)
+    }
 
-    // Views
+    // ── Views ────────────────────────────────────────────────────────────────
 
-        /// Returns the total amount deposited by the admin.
-        pub fn get_total_deposited(e: Env) -> i128 {
-            get_total_deposited(&e)
+    /// Returns the current flash loan fee in basis points.
+    pub fn get_flash_fee_bps(e: Env) -> u32 {
+        get_fee_bps(&e)
+    }
+
+    /// Returns the current fee in basis points.
+    pub fn get_fee(e: Env) -> u32 {
+        get_fee_bps(&e)
+    }
+
+    /// Returns the amount of tokens available for flash loans.
+    pub fn get_available(e: Env) -> Result<i128, Error> {
+        let token_addr = load_token(&e)?;
+        let token = soroban_sdk::token::Client::new(&e, &token_addr);
+        Ok(token.balance(&e.current_contract_address()))
+    }
+
+    /// Returns the token address this vault lends.
+    pub fn get_token(e: Env) -> Result<Address, Error> {
+        load_token(&e)
+    }
+
+    /// Returns the vault admin.
+    pub fn get_admin(e: Env) -> Result<Address, Error> {
+        load_admin(&e)
+    }
+
+    /// Returns the total amount deposited by the admin.
+    pub fn get_total_deposited(e: Env) -> i128 {
+        get_total_deposited(&e)
+    }
+
+    /// Returns the accumulated fees claimable by the admin.
+    pub fn get_accumulated_fees(e: Env) -> i128 {
+        get_accumulated_fees(&e)
+    }
+
+    /// EIP-3156: The amount of currency available to be lent.
+    /// Returns 0 if borrow is paused or if the token is unsupported.
+    pub fn max_flash_loan(e: Env, token: Address) -> i128 {
+        if is_borrow_paused(&e) || EmergencyGuard::is_paused(e.clone(), PauseType::BORROW) {
+            return 0;
         }
+        match load_token(&e) {
+            Ok(vault_token) => {
+                if token != vault_token {
+                    0
+                } else {
+                    soroban_sdk::token::Client::new(&e, &vault_token)
+                        .balance(&e.current_contract_address())
+                }
+            }
+            Err(_) => 0,
+        }
+    }
+
+    /// EIP-3156: The fee to be charged for a given loan.
+    /// Reverts if token is unsupported or amount <= 0.
+    /// Uses ceiling rounding (amount * fee_bps + 9999) / 10000.
+    pub fn flash_fee(e: Env, token: Address, amount: i128) -> Result<i128, Error> {
+        let vault_token = load_token(&e)?;
+        if token != vault_token {
+            return Err(Error::UnsupportedToken);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        Ok(calculate_fee(&e, amount))
     }
 }

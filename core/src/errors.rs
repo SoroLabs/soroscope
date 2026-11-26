@@ -23,6 +23,15 @@ pub enum AppError {
 
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+
+    #[error("Payload too large: {0}")]
+    PayloadTooLarge(String),
+
+    #[error("Unprocessable entity: {0}")]
+    UnprocessableEntity(String),
+
+    #[error("Too many requests: {0}")]
+    TooManyRequests(String),
 }
 
 /// RFC 7807 "Problem Details for HTTP APIs" response body.
@@ -51,6 +60,9 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -60,6 +72,9 @@ impl AppError {
             Self::NotFound(_) => "not-found",
             Self::BadRequest(_) => "bad-request",
             Self::Unauthorized(_) => "unauthorized",
+            Self::PayloadTooLarge(_) => "payload-too-large",
+            Self::UnprocessableEntity(_) => "unprocessable-entity",
+            Self::TooManyRequests(_) => "too-many-requests",
         }
     }
 
@@ -69,6 +84,9 @@ impl AppError {
             Self::NotFound(_) => "Not Found",
             Self::BadRequest(_) => "Bad Request",
             Self::Unauthorized(_) => "Unauthorized",
+            Self::PayloadTooLarge(_) => "Payload Too Large",
+            Self::UnprocessableEntity(_) => "Unprocessable Entity",
+            Self::TooManyRequests(_) => "Too Many Requests",
         }
     }
 }
@@ -152,6 +170,29 @@ impl From<SimulationError> for AppError {
             SimulationError::ConsensusMismatch(msg) => {
                 AppError::Internal(format!("Consensus mismatch: {}", msg))
             }
+            SimulationError::TimeoutExceeded {
+                timeout_ms,
+                partial,
+            } => AppError::Internal(format!(
+                "Simulation exceeded the {timeout_ms}ms timeout \
+                 (partial budget: {} cpu instructions, {} memory bytes)",
+                partial.cpu_instructions, partial.memory_bytes
+            )),
+        }
+    }
+}
+
+/// Map upload validation failures to 413 (too large) or 422 (not a valid
+/// Soroban WASM module).
+impl From<crate::parser::UploadValidationError> for AppError {
+    fn from(err: crate::parser::UploadValidationError) -> Self {
+        use crate::parser::UploadValidationError;
+        match err {
+            UploadValidationError::TooLarge { .. } => AppError::PayloadTooLarge(err.to_string()),
+            UploadValidationError::InvalidHeader
+            | UploadValidationError::CustomSectionTooLarge { .. }
+            | UploadValidationError::Malformed(_) => AppError::UnprocessableEntity(err.to_string()),
+            UploadValidationError::ReadFailed(_) => AppError::BadRequest(err.to_string()),
         }
     }
 }

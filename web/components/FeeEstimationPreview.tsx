@@ -10,12 +10,15 @@ interface FeeEstimationPreviewProps {
   costStroops?: number;
   loading?: boolean;
   onFeeBumpChange?: (level: string, feeStroops: number) => void;
+  /** Projected ledger rent (TTL) fee in stroops, from the TTL rent calculator. */
+  ttlRentStroops?: number;
 }
 
 export function FeeEstimationPreview({
   costStroops = 0,
   loading = false,
   onFeeBumpChange,
+  ttlRentStroops = 0,
 }: FeeEstimationPreviewProps) {
   const { network } = useNetwork();
   const [feeEstimate, setFeeEstimate] = useState<FeeEstimate | null>(null);
@@ -59,6 +62,8 @@ export function FeeEstimationPreview({
 
   const isBusy = loading || fetching;
   const hasFees = feeEstimate && feeEstimate.totalFeeStroops > 0;
+  const hasTtlRent = ttlRentStroops > 0;
+  const grandTotalStroops = (feeEstimate?.totalFeeStroops ?? 0) + ttlRentStroops;
 
   return (
     <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 font-mono">
@@ -82,7 +87,7 @@ export function FeeEstimationPreview({
         </div>
       ) : hasFees ? (
         <div className="space-y-4">
-          <div className="grid grid-cols-3 gap-3">
+          <div className={`grid gap-3 ${hasTtlRent ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-3'}`}>
             <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-3 text-center">
               <div className="flex items-center justify-center gap-1 text-[10px] text-slate-500 uppercase mb-1">
                 <Zap className="h-3 w-3" />
@@ -107,16 +112,30 @@ export function FeeEstimationPreview({
                 {feeEstimate.classicFeeStroops.toLocaleString()} stroops
               </div>
             </div>
+            {hasTtlRent && (
+              <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-3 text-center">
+                <div className="flex items-center justify-center gap-1 text-[10px] text-slate-500 uppercase mb-1">
+                  <Fuel className="h-3 w-3" />
+                  TTL Rent
+                </div>
+                <div className="text-sm font-bold text-violet-400">
+                  {stroopsToXlm(ttlRentStroops)} XLM
+                </div>
+                <div className="text-[9px] text-slate-500 mt-0.5">
+                  {ttlRentStroops.toLocaleString()} stroops
+                </div>
+              </div>
+            )}
             <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-3 text-center">
               <div className="flex items-center justify-center gap-1 text-[10px] text-slate-500 uppercase mb-1">
                 <DollarSign className="h-3 w-3" />
                 Total
               </div>
               <div className="text-sm font-bold text-emerald-400">
-                {feeEstimate.totalFeeXlm} XLM
+                {stroopsToXlm(grandTotalStroops)} XLM
               </div>
               <div className="text-[9px] text-slate-500 mt-0.5">
-                {feeEstimate.totalFeeStroops.toLocaleString()} stroops
+                {grandTotalStroops.toLocaleString()} stroops
               </div>
             </div>
           </div>
@@ -164,7 +183,14 @@ export function FeeEstimationPreview({
 
           <div className="border-t border-slate-800 pt-3">
             <div className="flex items-center justify-between text-[10px] text-slate-500">
-              <span>Surge multiplier: {feeEstimate.surgeMultiplier}x</span>
+              <span>
+                Surge multiplier: {feeEstimate.surgeMultiplier}x
+                {hasTtlRent && (
+                  <span className="ml-2 text-violet-400">
+                    incl. {ttlRentStroops.toLocaleString()} stroops TTL rent
+                  </span>
+                )}
+              </span>
               <button
                 type="button"
                 onClick={loadFeeEstimate}
@@ -182,6 +208,11 @@ export function FeeEstimationPreview({
           <p className="text-xs text-slate-500">
             Run a simulation to see network fee estimates
           </p>
+          {hasTtlRent && (
+            <p className="text-[10px] text-violet-400 mt-2">
+              Projected TTL rent: {stroopsToXlm(ttlRentStroops)} XLM ({ttlRentStroops.toLocaleString()} stroops)
+            </p>
+          )}
         </div>
       )}
     </div>

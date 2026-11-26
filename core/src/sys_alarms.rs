@@ -490,6 +490,60 @@ impl SysAlarmMonitor {
     }
 }
 
+/// JSON payload for a fee-spike alert.
+#[derive(Debug, Clone, Serialize)]
+pub struct FeeSpikeAlert {
+    pub event: &'static str,
+    pub current_fee: u64,
+    pub spike_threshold: u64,
+    pub ledger: u32,
+}
+
+/// Pure check: true when `current_fee` meets or exceeds the threshold.
+pub fn is_fee_spike(current_fee: u64, spike_threshold: u64) -> bool {
+    current_fee >= spike_threshold
+}
+
+/// Evaluate a fee sample for the cron job. Returns `Some(alert)` when the
+/// fee spikes at or above `spike_threshold`.
+pub fn check_fee_spike(current_fee: u64, spike_threshold: u64, ledger: u32) -> Option<FeeSpikeAlert> {
+    if is_fee_spike(current_fee, spike_threshold) {
+        Some(FeeSpikeAlert {
+            event: "fee_spike",
+            current_fee,
+            spike_threshold,
+            ledger,
+        })
+    } else {
+        None
+    }
+}
+
+/// Dispatch a fee-spike alert to `webhook_url` via POST. Log-only when the
+/// URL is unset; never panics.
+pub async fn dispatch_fee_spike_webhook(
+    client: &Client,
+    webhook_url: Option<&str>,
+    alert: &FeeSpikeAlert,
+) {
+    let Some(url) = webhook_url else {
+        warn!(?alert, "Fee spike detected (no webhook configured)");
+        return;
+    };
+    match client.post(url).json(alert).send().await {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            warn!(
+                status = response.status().as_u16(),
+                url, "Fee-spike webhook returned non-success status"
+            );
+        }
+        Err(err) => {
+            warn!(error = %err, url, "Failed to POST fee-spike webhook");
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(deprecated)] // `std::env::set_var`/`remove_var` are deprecated in 1.74+; tests serialise via ENV_LOCK.
 mod tests {

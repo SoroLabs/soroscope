@@ -1,6 +1,7 @@
 "use client";
 
 import { useWallet } from "../context/WalletContext";
+import { useRouter } from "next/router";
 import { motion, AnimatePresence } from "framer-motion";
 import { useState, useRef, useEffect } from "react";
 import { LogOut } from "lucide-react";
@@ -23,6 +24,7 @@ const ArrowDownIcon = () => (
 
 export function ConnectButton() {
   const { isConnected, address, openModal, disconnect } = useWallet();
+  const router = useRouter();
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -34,6 +36,11 @@ export function ConnectButton() {
   const handleDisconnect = async () => {
     await disconnect();
     setDropdownOpen(false);
+    // Wallet state (address, balances) is cleared in the WalletContext.
+    // Leave wallet-gated pages so stale address-scoped UI never renders.
+    if (router.pathname !== "/") {
+      await router.push("/");
+    }
   };
 
   // Close dropdown when clicking outside
@@ -120,3 +127,64 @@ export function ConnectButton() {
     </motion.button>
   );
 }
+const handleDisconnect = async () => {
+  setDropdownOpen(false);
+
+  try {
+    await disconnect();
+
+    const walletRequiredRoutes = [
+      // Add the actual wallet-protected routes in this repository.
+    ];
+
+    const requiresWallet = walletRequiredRoutes.some(
+      (route) => pathname === route || pathname.startsWith(`${route}/`),
+    );
+
+    if (requiresWallet) {
+      router.replace("/");
+    }
+  } catch (error) {
+    console.error("Failed to disconnect wallet:", error);
+  }
+};const resetWalletSession = useCallback(() => {
+  balanceReqRef.current?.abort();
+  balanceReqRef.current = null;
+
+  setAddress(null);
+  setSelectedWalletId(null);
+  setIsConnecting(false);
+  setError(null);
+
+  setBalances([]);
+  setBalancesLoading(false);
+  setBalancesError(null);
+
+  try {
+    localStorage.removeItem("inheritx_wallet_address");
+    localStorage.removeItem("inheritx_wallet_id");
+  } catch (error) {
+    console.warn("Failed to clear persisted wallet state:", error);
+  }
+}, []);
+
+const resetWalletSession = useCallback(() => {
+  balanceReqRef.current?.abort();
+  balanceReqRef.current = null;
+
+  setAddress(null);
+  setSelectedWalletId(null);
+  setIsConnecting(false);
+  setError(null);
+
+  setBalances([]);
+  setBalancesLoading(false);
+  setBalancesError(null);
+
+  try {
+    localStorage.removeItem("inheritx_wallet_address");
+    localStorage.removeItem("inheritx_wallet_id");
+  } catch (error) {
+    console.warn("Failed to clear persisted wallet state:", error);
+  }
+}, []);

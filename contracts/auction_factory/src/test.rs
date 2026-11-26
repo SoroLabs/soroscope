@@ -292,7 +292,7 @@ fn test_old_admin_cannot_approve_multi_sig_after_rotation() {
     let extra_admin = Address::generate(&env);
     let bad_approvers = vec![&env, old_admin.clone(), admins.get(1).unwrap()];
     let result = client.try_add_admin(&bad_approvers, &extra_admin);
-    assert_eq!(result, Err(Ok(GuardError::InsufficientSignatures)));
+    assert_eq!(result, Err(Ok(GuardError::Unauthorized)));
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn test_old_admin_cannot_be_sole_approver_for_rotate_admin() {
     let another_new = Address::generate(&env);
     let bad_approvers = vec![&env, old_admin.clone()];
     let result = client.try_rotate_admin(&bad_approvers, &admins.get(1).unwrap(), &another_new);
-    assert_eq!(result, Err(Ok(GuardError::InsufficientSignatures)));
+    assert_eq!(result, Err(Ok(GuardError::Unauthorized)));
 }
 
 // ── edge case: rotating to the same admin ────────────────────────────────────
@@ -420,7 +420,7 @@ fn test_rotate_admin_fails_with_non_admin_approvers() {
     let outsider2 = Address::generate(&env);
     let approvers = vec![&env, outsider1, outsider2];
     let result = client.try_rotate_admin(&approvers, &old_admin, &new_admin);
-    assert_eq!(result, Err(Ok(GuardError::InsufficientSignatures)));
+    assert_eq!(result, Err(Ok(GuardError::Unauthorized)));
 }
 
 // ── full rotation cycle ──────────────────────────────────────────────────────
@@ -485,4 +485,173 @@ fn test_rotate_admin_then_new_admin_can_rotate_again() {
     assert!(client.is_admin(&next_admin));
     assert!(!client.is_admin(&admins.get(0).unwrap()));
     assert!(!client.is_admin(&admins.get(1).unwrap()));
+}
+
+// ── deterministic deployment / creator registry / pagination ────────────────
+
+fn setup_with_fee(amount: i128) -> (Env, AuctionFactoryClient<'static>, Address, Address) {
+    let (env, client, admins) = setup(1, 1);
+    let seller = Address::generate(&env);
+    let fee_recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let fee_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    token::StellarAssetClient::new(&env, &fee_token).mint(&seller, &amount);
+    client.configure_deployment_fee(&admins, &fee_token, &fee_recipient, &50);
+
+    (env, client, seller, fee_token)
+}
+
+fn create_english(
+    env: &Env,
+    client: &AuctionFactoryClient<'static>,
+    seller: &Address,
+    nft_contract: &Address,
+    token_id: i128,
+    payment_token: &Address,
+) -> Address {
+    token::StellarAssetClient::new(env, nft_contract).mint(seller, &token_id);
+    client.create_english_auction(
+        seller,
+        nft_contract,
+        &token_id,
+        payment_token,
+        &100,
+        &200,
+        &10,
+        &english_wasm_hash(env),
+    )
+}
+
+#[test]
+fn test_deterministic_nonce_salt_and_creator_registry() {
+    let (env, client, seller, payment_token) = setup_with_fee(200);
+    let nft = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+
+    let first = create_english(&env, &client, &seller, &nft, 1, &payment_token);
+    let second = create_english(&env, &client, &seller, &nft, 2, &payment_token);
+
+    assert_ne!(first, second);
+    assert_eq!(client.get_creator_nonce(&seller), 2);
+    assert_eq!(client.get_creator_auction_count(&seller), 2);
+    assert_eq!(
+        client.get_auction_by_creator(&seller, &0),
+        Some(first.clone())
+    );
+    assert_eq!(
+        client.get_auction_by_creator(&seller, &1),
+        Some(second.clone())
+    );
+    assert_eq!(client.get_auction_creator(&first), Some(seller.clone()));
+    assert_eq!(client.get_auction_creator(&second), Some(seller.clone()));
+    assert_eq!(
+        client.get_auctions_by_creator(&seller, &0, &10),
+        vec![&env, first, second]
+    );
+}
+
+#[test]
+fn test_paginated_queries_are_bounded() {
+    let (env, client, seller, payment_token) = setup_with_fee(200);
+    let nft = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+
+    let mut addresses = soroban_sdk::Vec::new(&env);
+    for id in 1..=4 {
+        addresses.push_back(create_english(
+            &env,
+            &client,
+            &seller,
+            &nft,
+            id,
+            &payment_token,
+        ));
+    }
+
+    assert_eq!(client.get_auction_count(), 4);
+    assert_eq!(
+        client.get_auctions(&0, &2),
+        vec![&env, addresses.get(0).unwrap(), addresses.get(1).unwrap()]
+    );
+    assert_eq!(
+        client.get_auctions(&2, &10),
+        vec![&env, addresses.get(2).unwrap(), addresses.get(3).unwrap()]
+    );
+    assert_eq!(client.get_auctions(&0, &1000).len(), 4);
+    assert_eq!(client.get_auctions(&4, &10).len(), 0);
+    assert_eq!(client.get_auctions(&99, &10).len(), 0);
+    assert_eq!(
+        client.get_auctions_by_creator(&seller, &2, &10),
+        vec![&env, addresses.get(2).unwrap(), addresses.get(3).unwrap()]
+    );
+}
+
+#[test]
+fn test_creator_filtering_returns_only_owned_auctions() {
+    let (env, client, seller_a, payment_token) = setup_with_fee(100);
+    let seller_b = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &payment_token).mint(&seller_b, &100);
+
+    let nft = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+
+    let auction_a = create_english(&env, &client, &seller_a, &nft, 1, &payment_token);
+    let auction_b = create_english(&env, &client, &seller_b, &nft, 2, &payment_token);
+
+    assert_eq!(
+        client.get_auctions_by_creator(&seller_a, &0, &10),
+        vec![&env, auction_a.clone()]
+    );
+    assert_eq!(
+        client.get_auctions_by_creator(&seller_b, &0, &10),
+        vec![&env, auction_b.clone()]
+    );
+    assert_eq!(
+        client.get_auctions(&0, &10),
+        vec![&env, auction_a, auction_b]
+    );
+}
+
+#[test]
+fn test_paused_factory_blocks_new_deployments_only() {
+    let (env, client, seller, payment_token) = setup_with_fee(100);
+    let nft = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let live = create_english(&env, &client, &seller, &nft, 1, &payment_token);
+
+    let admins = client.get_admins();
+    assert!(!client.is_creation_paused());
+    client.set_creation_paused(&admins, &true);
+    assert!(client.is_creation_paused());
+
+    assert_eq!(
+        client.try_create_english_auction(
+            &seller,
+            &nft,
+            &2,
+            &payment_token,
+            &100,
+            &200,
+            &10,
+            &english_wasm_hash(&env),
+        ),
+        Err(Ok(FactoryError::Paused))
+    );
+
+    // Live auctions remain fully queryable while new deployments are paused.
+    assert_eq!(client.get_auction_type(&live), Some(AuctionType::English));
+    assert_eq!(client.get_auctions(&0, &10).len(), 1);
+    assert_eq!(client.get_creator_auction_count(&seller), 1);
+
+    client.set_creation_paused(&admins, &false);
+    let resumed = create_english(&env, &client, &seller, &nft, 2, &payment_token);
+    assert_eq!(client.get_auction_count(), 2);
+    assert!(resumed != live);
 }

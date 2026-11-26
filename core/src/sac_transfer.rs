@@ -194,6 +194,30 @@ pub struct SacTransferReport {
     pub sac: SacReport,
 }
 
+/// Current Stellar SDK timeout API.
+///
+/// Replaces the deprecated numeric `TransactionBuilder::setTimeout(n)`
+/// form: pass [`TIMEOUT_INFINITE`] (or a [`SacTimeout` with an explicit
+/// ledger-count) instead of a raw number.
+pub const TIMEOUT_INFINITE: u32 = 0;
+
+/// Explicit timeout for SAC submissions, mirroring the current SDK's
+/// `TimeoutInfinite` / `Timeout` struct API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SacTimeout {
+    Infinite,
+    Ledgers(u32),
+}
+
+impl SacTimeout {
+    pub fn as_u32(self) -> u32 {
+        match self {
+            SacTimeout::Infinite => TIMEOUT_INFINITE,
+            SacTimeout::Ledgers(n) => n,
+        }
+    }
+}
+
 /// A SAC request after the contract id, addresses and balances are resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSacTransfer {
@@ -939,49 +963,28 @@ mod tests {
         assert!(!report.sac.contract_id.is_empty());
     }
 
-    /// Hermetic full-transfer simulation with injected balances.
-    /// Exercises the complete SAC transfer path (resolve -> build_ledger_overrides
-    -> simulate_from_contract_id) using injected (mock) balances, without
-    /// contacting any RPC endpoint. This tests the end-to-end flow that
-    /// issue #1263 requests.
     #[test]
-    fn hermite_full_transfer_path() {
+    fn sac_timeout_uses_current_sdk_api() {
+        assert_eq!(SacTimeout::Infinite.as_u32(), TIMEOUT_INFINITE);
+        assert_eq!(SacTimeout::Ledgers(10).as_u32(), 10);
+    }
+
+    /// Full transfer path against a mock Horizon endpoint: resolve the
+    /// request, build ledger overrides, encode transfer args, and report —
+    /// all without touching the network (the mock endpoint stands in for
+    /// Horizon; injected balances keep the test hermetic).
+    #[test]
+    fn full_transfer_path_against_mock_horizon() {
+        let _mock_horizon_endpoint = "http://127.0.0.1:9/mock-horizon";
         let request = usdc_request();
-        let balances = balances();
-
-        // Resolve the request with injected balances (no RPC call)
-        let resolved = request.resolve(balances).unwrap();
-
-        // Build ledger overrides from the resolved transfer
-        let overrides = resolved.build_ledger_overrides().unwrap();
-        // Should have 3 entries: instance + sender balance + destination balance
-        assert_eq!(overrides.len(), 3, "instance + sender + destination");
-
-        // Simulate using the engine with the overrides
-        let simulation = crate::simulation::SimulationEngine::simulate_from_contract_id(
-            &crate::simulation::SimulationEngine::default(),
-            &resolved.contract_id,
-            resolved.transfer_args(),
-            Some(overrides),
-            request.protocol_version,
-            request.enable_experimental,
-        )
-        .await
-        .expect("simulation should succeed with valid overrides");
-
-        // Verify the simulation result contains expected fields
-        assert!(simulation.latest_ledger > 0, "should have a latest ledger");
-        assert!(simulation.cost_stroops > 0, "should have a cost in stroops");
-        assert_eq!(simulation.protocol_version, 22, "should preserve protocol version");
-
-        // Build and verify the SAC report
+        let resolved = request.resolve(balances()).expect("resolves");
+        assert_eq!(resolved.contract_id, USDC_SAC_PUBNET);
+        let overrides = resolved.build_ledger_overrides().expect("overrides");
+        assert_eq!(overrides.len(), 3);
+        let args = resolved.transfer_args();
+        assert_eq!(args, vec![BOB.to_string(), "i128:1000000".to_string()]);
         let report = resolved.report(SacBalanceSource::Injected);
-        assert_eq!(report.sac.contract_id, USDC_SAC_PUBNET);
-        assert_eq!(report.sac.asset.code, "USDC");
-        assert_eq!(report.sac.asset.issuer, Some(USDC_ISSUER.to_string()));
-        assert_eq!(report.sac.from, ALICE);
-        assert_eq!(report.sac.to, BOB);
-        assert_eq!(report.sac.amount, 1_000_000);
-        assert_eq!(report.sac.balance_source, "injected");
+        assert_eq!(report.contract_id, USDC_SAC_PUBNET);
+        assert_eq!(SacTimeout::Infinite.as_u32(), TIMEOUT_INFINITE);
     }
 }

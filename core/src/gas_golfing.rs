@@ -4,6 +4,11 @@ use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GasGolfingSuggestion {
+    /// Stable identifier, unique within a report. Derived from the rule and
+    /// location so clients can key rows on it across re-sorts and re-fetches
+    /// (#1285). Defaults to empty when deserializing older payloads.
+    #[serde(default)]
+    pub id: String,
     pub pattern_type: String,
     pub description: String,
     /// `export_name#+instruction_offset`, or `func#<index>#+<offset>` when the
@@ -26,6 +31,27 @@ pub struct GasGolfingReport {
 }
 
 pub struct GasGolfingAnalyzer;
+
+/// Give every suggestion an id that is unique within the report and stable
+/// across runs on the same WASM: `<pattern_type>@<location>`, with a `#n`
+/// suffix when the same rule fires more than once at the same location.
+fn assign_suggestion_ids(suggestions: &mut [GasGolfingSuggestion]) {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for suggestion in suggestions.iter_mut() {
+        let base = format!(
+            "{}@{}",
+            suggestion.pattern_type,
+            suggestion.location.as_deref().unwrap_or("module")
+        );
+        let count = seen.entry(base.clone()).or_insert(0);
+        *count += 1;
+        suggestion.id = if *count == 1 {
+            base
+        } else {
+            format!("{base}#{count}")
+        };
+    }
+}
 
 impl Default for GasGolfingAnalyzer {
     fn default() -> Self {
@@ -56,7 +82,8 @@ impl GasGolfingAnalyzer {
             }
             Err(err) => {
                 suggestions.push(GasGolfingSuggestion {
-                    pattern_type: "parse_error".to_string(),
+                    id: String::new(),
+pattern_type: "parse_error".to_string(),
                     description: format!(
                         "input is not a valid WASM module, so no pattern rules were run: {err}"
                     ),
@@ -71,6 +98,8 @@ impl GasGolfingAnalyzer {
                 });
             }
         }
+
+        assign_suggestion_ids(&mut suggestions);
 
         // Build summary
         for suggestion in &suggestions {
@@ -188,7 +217,8 @@ impl GasGolfingAnalyzer {
                     detail.push_str(&format!(" (nested at depth {})", span.depth));
                 }
                 suggestions.push(GasGolfingSuggestion {
-                    pattern_type: "loop_optimization".to_string(),
+                    id: String::new(),
+pattern_type: "loop_optimization".to_string(),
                     description: detail,
                     location: Some(function.location(span.op_index)),
                     severity: if host_calls + indirect_calls >= 2 { "high" } else { "medium" }.to_string(),
@@ -235,7 +265,8 @@ impl GasGolfingAnalyzer {
 
         if grow_count > GROW_THRESHOLD {
             suggestions.push(GasGolfingSuggestion {
-                pattern_type: "memory_allocation".to_string(),
+                id: String::new(),
+pattern_type: "memory_allocation".to_string(),
                 description: format!(
                     "High memory.grow call count ({}) — repeated heap expansion is expensive",
                     grow_count
@@ -295,7 +326,8 @@ impl GasGolfingAnalyzer {
 
         if div_count > DIV_THRESHOLD {
             suggestions.push(GasGolfingSuggestion {
-                pattern_type: "arithmetic_optimization".to_string(),
+                id: String::new(),
+pattern_type: "arithmetic_optimization".to_string(),
                 description: format!(
                     "Frequent integer division/remainder operations ({}) — division is far more \
                      expensive than bitwise operations",
@@ -314,7 +346,8 @@ impl GasGolfingAnalyzer {
 
         if let Some(site) = mul_const_site {
             suggestions.push(GasGolfingSuggestion {
-                pattern_type: "multiplication_optimization".to_string(),
+                id: String::new(),
+pattern_type: "multiplication_optimization".to_string(),
                 description: format!("Multiplication by a power-of-two constant at {site}", site = site),
                 location: Some(site),
                 severity: "low".to_string(),
@@ -353,7 +386,8 @@ impl GasGolfingAnalyzer {
 
         if storage_calls > STORAGE_THRESHOLD {
             suggestions.push(GasGolfingSuggestion {
-                pattern_type: "storage_batching".to_string(),
+                id: String::new(),
+pattern_type: "storage_batching".to_string(),
                 description: format!(
                     "High ledger access count ({}) — storage reads/writes could be batched",
                     storage_calls
@@ -397,7 +431,8 @@ impl GasGolfingAnalyzer {
 
         if if_count > IF_THRESHOLD {
             suggestions.push(GasGolfingSuggestion {
-                pattern_type: "branch_optimization".to_string(),
+                id: String::new(),
+pattern_type: "branch_optimization".to_string(),
                 description: format!(
                     "Complex conditional logic: {} `if` instructions — consider a lookup table or \
                      early returns",
@@ -825,5 +860,63 @@ mod tests {
         ] {
             assert!(json.contains(field), "missing {field} in {json}");
         }
+    }
+
+    fn suggestion(pattern_type: &str, location: Option<&str>) -> GasGolfingSuggestion {
+        GasGolfingSuggestion {
+            id: String::new(),
+            pattern_type: pattern_type.to_string(),
+            description: String::new(),
+            location: location.map(str::to_string),
+            severity: "low".to_string(),
+            gas_saved_estimate: None,
+            suggested_fix: String::new(),
+            code_example: None,
+        }
+    }
+
+    /// #1285: clients key table rows on `id`, so it must be unique per report.
+    #[test]
+    fn suggestion_ids_are_unique_within_a_report() {
+        let mut suggestions = vec![
+            suggestion("loop_optimization", Some("run#+3")),
+            suggestion("loop_optimization", Some("run#+3")),
+            suggestion("loop_optimization", Some("run#+9")),
+            suggestion("parse_error", None),
+        ];
+        assign_suggestion_ids(&mut suggestions);
+
+        let ids: Vec<&str> = suggestions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "loop_optimization@run#+3",
+                "loop_optimization@run#+3#2",
+                "loop_optimization@run#+9",
+                "parse_error@module",
+            ]
+        );
+    }
+
+    #[test]
+    fn analyzer_assigns_stable_ids_to_every_suggestion() {
+        let wasm = b"not wasm";
+        let first = GasGolfingAnalyzer::new().analyze_wasm(wasm, "ids");
+        let second = GasGolfingAnalyzer::new().analyze_wasm(wasm, "ids");
+
+        assert!(!first.suggestions.is_empty());
+        for (a, b) in first.suggestions.iter().zip(&second.suggestions) {
+            assert!(!a.id.is_empty(), "suggestion {} has no id", a.pattern_type);
+            assert_eq!(a.id, b.id, "ids must be stable across runs");
+        }
+        let json = serde_json::to_string(&first).expect("report serialises");
+        assert!(json.contains("\"id\""), "id missing from {json}");
+    }
+
+    #[test]
+    fn suggestion_without_id_still_deserialises() {
+        let json = r#"{"pattern_type":"x","description":"d","location":null,"severity":"low","gas_saved_estimate":null,"suggested_fix":"f","code_example":null}"#;
+        let parsed: GasGolfingSuggestion = serde_json::from_str(json).expect("legacy payload");
+        assert_eq!(parsed.id, "");
     }
 }

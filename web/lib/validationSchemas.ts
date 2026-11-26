@@ -91,3 +91,26 @@ export function validateField(sorobanType: SorobanType, value: unknown): { succe
   const message = result.error.issues[0]?.message ?? 'Invalid value';
   return { success: false, error: message };
 }
+
+/**
+ * Validates a custom RPC URL before it is saved to localStorage.
+ *
+ * The URL must be non-empty, start with `https://`, and be parseable by
+ * `new URL()`. Returns `{ valid: true }` or `{ valid: false, error }` where
+ * `error` is shown inline in red under the RPC field.
+ */
+export function validateRpcUrl(value: unknown): { valid: boolean; error?: string } {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (raw === '') {
+    return { valid: false, error: 'RPC URL is required' };
+  }
+  if (!raw.startsWith('https://')) {
+    return { valid: false, error: 'RPC URL must start with https://' };
+  }
+  try {
+    new URL(raw);
+  } catch {
+    return { valid: false, error: 'RPC URL is not a valid URL' };
+  }
+  return { valid: true };
+}

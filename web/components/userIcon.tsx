@@ -18,6 +18,19 @@ const UserIcon = () => (
       fill="currentColor"
     />
   </svg>
+  
+-      <img
++      <img
+         src={avatarUrl}
++        onError={(event) => {
++          // Gravatar can return 404 when an email has no registered avatar.
++          // Switch to a local asset and remove the handler to avoid retry loops.
++          event.currentTarget.onerror = null;
++          event.currentTarget.src = "/default-avatar.svg";
++        }}
+         alt={alt}
+         className={className}
+       />
 );
 
 export default UserIcon;

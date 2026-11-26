@@ -218,13 +218,15 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
     openModal,
     closeModal,
     isModalOpen,
-    supportedWallets,
+    supportedWallets: SUPPORTED_WALLETS,
+    networkName: network.name,
+    selectedWalletName: SUPPORTED_WALLETS.find((w) => w.id === selectedWalletId)?.name ?? null,
     error,
     balances,
     balancesLoading,
     balancesError,
     refreshBalances,
-  }), [address, isConnecting, selectedWalletId, isModalOpen, error, balances, balancesLoading, balancesError, refreshBalances]);
+  }), [address, isConnecting, selectedWalletId, isModalOpen, error, balances, balancesLoading, balancesError, refreshBalances, network.name]);
 
   return (
     <WalletContext.Provider value={contextValue}>
