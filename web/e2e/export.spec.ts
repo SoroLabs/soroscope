@@ -1,19 +1,21 @@
 import { test, expect } from '@playwright/test';
+import { MINIMAL_WASM, mockBackend } from './support/mockBackend';
 
 test('Export report as file', async ({ page }) => {
+  await mockBackend(page);
   await page.goto('/');
 
-  // Upload and simulate to get to export step
+  // Uploading a contract runs the simulation and shows the result.
   await page.setInputFiles('input[type="file"]', {
     name: 'module.wasm',
     mimeType: 'application/wasm',
-    buffer: Buffer.from('0061736d01000000', 'hex'),
+    buffer: MINIMAL_WASM,
   });
-  await page.getByRole('button', { name: /simulate|run/i }).click();
+  const exportButton = page.getByRole('button', { name: 'Export Report' });
+  await expect(exportButton).toBeVisible();
 
-  // Click export button and wait for download
-  const downloadPromise = page.waitEvent('download');
-  await page.getByRole('button', { name: /export|download/i }).click();
+  const downloadPromise = page.waitForEvent('download');
+  await exportButton.click();
   const download = await downloadPromise;
-  expect(download.suggestedFilename()).contain('report');
+  expect(download.suggestedFilename()).toContain('report');
 });

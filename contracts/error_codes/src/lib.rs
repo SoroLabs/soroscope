@@ -42,6 +42,20 @@ pub enum ContractError {
     DivisionByZero = 16,
     InvalidInput = 17,
     InvalidAmount = 18,
+
+    // ── Staking ──────────────────────────────────────────────────────────────
+    WithdrawExceedsSurplus = 19,
+
+    // ── Rate-limiting / velocity ──────────────────────────────────────────────
+    /// Payout velocity guard rejected the transaction (epoch cap, min spacing,
+    /// or rolling-window cap exceeded).
+    RateLimited = 20,
+    /// Contract pool has insufficient funds to honour a payout.
+    InsufficientFunds = 21,
+    /// Loss exceeds total receipt supply (backstop contracts).
+    LossExceedsSupply = 22,
+    /// Grant has not been approved for this recipient.
+    GrantNotApproved = 23,
 }
 
 impl ContractError {
@@ -71,6 +85,11 @@ impl ContractError {
             16 => Some(Self::DivisionByZero),
             17 => Some(Self::InvalidInput),
             18 => Some(Self::InvalidAmount),
+            19 => Some(Self::WithdrawExceedsSurplus),
+            20 => Some(Self::RateLimited),
+            21 => Some(Self::InsufficientFunds),
+            22 => Some(Self::LossExceedsSupply),
+            23 => Some(Self::GrantNotApproved),
             _ => None,
         }
     }
@@ -100,7 +119,12 @@ pub const ERROR_SCHEMA_JSON: &str = r#"{
     { "name": "Overflow", "code": 15, "description": "Arithmetic overflow occurred." },
     { "name": "DivisionByZero", "code": 16, "description": "Attempted division by zero." },
     { "name": "InvalidInput", "code": 17, "description": "Input argument provided is invalid." },
-    { "name": "InvalidAmount", "code": 18, "description": "Amount is invalid, negative, or below the minimum required." }
+    { "name": "InvalidAmount", "code": 18, "description": "Amount is invalid, negative, or below the minimum required." },
+    { "name": "WithdrawExceedsSurplus", "code": 19, "description": "Admin withdraw amount exceeds surplus reward tokens." },
+    { "name": "RateLimited", "code": 20, "description": "Payout velocity guard rejected the transaction." },
+    { "name": "InsufficientFunds", "code": 21, "description": "Contract pool has insufficient funds to honour a payout." },
+    { "name": "LossExceedsSupply", "code": 22, "description": "Requested loss exceeds total receipt supply." },
+    { "name": "GrantNotApproved", "code": 23, "description": "Grant has not been approved for this recipient." }
   ]
 }"#;
 
@@ -128,16 +152,21 @@ mod test {
         assert_eq!(ContractError::DivisionByZero.as_u32(), 16);
         assert_eq!(ContractError::InvalidInput.as_u32(), 17);
         assert_eq!(ContractError::InvalidAmount.as_u32(), 18);
+        assert_eq!(ContractError::WithdrawExceedsSurplus.as_u32(), 19);
+        assert_eq!(ContractError::RateLimited.as_u32(), 20);
+        assert_eq!(ContractError::InsufficientFunds.as_u32(), 21);
+        assert_eq!(ContractError::LossExceedsSupply.as_u32(), 22);
+        assert_eq!(ContractError::GrantNotApproved.as_u32(), 23);
     }
 
     #[test]
     fn test_from_u32_conversion() {
-        for code in 1..=18 {
+        for code in 1..=23 {
             let err = ContractError::from_u32(code).expect("Valid discriminant should convert");
             assert_eq!(err.as_u32(), code);
         }
         assert_eq!(ContractError::from_u32(0), None);
-        assert_eq!(ContractError::from_u32(19), None);
+        assert_eq!(ContractError::from_u32(24), None);
     }
 
     #[test]
@@ -145,7 +174,132 @@ mod test {
         assert!(ERROR_SCHEMA_JSON.contains("AlreadyInitialized"));
         assert!(ERROR_SCHEMA_JSON.contains("InvalidInput"));
         assert!(ERROR_SCHEMA_JSON.contains("InvalidAmount"));
+        assert!(ERROR_SCHEMA_JSON.contains("WithdrawExceedsSurplus"));
         assert!(ERROR_SCHEMA_JSON.contains("\"code\": 1"));
         assert!(ERROR_SCHEMA_JSON.contains("\"code\": 18"));
+        assert!(ERROR_SCHEMA_JSON.contains("\"code\": 19"));
+        assert!(ERROR_SCHEMA_JSON.contains("RateLimited"));
+        assert!(ERROR_SCHEMA_JSON.contains("\"code\": 20"));
+        assert!(ERROR_SCHEMA_JSON.contains("GrantNotApproved"));
+        assert!(ERROR_SCHEMA_JSON.contains("\"code\": 23"));
+    }
+}
+#![no_std]
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ErrorCategory {
+    Auth = 1,
+    Math = 2,
+    Storage = 3,
+    Liquidity = 4,
+    Oracle = 5,
+    Governance = 6,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SharedError {
+    // Auth (100..=199)
+    Unauthorized = 100,
+    InvalidCaller = 101,
+
+    // Math (200..=299)
+    Overflow = 200,
+    Underflow = 201,
+    DivisionByZero = 202,
+
+    // Storage (300..=399)
+    MissingEntry = 300,
+    StorageCorrupted = 301,
+
+    // Liquidity (400..=499)
+    InsufficientLiquidity = 400,
+    SlippageExceeded = 401,
+
+    // Oracle (500..=599)
+    StalePrice = 500,
+    InvalidOracleFeed = 501,
+
+    // Governance (600..=699)
+    ProposalNotFound = 600,
+    VotingClosed = 601,
+}
+
+impl SharedError {
+    pub const ALL: [Self; 12] = [
+        Self::Unauthorized,
+        Self::InvalidCaller,
+        Self::Overflow,
+        Self::Underflow,
+        Self::DivisionByZero,
+        Self::MissingEntry,
+        Self::StorageCorrupted,
+        Self::InsufficientLiquidity,
+        Self::SlippageExceeded,
+        Self::StalePrice,
+        Self::InvalidOracleFeed,
+        Self::ProposalNotFound,
+        // Note: adjust array length to match exact variant count
+    ];
+
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+
+    pub const fn category(self) -> ErrorCategory {
+        match self {
+            Self::Unauthorized | Self::InvalidCaller => ErrorCategory::Auth,
+            Self::Overflow | Self::Underflow | Self::DivisionByZero => ErrorCategory::Math,
+            Self::MissingEntry | Self::StorageCorrupted => ErrorCategory::Storage,
+            Self::InsufficientLiquidity | Self::SlippageExceeded => ErrorCategory::Liquidity,
+            Self::StalePrice | Self::InvalidOracleFeed => ErrorCategory::Oracle,
+            Self::ProposalNotFound | Self::VotingClosed => ErrorCategory::Governance,
+        }
+    }
+
+    pub const fn is_retryable(self) -> bool {
+        match self {
+            // Transient / state or market conditions that may succeed later
+            Self::InsufficientLiquidity | Self::SlippageExceeded | Self::StalePrice => true,
+            // Deterministic or permission/state failures unless inputs/state change
+            Self::Unauthorized
+            | Self::InvalidCaller
+            | Self::Overflow
+            | Self::Underflow
+            | Self::DivisionByZero
+            | Self::MissingEntry
+            | Self::StorageCorrupted
+            | Self::InvalidOracleFeed
+            | Self::ProposalNotFound
+            | Self::VotingClosed => false,
+        }
+    }
+
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            100 => Some(Self::Unauthorized),
+            101 => Some(Self::InvalidCaller),
+            200 => Some(Self::Overflow),
+            201 => Some(Self::Underflow),
+            202 => Some(Self::DivisionByZero),
+            300 => Some(Self::MissingEntry),
+            301 => Some(Self::StorageCorrupted),
+            400 => Some(Self::InsufficientLiquidity),
+            401 => Some(Self::SlippageExceeded),
+            500 => Some(Self::StalePrice),
+            501 => Some(Self::InvalidOracleFeed),
+            600 => Some(Self::ProposalNotFound),
+            601 => Some(Self::VotingClosed),
+            _ => None,
+        }
+    }
+}
+
+impl TryFrom<u32> for SharedError {
+    type Error = ();
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::from_code(value).ok_or(())
     }
 }

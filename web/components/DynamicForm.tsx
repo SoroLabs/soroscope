@@ -29,6 +29,62 @@ function isNumericType(type: string): boolean {
   return /^(u|i)(32|64|128|256)$/.test(type.toLowerCase());
 }
 
+// Integer types whose range exceeds Number.MAX_SAFE_INTEGER (2^53 - 1).
+// These must never be routed through Number()/parseInt()/parseFloat().
+function isBigIntType(type: string): boolean {
+  return /^(u|i)(64|128|256)$/.test(type.toLowerCase());
+}
+
+const INTEGER_PATTERN = /^-?\d+$/;
+
+/**
+ * Validates an integer string for a BigInt-backed type without ever converting
+ * it to a JS Number. Returns an error message, or null when the value is valid.
+ */
+export function validateBigIntString(type: string, raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed === '') return null;
+  if (!INTEGER_PATTERN.test(trimmed)) {
+    return 'Must be an integer (digits only, optional leading -)';
+  }
+  let parsed: bigint;
+  try {
+    parsed = BigInt(trimmed);
+  } catch {
+    return 'Invalid integer value';
+  }
+  const normalized = type.toLowerCase();
+  const unsigned = normalized.startsWith('u');
+  if (unsigned && parsed < 0n) {
+    return `${type} cannot be negative`;
+  }
+  const bits = Number(normalized.slice(1));
+  if (Number.isFinite(bits) && bits > 0) {
+    const min = unsigned ? 0n : -(1n << BigInt(bits - 1));
+    const max = unsigned ? (1n << BigInt(bits)) - 1n : (1n << BigInt(bits - 1)) - 1n;
+    if (parsed < min || parsed > max) {
+      return `Out of range for ${type}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Inserts a decimal point into a raw integer digit string without converting to
+ * Number, so no precision is lost and scientific notation is never produced.
+ * e.g. formatStroops('100000000000000000000', 7) -> '10000000000000.0000000'
+ */
+export function formatStroops(value: string, decimals = 7): string {
+  const trimmed = value.trim();
+  if (!INTEGER_PATTERN.test(trimmed)) return value;
+  const negative = trimmed.startsWith('-');
+  const digits = (negative ? trimmed.slice(1) : trimmed).padStart(decimals + 1, '0');
+  const whole = digits.slice(0, digits.length - decimals);
+  const fraction = decimals > 0 ? `.${digits.slice(digits.length - decimals)}` : '';
+  return `${negative ? '-' : ''}${whole}${fraction}`;
+}
+=======
+
 export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = false, loading }: DynamicFormProps) {
   const [formData, setFormData] = useState<SimulationInputs>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -39,7 +95,19 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
     return simulationQueueManager.subscribe(setQueueStatus);
   }, []);
 
+  // A different contract function has different inputs, so values typed for
+  // the previous one must not carry over (or be submitted with the new one).
+  const selectedFunction = func.name;
+  useEffect(() => {
+    setFormData({});
+    setErrors({});
+    setJsonMode({});
+  }, [selectedFunction]);
+
   const handleChange = (name: string, value: string | number | boolean) => {
+    // Numeric inputs are kept as raw strings so BigInt-range values (u64/i64/
+    // u128/i128) never pass through Number() and lose precision or gain
+    // scientific notation.
     const updatedData = { ...formData, [name]: value };
     setFormData(updatedData);
     if (errors[name]) {
@@ -81,6 +149,13 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
             JSON.parse(String(raw));
           } catch {
             newErrors[input.name] = 'Invalid JSON';
+            continue;
+          }
+        }
+        if (isBigIntType(input.type)) {
+          const bigIntError = validateBigIntString(input.type, String(raw));
+          if (bigIntError) {
+            newErrors[input.name] = bigIntError;
             continue;
           }
         }
@@ -227,18 +302,34 @@ export function DynamicForm({ func, onSubmit, onInputChange, liveSimulate = fals
                 style={{ ...inputStyle(hasError), fontFamily: 'monospace' }}
               />
             ) : isNumericType(input.type) ? (
-              <input
-                id={inputId}
-                type="text"
-                placeholder={`Enter ${input.type} value`}
-                value={fieldValue(input.name)}
-                onChange={(e) => handleChange(input.name, e.target.value)}
-                required={!input.optional}
-                disabled={loading}
-                aria-invalid={hasError || undefined}
-                aria-describedby={[descriptionId, errorId].filter(Boolean).join(' ') || undefined}
-                style={inputStyle(hasError)}
-              />
+              <>
+                <input
+                  id={inputId}
+                  type="text"
+                  inputMode="numeric"
+                  placeholder={`Enter ${input.type} value`}
+                  value={fieldValue(input.name)}
+                  onChange={(e) => handleChange(input.name, e.target.value)}
+                  required={!input.optional}
+                  disabled={loading}
+                  aria-invalid={hasError || undefined}
+                  aria-describedby={[descriptionId, errorId].filter(Boolean).join(' ') || undefined}
+                  style={inputStyle(hasError)}
+                />
+                {isBigIntType(input.type) && INTEGER_PATTERN.test(String(fieldValue(input.name)).trim()) && (
+                  <p
+                    style={{
+                      fontSize: '12px',
+                      color: 'var(--text-secondary)',
+                      margin: '0',
+                      fontFamily: 'monospace',
+                      wordBreak: 'break-all',
+                    }}
+                  >
+                    {formatStroops(String(fieldValue(input.name)))}
+                  </p>
+                )}
+              </>
             ) : input.type === 'string' || input.type === 'symbol' ? (
               <input
                 id={inputId}

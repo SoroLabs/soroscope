@@ -48,6 +48,23 @@ pub struct EncryptedBalanceUpdate {
     pub ciphertext: Bytes,
 }
 
+/// Point on the fixed elliptic curve y^2 = x^3 + 7x + 11 (mod p) where p = 2^64 - 59.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurvePoint {
+    pub x: u64,
+    pub y: u64,
+    pub is_infinity: bool,
+}
+
+/// Opening of a Pedersen commitment (private amount and blinding factor).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitmentOpening {
+    pub amount: i128,
+    pub blinding_factor: BytesN<32>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrivateTransfer {
@@ -81,6 +98,7 @@ pub enum DataKey {
     DepositKeyUsed(BytesN<32>),
     DepositKeyOwner(BytesN<32>),
     StealthMeta(Address),
+    StoredCommitment(BytesN<32>),
 }
 
 #[contractclient(name = "Groth16VerifierClient")]
@@ -236,6 +254,197 @@ fn emit_obfuscated_transfer(env: &Env, transfer: &PrivateTransfer, receipt: &Tra
         (receipt.new_root.clone(), receipt.leaf_index_start),
     );
 }
+
+/// Fixed elliptic curve arithmetic and Pedersen commitment implementation.
+///
+/// Curve equation: y^2 = x^3 + 7x + 11 (mod p)
+/// Field prime: p = 2^64 - 59 = 18446744073709551557
+/// Generator G: (3, 2^32) = (3, 4294967296)
+/// Generator H: (102, 10432324945265058214)
+pub mod pedersen {
+    use super::*;
+
+    pub const FIELD_P: u64 = 18446744073709551557;
+    pub const CURVE_A: u64 = 7;
+    pub const CURVE_B: u64 = 11;
+
+    pub const GENERATOR_G: CurvePoint = CurvePoint {
+        x: 3,
+        y: 4294967296,
+        is_infinity: false,
+    };
+
+    pub const GENERATOR_H: CurvePoint = CurvePoint {
+        x: 102,
+        y: 10432324945265058214,
+        is_infinity: false,
+    };
+
+    #[inline(always)]
+    pub fn mod_add(a: u64, b: u64) -> u64 {
+        let sum = (a as u128) + (b as u128);
+        (sum % (FIELD_P as u128)) as u64
+    }
+
+    #[inline(always)]
+    pub fn mod_sub(a: u64, b: u64) -> u64 {
+        if a >= b {
+            a - b
+        } else {
+            FIELD_P - (b - a)
+        }
+    }
+
+    #[inline(always)]
+    pub fn mod_mul(a: u64, b: u64) -> u64 {
+        (((a as u128) * (b as u128)) % (FIELD_P as u128)) as u64
+    }
+
+    pub fn mod_pow(mut base: u64, mut exp: u64) -> u64 {
+        let mut res = 1u64;
+        base = mod_mul(base, 1);
+        while exp > 0 {
+            if exp & 1 == 1 {
+                res = mod_mul(res, base);
+            }
+            base = mod_mul(base, base);
+            exp >>= 1;
+        }
+        res
+    }
+
+    pub fn mod_inv(val: u64) -> u64 {
+        if val == 0 {
+            0
+        } else {
+            mod_pow(val, FIELD_P - 2)
+        }
+    }
+
+    pub fn point_is_on_curve(pt: &CurvePoint) -> bool {
+        if pt.is_infinity {
+            return true;
+        }
+        let lhs = mod_mul(pt.y, pt.y);
+        let x2 = mod_mul(pt.x, pt.x);
+        let x3 = mod_mul(x2, pt.x);
+        let ax = mod_mul(CURVE_A, pt.x);
+        let rhs = mod_add(mod_add(x3, ax), CURVE_B);
+        lhs == rhs
+    }
+
+    pub fn point_add(p1: &CurvePoint, p2: &CurvePoint) -> CurvePoint {
+        if p1.is_infinity {
+            return p2.clone();
+        }
+        if p2.is_infinity {
+            return p1.clone();
+        }
+        if p1.x == p2.x {
+            if mod_add(p1.y, p2.y) == 0 || p1.y == 0 {
+                return CurvePoint {
+                    x: 0,
+                    y: 0,
+                    is_infinity: true,
+                };
+            }
+            let x1_sq = mod_mul(p1.x, p1.x);
+            let num = mod_add(mod_mul(3, x1_sq), CURVE_A);
+            let den = mod_mul(2, p1.y);
+            let m = mod_mul(num, mod_inv(den));
+
+            let m_sq = mod_mul(m, m);
+            let x3 = mod_sub(mod_sub(m_sq, p1.x), p1.x);
+            let y3 = mod_sub(mod_mul(m, mod_sub(p1.x, x3)), p1.y);
+            CurvePoint {
+                x: x3,
+                y: y3,
+                is_infinity: false,
+            }
+        } else {
+            let num = mod_sub(p2.y, p1.y);
+            let den = mod_sub(p2.x, p1.x);
+            let m = mod_mul(num, mod_inv(den));
+
+            let m_sq = mod_mul(m, m);
+            let x3 = mod_sub(mod_sub(m_sq, p1.x), p2.x);
+            let y3 = mod_sub(mod_mul(m, mod_sub(p1.x, x3)), p1.y);
+            CurvePoint {
+                x: x3,
+                y: y3,
+                is_infinity: false,
+            }
+        }
+    }
+
+    pub fn scalar_mul(mut k: u64, pt: &CurvePoint) -> CurvePoint {
+        let mut res = CurvePoint {
+            x: 0,
+            y: 0,
+            is_infinity: true,
+        };
+        let mut curr = pt.clone();
+        while k > 0 {
+            if k & 1 == 1 {
+                res = point_add(&res, &curr);
+            }
+            curr = point_add(&curr, &curr);
+            k >>= 1;
+        }
+        res
+    }
+
+    pub fn point_to_bytes(env: &Env, pt: &CurvePoint) -> BytesN<32> {
+        let mut out = [0u8; 32];
+        if !pt.is_infinity {
+            out[0..8].copy_from_slice(&pt.x.to_be_bytes());
+            out[8..16].copy_from_slice(&pt.y.to_be_bytes());
+            out[16] = 1;
+        }
+        BytesN::from_array(env, &out)
+    }
+
+    pub fn bytes_to_point(bytes: &BytesN<32>) -> CurvePoint {
+        let arr = bytes.to_array();
+        if arr[16] == 0 {
+            CurvePoint {
+                x: 0,
+                y: 0,
+                is_infinity: true,
+            }
+        } else {
+            let mut x_bytes = [0u8; 8];
+            let mut y_bytes = [0u8; 8];
+            x_bytes.copy_from_slice(&arr[0..8]);
+            y_bytes.copy_from_slice(&arr[8..16]);
+            CurvePoint {
+                x: u64::from_be_bytes(x_bytes),
+                y: u64::from_be_bytes(y_bytes),
+                is_infinity: false,
+            }
+        }
+    }
+
+    pub fn commit(env: &Env, amount: i128, blinding_factor: &BytesN<32>) -> Result<BytesN<32>, Error> {
+        if amount < 0 {
+            return Err(Error::InvalidCommitment);
+        }
+        let scalar_amount = ((amount as u128) % (FIELD_P as u128)) as u64;
+
+        let b_arr = blinding_factor.to_array();
+        let mut b_first8 = [0u8; 8];
+        b_first8.copy_from_slice(&b_arr[0..8]);
+        let raw_blinding = u64::from_be_bytes(b_first8);
+        let scalar_blinding = raw_blinding % FIELD_P;
+
+        let pt_g = scalar_mul(scalar_amount, &GENERATOR_G);
+        let pt_h = scalar_mul(scalar_blinding, &GENERATOR_H);
+        let commitment_pt = point_add(&pt_g, &pt_h);
+
+        Ok(point_to_bytes(env, &commitment_pt))
+    }
+}
+
 
 #[contract]
 pub struct PrivateTransferContract;
@@ -463,4 +672,75 @@ impl PrivateTransferContract {
         emit_obfuscated_transfer(&env, &transfer, &receipt);
         Ok(receipt)
     }
+
+    /// Store a Pedersen commitment on-chain.
+    pub fn store_commitment(env: Env, commitment: BytesN<32>) -> Result<(), Error> {
+        require_nonzero_commitment(&env, &commitment)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::StoredCommitment(commitment), &true);
+        Ok(())
+    }
+
+    /// Check if a commitment is stored on-chain.
+    pub fn has_commitment(env: Env, commitment: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StoredCommitment(commitment))
+            .unwrap_or(false)
+    }
+
+    /// Compute a Pedersen commitment: commitment = amount*G + blinding_factor*H.
+    pub fn compute_pedersen_commitment(
+        env: Env,
+        amount: i128,
+        blinding_factor: BytesN<32>,
+    ) -> Result<BytesN<32>, Error> {
+        pedersen::commit(&env, amount, &blinding_factor)
+    }
+
+    /// Verifier function: accepts (commitment, opening) and verifies opening against stored commitment.
+    pub fn verify_opening(
+        env: Env,
+        commitment: BytesN<32>,
+        opening: CommitmentOpening,
+    ) -> Result<bool, Error> {
+        require_nonzero_commitment(&env, &commitment)?;
+        if !Self::has_commitment(env.clone(), commitment.clone()) {
+            return Ok(false);
+        }
+        let expected = pedersen::commit(&env, opening.amount, &opening.blinding_factor)?;
+        Ok(expected == commitment)
+    }
+
+    /// Alias for verify_opening.
+    pub fn verify_commitment(
+        env: Env,
+        commitment: BytesN<32>,
+        opening: CommitmentOpening,
+    ) -> Result<bool, Error> {
+        Self::verify_opening(env, commitment, opening)
+    }
+
+    /// Directly verify that an opening matches a given commitment value.
+    pub fn verify_commitment_opening(
+        env: Env,
+        commitment: BytesN<32>,
+        opening: CommitmentOpening,
+    ) -> Result<bool, Error> {
+        require_nonzero_commitment(&env, &commitment)?;
+        let expected = pedersen::commit(&env, opening.amount, &opening.blinding_factor)?;
+        Ok(expected == commitment)
+    }
+
+    /// Returns the fixed curve generator G.
+    pub fn curve_generator_g(_env: Env) -> CurvePoint {
+        pedersen::GENERATOR_G
+    }
+
+    /// Returns the fixed curve generator H.
+    pub fn curve_generator_h(_env: Env) -> CurvePoint {
+        pedersen::GENERATOR_H
+    }
 }
+

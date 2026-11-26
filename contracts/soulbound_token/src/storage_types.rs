@@ -9,4 +9,9 @@ pub enum DataKey {
     Symbol,
     Decimals,
     IdentityMetadata(Address),
+    NextTokenId,
+    OwnerToken(Address),
+    TokenOwner(u64),
+    TokenIssuer(u64),
+    TokenRevoked(u64),
 }

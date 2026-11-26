@@ -91,16 +91,16 @@ fn test_revoke_by_admin() {
     client.mint(&user1);
     assert_eq!(client.balance(&user1), 1);
 
-    client.revoke(&user1);
+    let token_id = client.token_id(&user1).unwrap();
+    assert_eq!(client.revoke(&token_id), Ok(()));
     assert_eq!(client.balance(&user1), 0);
 }
 
 #[test]
-#[should_panic(expected = "no token to revoke")]
-fn test_revoke_no_token_panics() {
+fn test_revoke_no_token_returns_not_found() {
     let env = Env::default();
-    let (client, user1) = init(&env);
-    client.revoke(&user1);
+    let (client, _) = init(&env);
+    assert_eq!(client.try_revoke(&0), Err(Ok(Error::TokenNotFound)));
 }
 
 #[test]
@@ -123,9 +123,10 @@ fn test_revoke_non_admin_panics() {
     env.mock_all_auths();
     client.mint(&user1);
     assert_eq!(client.balance(&user1), 1);
+    let token_id = client.token_id(&user1).unwrap();
 
     env.mock_auths(&[]);
-    client.revoke(&user1);
+    client.revoke(&token_id);
 }
 
 #[test]
@@ -164,7 +165,8 @@ fn test_revoke_clears_identity_metadata() {
     let env = Env::default();
     let (client, user1) = init(&env);
     client.mint_identity(&user1, &String::from_str(&env, "ipfs://v1"));
-    client.revoke(&user1);
+    let token_id = client.token_id(&user1).unwrap();
+    client.revoke(&token_id).unwrap();
     assert_eq!(client.balance(&user1), 0);
     assert_eq!(client.identity_metadata(&user1), String::from_str(&env, ""));
 }

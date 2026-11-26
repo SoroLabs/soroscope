@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { ContractFunction } from '../lib/sorobantypes';
-import { Search, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Code2 } from 'lucide-react';
+import { Search, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Code2, X } from 'lucide-react';
 
 interface FunctionSidebarProps {
     functions: ContractFunction[];
@@ -16,9 +16,18 @@ export const FunctionSidebar: React.FC<FunctionSidebarProps> = ({
     const [isOpen, setIsOpen] = useState(true);
     const [searchQuery, setSearchQuery] = useState('');
     const [collapsed, setCollapsed] = useState(false);
+    const searchRef = useRef<HTMLInputElement>(null);
+
+    // Focus the search input when the sidebar opens
+    useEffect(() => {
+        if (isOpen && !collapsed && searchRef.current) {
+            searchRef.current.focus();
+        }
+    }, [isOpen, collapsed]);
 
     const filteredFunctions = functions.filter((func) => {
-        const query = searchQuery.toLowerCase();
+        const query = searchQuery.toLowerCase().trim();
+        if (!query) return true;
         const matchesName = func.name.toLowerCase().includes(query);
         const matchesInputs = func.inputs.some(
             (input) =>
@@ -29,6 +38,11 @@ export const FunctionSidebar: React.FC<FunctionSidebarProps> = ({
         const matchesOutput = func.outputs && func.outputs.toLowerCase().includes(query);
         return matchesName || matchesInputs || matchesOutput;
     });
+
+    const clearSearch = () => {
+        setSearchQuery('');
+        searchRef.current?.focus();
+    };
 
     return (
         <div style={{ position: 'relative', marginBottom: '24px' }}>
@@ -74,7 +88,7 @@ export const FunctionSidebar: React.FC<FunctionSidebarProps> = ({
                             display: 'flex',
                             alignItems: 'center',
                             justifyContent: 'space-between',
-                            marginBottom: '16px',
+                            marginBottom: '12px',
                         }}
                     >
                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -99,7 +113,7 @@ export const FunctionSidebar: React.FC<FunctionSidebarProps> = ({
                                     lineHeight: '16px',
                                 }}
                             >
-                                {filteredFunctions.length}
+                                {searchQuery ? `${filteredFunctions.length}/${functions.length}` : functions.length}
                             </span>
                         </div>
                         <button
@@ -119,41 +133,74 @@ export const FunctionSidebar: React.FC<FunctionSidebarProps> = ({
                         </button>
                     </div>
 
+                    {/* Search input — always visible when sidebar is open so users
+                        can filter even before expanding the full list (fixes #1292). */}
+                    <div style={{ position: 'relative', marginBottom: collapsed ? '0' : '14px' }}>
+                        <Search
+                            size={14}
+                            color="#8b949e"
+                            style={{
+                                position: 'absolute',
+                                left: '12px',
+                                top: '50%',
+                                transform: 'translateY(-50%)',
+                                pointerEvents: 'none',
+                            }}
+                        />
+                        <input
+                            ref={searchRef}
+                            type="search"
+                            placeholder="Search functions, args or types…"
+                            value={searchQuery}
+                            onChange={(e) => {
+                                setSearchQuery(e.target.value);
+                                // Auto-expand list when user starts typing
+                                if (e.target.value && collapsed) {
+                                    setCollapsed(false);
+                                }
+                            }}
+                            aria-label="Search exported functions"
+                            style={{
+                                width: '100%',
+                                padding: '9px 36px 9px 34px',
+                                borderRadius: '6px',
+                                border: '1px solid #30363d',
+                                backgroundColor: '#0d1117',
+                                color: '#c9d1d9',
+                                fontSize: '13px',
+                                outline: 'none',
+                                boxSizing: 'border-box',
+                            }}
+                        />
+                        {searchQuery && (
+                            <button
+                                onClick={clearSearch}
+                                aria-label="Clear search"
+                                style={{
+                                    position: 'absolute',
+                                    right: '10px',
+                                    top: '50%',
+                                    transform: 'translateY(-50%)',
+                                    background: 'none',
+                                    border: 'none',
+                                    cursor: 'pointer',
+                                    color: '#8b949e',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    padding: '2px',
+                                }}
+                            >
+                                <X size={13} />
+                            </button>
+                        )}
+                    </div>
+
                     {!collapsed && (
                         <>
-                            {/* Search input */}
-                            <div style={{ position: 'relative', marginBottom: '14px' }}>
-                                <Search
-                                    size={14}
-                                    color="#8b949e"
-                                    style={{
-                                        position: 'absolute',
-                                        left: '12px',
-                                        top: '50%',
-                                        transform: 'translateY(-50%)',
-                                    }}
-                                />
-                                <input
-                                    type="text"
-                                    placeholder="Search functions or tags..."
-                                    value={searchQuery}
-                                    onChange={(e) => setSearchQuery(e.target.value)}
-                                    style={{
-                                        width: '100%',
-                                        padding: '9px 12px 9px 34px',
-                                        borderRadius: '6px',
-                                        border: '1px solid #30363d',
-                                        backgroundColor: '#0d1117',
-                                        color: '#c9d1d9',
-                                        fontSize: '13px',
-                                        outline: 'none',
-                                        boxSizing: 'border-box',
-                                    }}
-                                />
-                            </div>
-
                             {/* Function list */}
                             <div
+                                role="listbox"
+                                aria-label="Contract functions"
                                 style={{
                                     display: 'flex',
                                     flexDirection: 'column',
@@ -171,7 +218,7 @@ export const FunctionSidebar: React.FC<FunctionSidebarProps> = ({
                                             fontSize: '13px',
                                         }}
                                     >
-                                        No matching functions found
+                                        No functions match &ldquo;{searchQuery}&rdquo;
                                     </div>
                                 ) : (
                                     filteredFunctions.map((func) => {
@@ -179,6 +226,8 @@ export const FunctionSidebar: React.FC<FunctionSidebarProps> = ({
                                         return (
                                             <button
                                                 key={func.name}
+                                                role="option"
+                                                aria-selected={isSelected}
                                                 onClick={() => onSelect(func)}
                                                 style={{
                                                     padding: '10px 14px',
@@ -222,7 +271,7 @@ export const FunctionSidebar: React.FC<FunctionSidebarProps> = ({
                                                     style={{
                                                         fontSize: '11px',
                                                         opacity: '0.8',
-                                                        flexShrink: '0',
+                                                        flexShrink: 0,
                                                         fontFamily: 'monospace',
                                                     }}
                                                 >

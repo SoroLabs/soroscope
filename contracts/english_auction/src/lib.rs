@@ -35,6 +35,7 @@ pub struct EnglishAuction;
 
 #[contractimpl]
 impl EnglishAuction {
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         env: Env,
         seller: Address,
@@ -214,7 +215,7 @@ impl EnglishAuction {
             .get(&DataKey::ReservePrice)
             .unwrap();
 
-        if highest_bid >= reserve_price {
+        if highest_bid > 0 && highest_bid >= reserve_price {
             let seller: Address = env.storage().instance().get(&DataKey::Seller).unwrap();
             let highest_bidder: Address = env
                 .storage()
@@ -319,6 +320,20 @@ impl EnglishAuction {
         env.storage()
             .instance()
             .get(&DataKey::EndTimestamp)
+            .unwrap()
+    }
+
+    pub fn get_reserve_price(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ReservePrice)
+            .unwrap()
+    }
+
+    pub fn get_starting_price(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::StartingPrice)
             .unwrap()
     }
 }

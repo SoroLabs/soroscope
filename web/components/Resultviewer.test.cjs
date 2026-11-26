@@ -53,3 +53,18 @@ test('ResultViewer Export: default suggested filename includes "report"', () => 
   const pdfDoc = generatePdfReport(mockResult);
   assert.ok(pdfDoc.getNumberOfPages() >= 1);
 });
+
+// ── #1282 / #1286: compare-networks toggle and share button ──────────────────
+const fs = require('node:fs');
+const path = require('node:path');
+const viewerSource = fs.readFileSync(path.join(__dirname, 'Resultviewer.tsx'), 'utf8');
+
+test('ResultViewer: Share button copies a /result/<simulation_id> link', () => {
+  assert.match(viewerSource, /buildShareUrl\(result\.simulationId/);
+  assert.match(viewerSource, /\{shareUrl && \(\s*<CopyButton[\s\S]*?text=\{shareUrl\}[\s\S]*?label="Share"/);
+});
+
+test('ResultViewer: Compare networks toggle renders the side-by-side view', () => {
+  assert.match(viewerSource, /aria-pressed=\{compareNetworks\}/);
+  assert.match(viewerSource, /compareNetworks && contractId && \(\s*<NetworkComparisonView/);
+});

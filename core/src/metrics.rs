@@ -24,6 +24,19 @@ pub struct AppMetrics {
     pub indexing_errors_total: IntCounterVec,
     /// Depth of background job queues, by queue name.
     pub job_queue_depth: prometheus::GaugeVec,
+    /// Fee quote cache lookups served from memory (issue #1259).
+    pub fee_quote_cache_hits_total: prometheus::IntCounter,
+    /// Fee quote cache lookups that had to fetch a fresh quote (issue #1259).
+    pub fee_quote_cache_misses_total: prometheus::IntCounter,
+    /// Contract profile lookups served from the in-memory L1 (issue #1397).
+    pub cache_l1_hits_total: prometheus::IntCounter,
+    /// Contract profile lookups served from the shared L2 (issue #1397).
+    pub cache_l2_hits_total: prometheus::IntCounter,
+    /// Contract profile lookups that missed both tiers (issue #1397).
+    pub cache_misses_total: prometheus::IntCounter,
+    /// RPC provider circuit breaker transitions, by provider and target
+    /// state (`open`, `half_open`, `closed`) (issue #1398).
+    pub rpc_circuit_breaker_transitions_total: IntCounterVec,
 }
 
 impl AppMetrics {
@@ -104,6 +117,33 @@ impl AppMetrics {
             Opts::new("job_queue_depth", "Current depth of background job queues"),
             &["queue"],
         )?;
+        let fee_quote_cache_hits_total = prometheus::IntCounter::new(
+            "fee_quote_cache_hits_total",
+            "Fee quote lookups served from the in-memory cache",
+        )?;
+        let fee_quote_cache_misses_total = prometheus::IntCounter::new(
+            "fee_quote_cache_misses_total",
+            "Fee quote lookups that required a fresh fetch",
+        )?;
+        let cache_l1_hits_total = prometheus::IntCounter::new(
+            "cache_l1_hits_total",
+            "Contract profile lookups served from the in-memory L1 cache",
+        )?;
+        let cache_l2_hits_total = prometheus::IntCounter::new(
+            "cache_l2_hits_total",
+            "Contract profile lookups served from the shared L2 cache",
+        )?;
+        let cache_misses_total = prometheus::IntCounter::new(
+            "cache_misses_total",
+            "Contract profile lookups that missed both cache tiers",
+        )?;
+        let rpc_circuit_breaker_transitions_total = IntCounterVec::new(
+            Opts::new(
+                "rpc_circuit_breaker_transitions_total",
+                "RPC provider circuit breaker state transitions",
+            ),
+            &["provider", "state"],
+        )?;
 
         registry.register(Box::new(simulation_latency_seconds.clone()))?;
         registry.register(Box::new(rpc_error_count_total.clone()))?;
@@ -116,6 +156,12 @@ impl AppMetrics {
         registry.register(Box::new(events_processed_total.clone()))?;
         registry.register(Box::new(indexing_errors_total.clone()))?;
         registry.register(Box::new(job_queue_depth.clone()))?;
+        registry.register(Box::new(fee_quote_cache_hits_total.clone()))?;
+        registry.register(Box::new(fee_quote_cache_misses_total.clone()))?;
+        registry.register(Box::new(cache_l1_hits_total.clone()))?;
+        registry.register(Box::new(cache_l2_hits_total.clone()))?;
+        registry.register(Box::new(cache_misses_total.clone()))?;
+        registry.register(Box::new(rpc_circuit_breaker_transitions_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -130,6 +176,12 @@ impl AppMetrics {
             events_processed_total,
             indexing_errors_total,
             job_queue_depth,
+            fee_quote_cache_hits_total,
+            fee_quote_cache_misses_total,
+            cache_l1_hits_total,
+            cache_l2_hits_total,
+            cache_misses_total,
+            rpc_circuit_breaker_transitions_total,
         })
     }
 }

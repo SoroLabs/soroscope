@@ -89,17 +89,54 @@ function createEncryptedStorage(storage, cryptoProvider) {
   };
 }
 
+/**
+ * A plain (unencrypted) localStorage facade that mirrors the EncryptedStorage
+ * interface. Used as a fallback when Web Crypto is unavailable (e.g. HTTP,
+ * old Safari without HTTPS) so data is still persisted rather than silently
+ * discarded. Callers continue to work correctly with the same async API.
+ *
+ * @param {Storage} storage
+ * @returns {import('./encryptedStorage').EncryptedStorage}
+ */
+function createPlaintextFallbackStorage(storage) {
+  return {
+    async setItem(key, value) {
+      storage.setItem(key, value);
+    },
+    async getItem(key) {
+      return storage.getItem(key);
+    },
+    removeItem(key) {
+      storage.removeItem(key);
+    },
+  };
+}
+
 let browserStorage;
 
 function getEncryptedLocalStorage() {
-  if (typeof window === 'undefined' || !window.localStorage || !globalThis.crypto?.subtle) {
+  if (typeof window === 'undefined' || !window.localStorage) {
     return null;
   }
 
   if (!browserStorage) {
-    browserStorage = createEncryptedStorage(window.localStorage, globalThis.crypto);
+    if (!globalThis.crypto?.subtle) {
+      // crypto.subtle is only available in secure contexts (HTTPS / localhost
+      // served over HTTPS). In plain HTTP or environments where it's absent we
+      // fall back to unencrypted localStorage and emit a one-time console
+      // warning so the issue is visible to developers without silently
+      // discarding every write (fixes #1293).
+      console.warn(
+        '[SoroScope] Web Crypto API (crypto.subtle) is unavailable in this context. ' +
+          'Storage will fall back to unencrypted localStorage. ' +
+          'Serve the app over HTTPS to enable AES-GCM encryption.',
+      );
+      browserStorage = createPlaintextFallbackStorage(window.localStorage);
+    } else {
+      browserStorage = createEncryptedStorage(window.localStorage, globalThis.crypto);
+    }
   }
   return browserStorage;
 }
 
-module.exports = { createEncryptedStorage, getEncryptedLocalStorage };
+module.exports = { createEncryptedStorage, createPlaintextFallbackStorage, getEncryptedLocalStorage };

@@ -133,9 +133,150 @@ function formatPercent(percent) {
   return `${num.toFixed(1)}%`;
 }
 
+// ---------------------------------------------------------------------------
+// Ledger footprint TTL & rent cost calculator
+// ---------------------------------------------------------------------------
+
+/** Number of ledgers closed per day (5s close time). */
+const LEDGERS_PER_DAY = 17_280;
+
+/** Stroops in one XLM (1 XLM = 10^7 stroops). */
+const STROOPS_PER_XLM = 10_000_000;
+
+/**
+ * Selectable TTL durations for the rent calculator.
+ *
+ * `ledgers` is the number of ledgers the entry's TTL is extended by; it is
+ * derived from the human-readable `days` value so the UI and the maths stay in
+ * sync.
+ */
+const TTL_OPTIONS = Object.freeze([
+  { id: '24h', label: '24h', days: 1, ledgers: 1 * LEDGERS_PER_DAY },
+  { id: '7d', label: '7d', days: 7, ledgers: 7 * LEDGERS_PER_DAY },
+  { id: '30d', label: '30d', days: 30, ledgers: 30 * LEDGERS_PER_DAY },
+  { id: '90d', label: '90d', days: 90, ledgers: 90 * LEDGERS_PER_DAY },
+  { id: '365d', label: '365d', days: 365, ledgers: 365 * LEDGERS_PER_DAY },
+]);
+
+/**
+ * Rent rates per byte per ledger, in stroops.
+ *
+ * Persistent entries are charged the full rate; temporary entries are charged
+ * a discounted rate. The values mirror the protocol's rent parameters and are
+ * exported so deployments with custom rent settings can override them.
+ */
+const RENT_RATES = Object.freeze({
+  persistent: 1.0,
+  temporary: 0.5,
+});
+
+/** Default inclusion (base) fee in stroops. */
+const DEFAULT_INCLUSION_FEE = 100;
+
+/** Default resource execution fee in stroops. */
+const DEFAULT_RESOURCE_FEE = 1_000;
+
+/** Look up a TTL option by id, falling back to the first option. */
+function resolveTtlOption(ttl) {
+  if (ttl && typeof ttl === 'object' && Number.isFinite(Number(ttl.ledgers))) {
+    return { id: ttl.id || 'custom', label: ttl.label || 'custom', ledgers: toSafeNumber(ttl.ledgers) };
+  }
+  const id = typeof ttl === 'string' ? ttl : ttl && ttl.id;
+  const match = TTL_OPTIONS.find((option) => option.id === id);
+  return match || TTL_OPTIONS[0];
+}
+
+/**
+ * Projected rent for a single storage class (persistent or temporary).
+ *
+ * Rent is charged on the total footprint (reads + writes) for every ledger in
+ * the TTL window, scaled by the class's per-byte rate.
+ *
+ * @param {number} footprintBytes total ledger bytes held by the entry
+ * @param {number} ledgers TTL window in ledgers
+ * @param {number} rate stroops per byte per ledger
+ * @returns {number} rent in stroops
+ */
+function rentForClass(footprintBytes, ledgers, rate) {
+  return toSafeNumber(footprintBytes) * toSafeNumber(ledgers) * toSafeNumber(rate);
+}
+
+/** Convert stroops to XLM. */
+function stroopsToXlm(stroops) {
+  return toSafeNumber(stroops) / STROOPS_PER_XLM;
+}
+
+/**
+ * Compute the full fee breakdown for a TTL selection.
+ *
+ * @param {object} input
+ * @param {number} [input.ledger_read_bytes]
+ * @param {number} [input.ledger_write_bytes]
+ * @param {string|object} [input.ttl] TTL option id (e.g. '30d') or option object
+ * @param {number} [input.inclusionFee] inclusion fee in stroops
+ * @param {number} [input.resourceFee] resource execution fee in stroops
+ * @param {Record<string, number>} [input.rentRates] per-class rate overrides
+ * @returns {object} breakdown with per-class rent, totals, and XLM values
+ */
+function computeRentBreakdown(input) {
+  const source = input || {};
+  const option = resolveTtlOption(source.ttl);
+  const rates = { ...RENT_RATES, ...(source.rentRates || {}) };
+
+  const footprintBytes =
+    toSafeNumber(source.ledger_read_bytes) + toSafeNumber(source.ledger_write_bytes);
+
+  const persistentStroops = rentForClass(footprintBytes, option.ledgers, rates.persistent);
+  const temporaryStroops = rentForClass(footprintBytes, option.ledgers, rates.temporary);
+
+  const inclusionFee = toSafeNumber(
+    source.inclusionFee === undefined ? DEFAULT_INCLUSION_FEE : source.inclusionFee,
+  );
+  const resourceFee = toSafeNumber(
+    source.resourceFee === undefined ? DEFAULT_RESOURCE_FEE : source.resourceFee,
+  );
+
+  // The TTL rent fee shown in the breakdown uses the persistent rate, since
+  // persistent entries are the ones that must be kept alive indefinitely.
+  const ttlRentFee = persistentStroops;
+  const totalStroops = inclusionFee + resourceFee + ttlRentFee;
+
+  return {
+    ttl: option,
+    footprintBytes,
+    rates: { persistent: rates.persistent, temporary: rates.temporary },
+    persistent: {
+      stroops: persistentStroops,
+      xlm: stroopsToXlm(persistentStroops),
+    },
+    temporary: {
+      stroops: temporaryStroops,
+      xlm: stroopsToXlm(temporaryStroops),
+    },
+    fees: {
+      inclusionFee,
+      resourceFee,
+      ttlRentFee,
+      totalStroops,
+      totalXlm: stroopsToXlm(totalStroops),
+    },
+  };
+}
+
+/** Format an XLM amount for display with fixed precision. */
+function formatXlm(xlm) {
+  return `${toSafeNumber(xlm).toFixed(7)} XLM`;
+}
+
 module.exports = {
   SOROBAN_LIMITS,
   METRIC_DEFINITIONS,
+  LEDGERS_PER_DAY,
+  STROOPS_PER_XLM,
+  TTL_OPTIONS,
+  RENT_RATES,
+  DEFAULT_INCLUSION_FEE,
+  DEFAULT_RESOURCE_FEE,
   dailyValuePercent,
   clampPercent,
   severityFor,
@@ -143,4 +284,9 @@ module.exports = {
   overallPercent,
   formatValue,
   formatPercent,
+  resolveTtlOption,
+  rentForClass,
+  stroopsToXlm,
+  computeRentBreakdown,
+  formatXlm,
 };

@@ -45,6 +45,7 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use rustls_pemfile::certs as read_cert_chain;
+use tokio::sync::watch;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
@@ -280,18 +281,54 @@ fn translate_event(
 ///
 /// This is called from `main` and runs in a separate Tokio task alongside the
 /// existing Axum HTTP server. For a TLS-enabled listener use [`serve_tls`].
+///
+/// The server runs until it is dropped; use [`serve_with_shutdown`] (or
+/// [`serve_with_tls_from_env_and_shutdown`]) when the drain coordinator must be
+/// able to stop it gracefully.
 pub async fn serve(addr: std::net::SocketAddr, bus: Arc<SimulationBus>) {
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    serve_with_shutdown(addr, bus, shutdown_rx).await;
+}
+
+/// Bind and serve the gRPC endpoint on `addr` over plaintext (no TLS), stopping
+/// gracefully when `shutdown` flips to `true`.
+///
+/// On shutdown the listener stops accepting new connections/streams and tonic
+/// waits for in-flight RPCs to finish. The caller is responsible for bounding
+/// that wait with the configured grace period (e.g. by wrapping the returned
+/// future in `tokio::time::timeout`).
+pub async fn serve_with_shutdown(
+    addr: std::net::SocketAddr,
+    bus: Arc<SimulationBus>,
+    shutdown: watch::Receiver<bool>,
+) {
     let svc = EventStreamServiceServer::new(EventStreamServiceImpl::new(bus));
 
     tracing::info!(grpc_addr = %addr, tls = false, "gRPC EventStreamService listening");
 
     if let Err(e) = tonic::transport::Server::builder()
         .add_service(svc)
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown_signal(shutdown))
         .await
     {
         tracing::error!(error = %e, "gRPC server terminated with error");
     }
+}
+
+/// Resolve once the coordinator signals shutdown.
+///
+/// Handles the case where the signal was already flipped before this future
+/// was created (watch channels only notify on *changes*).
+async fn shutdown_signal(mut shutdown: watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+    // Sender dropped without signalling: treat as shutdown so we never hang.
 }
 
 // ── TLS configuration & certificate chain loading (Issue #918) ────────────────
@@ -436,6 +473,22 @@ fn build_server_tls(tls: &TlsConfig) -> io::Result<ServerTlsConfig> {
 /// full certificate chain (see [`load_cert_chain`]). If a custom CA root is
 /// configured it is registered so client certificates are validated against it.
 pub async fn serve_tls(addr: std::net::SocketAddr, bus: Arc<SimulationBus>, tls: TlsConfig) {
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    serve_tls_with_shutdown(addr, bus, tls, shutdown_rx).await;
+}
+
+/// Bind and serve the gRPC endpoint on `addr` over TLS, stopping gracefully when
+/// `shutdown` flips to `true`.
+///
+/// On shutdown the listener stops accepting new streams and tonic waits for
+/// in-flight RPCs to complete; the caller bounds that wait with the grace
+/// period.
+pub async fn serve_tls_with_shutdown(
+    addr: std::net::SocketAddr,
+    bus: Arc<SimulationBus>,
+    tls: TlsConfig,
+    shutdown: watch::Receiver<bool>,
+) {
     let server_tls = match build_server_tls(&tls) {
         Ok(t) => t,
         Err(e) => {
@@ -458,7 +511,11 @@ pub async fn serve_tls(addr: std::net::SocketAddr, bus: Arc<SimulationBus>, tls:
             return;
         }
     };
-    if let Err(e) = builder.add_service(svc).serve(addr).await {
+    if let Err(e) = builder
+        .add_service(svc)
+        .serve_with_shutdown(addr, shutdown_signal(shutdown))
+        .await
+    {
         tracing::error!(error = %e, "gRPC TLS server terminated with error");
     }
 }
@@ -468,14 +525,29 @@ pub async fn serve_tls(addr: std::net::SocketAddr, bus: Arc<SimulationBus>, tls:
 ///
 /// Convenience entry point used by `main` so a single call always "just works".
 pub async fn serve_with_tls_from_env(addr: std::net::SocketAddr, bus: Arc<SimulationBus>) {
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    serve_with_tls_from_env_and_shutdown(addr, bus, shutdown_rx).await;
+}
+
+/// Run the gRPC server (TLS when configured, plaintext otherwise) and stop it
+/// gracefully when `shutdown` flips to `true`.
+///
+/// This is the entry point the [`crate::runner::ShutdownCoordinator`] uses: it
+/// flips the shared watch channel so the gRPC listener stops accepting new
+/// streams and lets in-flight streams finish within the grace period.
+pub async fn serve_with_tls_from_env_and_shutdown(
+    addr: std::net::SocketAddr,
+    bus: Arc<SimulationBus>,
+    shutdown: watch::Receiver<bool>,
+) {
     match TlsConfig::from_env() {
-        Ok(Some(tls)) => serve_tls(addr, bus, tls).await,
+        Ok(Some(tls)) => serve_tls_with_shutdown(addr, bus, tls, shutdown).await,
         Ok(None) => {
             tracing::warn!(
                 grpc_addr = %addr,
                 "GRPC_TLS_CERT not set; gRPC server running without TLS"
             );
-            serve(addr, bus).await;
+            serve_with_shutdown(addr, bus, shutdown).await;
         }
         Err(e) => {
             tracing::error!(error = %e, "invalid gRPC TLS configuration");
@@ -681,6 +753,38 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_resolves_when_already_flagged() {
+        let (tx, rx) = watch::channel(true);
+        // Already-flagged receivers must resolve immediately.
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_signal(rx))
+            .await
+            .expect("shutdown_signal must resolve when already flagged");
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_resolves_on_flip() {
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(shutdown_signal(rx));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!handle.is_finished(), "must not resolve before the flip");
+        tx.send(true).expect("send shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("shutdown_signal must resolve after the flip")
+            .expect("join");
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_resolves_when_sender_dropped() {
+        let (tx, rx) = watch::channel(false);
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_signal(rx))
+            .await
+            .expect("shutdown_signal must resolve when the sender is dropped");
     }
 
     #[test]

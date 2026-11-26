@@ -642,7 +642,7 @@ fn test_granular_pause_staking() {
 
 #[test]
 fn test_emergency_withdraw_with_penalty_fee() {
-    let (e, client, owner, staking_token, _) = setup();
+    let (e, client, _owner, staking_token, _) = setup();
     let user = Address::generate(&e);
 
     let staking_client = token::StellarAssetClient::new(&e, &staking_token);
@@ -664,4 +664,119 @@ fn test_emergency_withdraw_with_penalty_fee() {
 
     let token_balance = token::Client::new(&e, &staking_token).balance(&user);
     assert_eq!(token_balance, 9_000);
+}
+
+#[test]
+fn test_admin_withdraw_surplus_success_different_tokens() {
+    let (e, client, owner, _, reward_token) = setup();
+    let reward_client = token::Client::new(&e, &reward_token);
+
+    // In setup, 1_000_000_000 reward tokens were minted to contract.
+    // staking_token != reward_token, so total_staked_principal does not restrict reward_token.
+    let balance_before = reward_client.balance(&owner);
+    client.admin_withdraw(&500_000);
+    let balance_after = reward_client.balance(&owner);
+    assert_eq!(balance_after - balance_before, 500_000);
+}
+
+#[test]
+fn test_admin_withdraw_surplus_success_same_token() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let owner = Address::generate(&e);
+    let token_admin = Address::generate(&e);
+    let common_token = e
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = e.register(StakingRewards, ());
+    let client = StakingRewardsClient::new(&e, &contract_id);
+
+    client.initialize(
+        &owner,
+        &common_token,
+        &common_token,
+        &INITIAL_RATE,
+        &0i128,
+        &EPOCH_LENGTH,
+        &0u32,
+    );
+
+    let token_admin_client = token::StellarAssetClient::new(&e, &common_token);
+    let token_client = token::Client::new(&e, &common_token);
+    // Mint 100_000 surplus reward tokens to contract
+    token_admin_client.mint(&contract_id, &100_000);
+
+    // User stakes 40_000
+    let user = Address::generate(&e);
+    token_admin_client.mint(&user, &40_000);
+    client.stake(&user, &40_000);
+
+    // Total contract balance = 140_000, Total staked = 40_000, Max withdrawable = 100_000
+    // Admin withdraws 60_000 (within 100_000 surplus)
+    let owner_before = token_client.balance(&owner);
+    client.admin_withdraw(&60_000);
+    let owner_after = token_client.balance(&owner);
+    assert_eq!(owner_after - owner_before, 60_000);
+
+    // Remaining surplus = 40_000. Trying to withdraw 40_001 should fail.
+    let err = client.try_admin_withdraw(&40_001);
+    assert_eq!(err, Err(Ok(ContractError::WithdrawExceedsSurplus)));
+
+    // Admin withdraws exactly the remaining 40_000 surplus
+    client.admin_withdraw(&40_000);
+
+    // Now zero surplus remains; any further admin withdrawal must fail
+    let err2 = client.try_admin_withdraw(&1);
+    assert_eq!(err2, Err(Ok(ContractError::WithdrawExceedsSurplus)));
+
+    // User can still safely withdraw their 40_000 staked principal!
+    client.withdraw(&user, &40_000);
+    assert_eq!(token_client.balance(&user), 40_000);
+}
+
+#[test]
+fn test_admin_withdraw_exceeds_surplus_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let owner = Address::generate(&e);
+    let token_admin = Address::generate(&e);
+    let common_token = e
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = e.register(StakingRewards, ());
+    let client = StakingRewardsClient::new(&e, &contract_id);
+
+    client.initialize(
+        &owner,
+        &common_token,
+        &common_token,
+        &INITIAL_RATE,
+        &0i128,
+        &EPOCH_LENGTH,
+        &0u32,
+    );
+
+    let token_client = token::StellarAssetClient::new(&e, &common_token);
+
+    // User stakes 50_000
+    let user = Address::generate(&e);
+    token_client.mint(&user, &50_000);
+    client.stake(&user, &50_000);
+
+    // No surplus was minted! Total balance = 50,000, Total staked = 50,000, max_withdrawable = 0
+    let res = client.try_admin_withdraw(&1);
+    assert_eq!(res, Err(Ok(ContractError::WithdrawExceedsSurplus)));
+}
+
+#[test]
+fn test_admin_withdraw_zero_or_negative_fails() {
+    let (_, client, _, _, _) = setup();
+    assert_eq!(client.try_admin_withdraw(&0), Err(Ok(ContractError::InvalidInput)));
+    assert_eq!(client.try_admin_withdraw(&-10), Err(Ok(ContractError::InvalidInput)));
 }

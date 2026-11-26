@@ -8,6 +8,8 @@ use soroban_sdk::{
 #[cfg(test)]
 mod fuzz_test;
 #[cfg(test)]
+mod reentrancy_test;
+#[cfg(test)]
 mod test;
 
 // Errors
@@ -283,8 +285,11 @@ fn map_guard_err(err: GuardError) -> Error {
         GuardError::Unauthorized
         | GuardError::InsufficientSignatures
         | GuardError::AdminNotFound
+        | GuardError::GuardianNotFound
         | GuardError::InvalidThreshold => Error::Unauthorized,
         GuardError::AlreadyInitialized => Error::AlreadyInitialized,
+
+        GuardError::TimelockNotElapsed => Error::TimelockNotElapsed,
     }
 }
 fn require_not_paused(e: &Env, operation: u32) -> Result<(), Error> {
@@ -1296,18 +1301,29 @@ impl LiquidityPool {
         let net_amount_a = gross_amount_a - fee_a - penalty_a;
         let net_amount_b = gross_amount_b - fee_b - penalty_b;
 
+        // ── Checks-Effects-Interactions ───────────────────────────────────────
+        // All state mutations MUST be committed before any external token call.
+        // A malicious token contract could re-enter `withdraw` during the
+        // transfer; because the caller's share balance and the pool reserves are
+        // saved first, a re-entrant call sees the reduced balance and cannot
+        // withdraw the same shares twice.
+
+        // Effects: deduct the caller's share balance first.
         e.storage()
             .persistent()
             .set(&user_key, &(current - share_amount));
         e.storage().persistent().extend_ttl(&user_key, 100, 100);
 
+        // Effects: update pool totals and reserves.
         pool.total_shares -= share_amount;
+        // Only the net amounts leave the pool; fees and penalties stay in reserves.
         pool.reserve_a -= net_amount_a;
         pool.reserve_b -= net_amount_b;
         let token_a = pool.token_a.clone();
         let token_b = pool.token_b.clone();
         save_pool(&e, &pool);
 
+        // Interactions: external token transfers happen only after all state is saved.
         soroban_sdk::token::Client::new(&e, &token_a).transfer(
             &e.current_contract_address(),
             &to,
@@ -1558,4 +1574,30 @@ impl EmergencyGuardTrait for LiquidityPool {
     fn is_admin(env: &Env, addr: Address) -> bool {
         DefaultEmergencyGuard::is_admin(env, addr)
     }
+}
+// Check existing total supply (or minted shares tracked in storage)
+if total_shares == 0 {
+    // Compute initial shares from deposited amounts (e.g., isqrt(amount_a * amount_b) or pool's existing formula)
+    let initial_shares: i128 = compute_initial_shares(amount_a, amount_b)?;
+
+    if initial_shares <= MINIMUM_LIQUIDITY {
+        return Err(Error::ZeroSharesMinted); // or appropriate insufficient initial liquidity error
+    }
+
+    let user_shares = initial_shares - MINIMUM_LIQUIDITY;
+
+    // Permanently lock MINIMUM_LIQUIDITY shares under the contract/pool address (or dead address)
+    mint_shares(&env, &env.current_contract_address(), MINIMUM_LIQUIDITY);
+    mint_shares(&env, &depositor, user_shares);
+    set_total_shares(&env, initial_shares);
+} else {
+    // Subsequent deposits: (amount * total_shares) / reserve (use checked/wide arithmetic like i128/u128 or I256)
+    let shares_to_mint: i128 = compute_subsequent_shares(amount_a, amount_b, reserve_a, reserve_b, total_shares)?;
+
+    if shares_to_mint <= 0 {
+        return Err(Error::ZeroSharesMinted);
+    }
+
+    mint_shares(&env, &depositor, shares_to_mint);
+    set_total_shares(&env, total_shares + shares_to_mint);
 }

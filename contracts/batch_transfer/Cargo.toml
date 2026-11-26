@@ -12,4 +12,3 @@ soroban-sdk.workspace = true
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-token-contract = { package = "soroban-token-contract", path = "../token" }

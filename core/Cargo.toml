@@ -101,6 +101,10 @@ harness = false
 name = "memory_bench"
 harness = false
 
+[[bench]]
+name = "batch_bench"
+harness = false
+
 [features]
 default = []
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]

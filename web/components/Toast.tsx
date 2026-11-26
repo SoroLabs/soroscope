@@ -4,8 +4,11 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   DEFAULT_TOAST_DURATION_MS,
   SWIPE_DISMISS_THRESHOLD_PX,
+  dismissToast,
+  enqueueToast,
   getVisibleToasts,
 } from '../lib/toastQueue.cjs';
+import { TOAST_EVENT } from '../lib/toastEvents';
 
 export type ToastType = 'error' | 'success' | 'warning' | 'info';
 
@@ -164,7 +167,7 @@ export function ToastStack({
   onClose: (id: string) => void;
   duration?: number;
 }) {
-  const visibleToasts = getVisibleToasts(toasts);
+  const visibleToasts: ToastItem[] = getVisibleToasts(toasts);
 
   if (visibleToasts.length === 0) return null;
 
@@ -193,5 +196,32 @@ export function ToastStack({
         />
       ))}
     </div>
+  );
+}
+
+/**
+ * App-wide toast renderer. Shows every toast sent with `emitToast()` from
+ * `lib/toastEvents`. Mount once, in `_app.tsx`.
+ */
+export function ToastHost({ duration }: { duration?: number }) {
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+
+  useEffect(() => {
+    const handleToast = (event: Event) => {
+      const toast = (event as CustomEvent<ToastItem>).detail;
+      if (!toast?.id || !toast.message) return;
+      setToasts((current) => enqueueToast(current, toast));
+    };
+
+    window.addEventListener(TOAST_EVENT, handleToast);
+    return () => window.removeEventListener(TOAST_EVENT, handleToast);
+  }, []);
+
+  return (
+    <ToastStack
+      toasts={toasts}
+      duration={duration}
+      onClose={(id) => setToasts((current) => dismissToast(current, id))}
+    />
   );
 }

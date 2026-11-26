@@ -36,7 +36,23 @@ export function isRpcNetworkError(error: Error | null): boolean {
 }
 
 /**
- * Builds a plain-text diagnostics report for the current error state.
+ * Sanitizes sensitive tokens, secret keys, and credentials from error messages and stack traces.
+ */
+export function sanitizeTelemetry(text: string): string {
+  if (!text) return '';
+  return text
+    // Stellar secret keys (starts with S, 56 characters base32)
+    .replace(/\bS[A-Z2-7]{55}\b/g, '[REDACTED_STELLAR_SECRET_KEY]')
+    // Bearer tokens
+    .replace(/Bearer\s+[A-Za-z0-9\-_.~+/]+=*/gi, 'Bearer [REDACTED_BEARER_TOKEN]')
+    // Authorization headers or key=val tokens
+    .replace(/(api[_-]?key|secret|token|password|auth|authorization)=["']?[^&"'\s]+/gi, '$1=[REDACTED]')
+    // Hex private keys (32 or 64 bytes)
+    .replace(/\b(0x)?[0-9a-fA-F]{64}\b/g, '[REDACTED_HEX_KEY]');
+}
+
+/**
+ * Builds a plain-text diagnostics report for the current error state with sanitization.
  */
 export function buildDiagnosticsReport(
   error: Error,
@@ -44,17 +60,62 @@ export function buildDiagnosticsReport(
 ): string {
   const lines = [
     `Error: ${error.name || 'Error'}`,
-    `Message: ${error.message || '(no message)'}`,
+    `Message: ${sanitizeTelemetry(error.message || '(no message)')}`,
     '',
     'Stack Trace:',
-    error.stack || '(no stack trace available)',
+    sanitizeTelemetry(error.stack || '(no stack trace available)'),
   ];
 
   if (errorInfo?.componentStack) {
-    lines.push('', 'Component Stack:', errorInfo.componentStack);
+    lines.push('', 'Component Stack:', sanitizeTelemetry(errorInfo.componentStack));
   }
 
   return lines.join('\n');
+}
+
+/**
+ * Generates a sanitized JSON crash bundle for telemetry export.
+ */
+export function generateCrashBundle(
+  error: Error,
+  errorInfo: React.ErrorInfo | null,
+): string {
+  const bundle = {
+    appVersion: '1.0.0',
+    timestamp: new Date().toISOString(),
+    userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
+    url: typeof window !== 'undefined' ? window.location.href : 'unknown',
+    error: {
+      name: error.name || 'Error',
+      message: sanitizeTelemetry(error.message || ''),
+      stack: sanitizeTelemetry(error.stack || ''),
+    },
+    componentStack: errorInfo?.componentStack
+      ? sanitizeTelemetry(errorInfo.componentStack)
+      : null,
+  };
+  return JSON.stringify(bundle, null, 2);
+}
+
+/**
+ * Resets cached application state in LocalStorage while preserving sensitive user secrets if any.
+ */
+export function resetCachedAppState(): void {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    const keysToPreserve = ['encrypted_key', 'wallet_auth', 'user_credentials'];
+    const preserved: Record<string, string> = {};
+    for (const key of keysToPreserve) {
+      const val = window.localStorage.getItem(key);
+      if (val !== null) preserved[key] = val;
+    }
+    window.localStorage.clear();
+    for (const [k, v] of Object.entries(preserved)) {
+      window.localStorage.setItem(k, v);
+    }
+  } catch (err) {
+    console.error('Failed to reset cached state:', err);
+  }
 }
 
 export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
@@ -95,6 +156,30 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
       }
     } catch (copyError) {
       console.error('Failed to copy diagnostics:', copyError);
+    }
+  };
+
+  resetAndReload = () => {
+    resetCachedAppState();
+    if (typeof window !== 'undefined') {
+      window.location.reload();
+    }
+  };
+
+  exportCrashBundle = () => {
+    const { error, errorInfo } = this.state;
+    if (!error) return;
+    const json = generateCrashBundle(error, errorInfo);
+    try {
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `crash-report-${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Failed to export crash bundle:', err);
     }
   };
 
@@ -173,10 +258,24 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
                   </button>
                   <button
                     type="button"
+                    onClick={this.resetAndReload}
+                    className="rounded-lg border border-purple-700/80 bg-purple-900/40 px-4 py-2.5 text-sm font-semibold text-purple-50 transition-colors hover:bg-purple-800/60 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                  >
+                    Reset Cached State &amp; Reload
+                  </button>
+                  <button
+                    type="button"
                     onClick={this.copyDiagnostics}
                     className="rounded-lg border border-amber-700/80 bg-amber-900/40 px-4 py-2.5 text-sm font-semibold text-amber-50 transition-colors hover:bg-amber-800/60 focus:outline-none focus:ring-2 focus:ring-amber-500/50"
                   >
                     Copy Diagnostics
+                  </button>
+                  <button
+                    type="button"
+                    onClick={this.exportCrashBundle}
+                    className="rounded-lg border border-blue-700/80 bg-blue-900/40 px-4 py-2.5 text-sm font-semibold text-blue-50 transition-colors hover:bg-blue-800/60 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                  >
+                    Export Crash Bundle
                   </button>
                   <button
                     type="button"

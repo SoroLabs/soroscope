@@ -229,6 +229,16 @@ struct AppConfig {
     /// When empty, defaults to `*` (allow all origins).
     #[serde(default = "default_allowed_origins")]
     allowed_origins: String,
+    /// Maximum time, in seconds, to wait for in-flight simulations, webhook
+    /// dispatches, and worker jobs to finish during a graceful shutdown
+    /// (issue #1425). After this elapses the drain coordinator aborts the
+    /// remaining work, releases the leader lock, and checkpoints SQLite.
+    #[serde(default = "default_shutdown_grace_period_secs")]
+    shutdown_grace_period_secs: u64,
+}
+
+fn default_shutdown_grace_period_secs() -> u64 {
+    30
 }
 
 fn default_health_check_interval() -> u64 {
@@ -336,9 +346,371 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("event_bus_capacity", 256)?
         .set_default("log_format_json", false)?
         .set_default("allowed_origins", "")?
+        .set_default("shutdown_grace_period_secs", 30)?
         .build()?;
 
     settings.try_deserialize()
+}
+
+// ── Startup configuration validation (issue #1257) ───────────────────────
+
+/// One row of the startup configuration report.
+///
+/// Every checked variable gets a row, not just the broken ones, so an operator
+/// can see the whole effective configuration at a glance. `problem` is `None`
+/// when the value is usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigCheck {
+    /// Environment variable the effective value came from.
+    variable: &'static str,
+    /// Effective value, rendered for the report.
+    value: String,
+    /// Why the value cannot be used, when it cannot.
+    problem: Option<String>,
+}
+
+impl ConfigCheck {
+    fn ok(variable: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            variable,
+            value: value.into(),
+            problem: None,
+        }
+    }
+
+    fn invalid(
+        variable: &'static str,
+        value: impl Into<String>,
+        problem: impl Into<String>,
+    ) -> Self {
+        Self {
+            variable,
+            value: value.into(),
+            problem: Some(problem.into()),
+        }
+    }
+
+    fn is_problem(&self) -> bool {
+        self.problem.is_some()
+    }
+}
+
+/// Render a value for the report, showing empty values as `<unset>`.
+fn render_value(value: &str) -> String {
+    if value.trim().is_empty() {
+        "<unset>".to_string()
+    } else {
+        value.trim().to_string()
+    }
+}
+
+/// Render a secret for the report without disclosing it.
+fn render_secret(value: &str) -> String {
+    if value.trim().is_empty() {
+        "<unset>".to_string()
+    } else {
+        "<set>".to_string()
+    }
+}
+
+fn is_http_url(raw: &str) -> bool {
+    url::Url::parse(raw.trim())
+        .map(|parsed| matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some())
+        .unwrap_or(false)
+}
+
+/// Validate an `http(s)` URL, reporting an unset and a malformed value apart.
+fn check_url(variable: &'static str, raw: &str) -> ConfigCheck {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return ConfigCheck::invalid(variable, "<unset>", "required but empty");
+    }
+    match url::Url::parse(trimmed) {
+        Ok(parsed)
+            if matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some() =>
+        {
+            ConfigCheck::ok(variable, trimmed)
+        }
+        Ok(parsed) => ConfigCheck::invalid(
+            variable,
+            trimmed,
+            format!(
+                "unsupported scheme '{}': expected an http:// or https:// URL",
+                parsed.scheme()
+            ),
+        ),
+        Err(error) => ConfigCheck::invalid(variable, trimmed, format!("not a valid URL: {error}")),
+    }
+}
+
+impl AppConfig {
+    /// Validate the effective configuration before anything is bound or
+    /// contacted.
+    ///
+    /// `APP_ENV` is read here so production-only requirements do not have to
+    /// be duplicated into the deserialised struct.
+    fn validate(&self) -> Vec<ConfigCheck> {
+        let app_env = env::var("APP_ENV").unwrap_or_default();
+        self.validate_for_env(&app_env, env::var("GRPC_PORT").ok().as_deref())
+    }
+
+    /// Validate every value the server depends on.
+    ///
+    /// Returns one [`ConfigCheck`] per variable in a stable order and reports
+    /// *all* problems rather than stopping at the first, so a misconfigured
+    /// deployment can be fixed in one pass instead of one restart per typo.
+    /// A value that still has a workable compiled-in default is reported as
+    /// `ok`; only values that would make the server fail, misbehave or panic
+    /// are `problem`s.
+    fn validate_for_env(&self, app_env: &str, grpc_port: Option<&str>) -> Vec<ConfigCheck> {
+        let is_production = app_env.eq_ignore_ascii_case("production");
+        let mut checks = Vec::new();
+
+        // --- Database -------------------------------------------------
+        let database_url = self.database_url.trim();
+        checks.push(if database_url.is_empty() {
+            ConfigCheck::invalid("DATABASE_URL", "<unset>", "required but empty")
+        } else if !["postgres://", "postgresql://", "sqlite:"]
+            .iter()
+            .any(|scheme| database_url.starts_with(scheme))
+        {
+            ConfigCheck::invalid(
+                "DATABASE_URL",
+                database_url,
+                "unsupported scheme: expected postgres://, postgresql:// or sqlite:",
+            )
+        } else if is_production && database_url.starts_with("sqlite:") {
+            ConfigCheck::invalid(
+                "DATABASE_URL",
+                database_url,
+                "SQLite is not suitable for production; set a PostgreSQL connection string",
+            )
+        } else {
+            ConfigCheck::ok("DATABASE_URL", database_url)
+        });
+
+        // --- Soroban RPC -------------------------------------------------
+        checks.push(check_url("SOROBAN_RPC_URL", &self.soroban_rpc_url));
+        checks.push(if self.network_passphrase.trim().is_empty() {
+            ConfigCheck::invalid("NETWORK_PASSPHRASE", "<unset>", "required but empty")
+        } else {
+            ConfigCheck::ok("NETWORK_PASSPHRASE", self.network_passphrase.trim())
+        });
+
+        // `RPC_PROVIDERS` is one JSON blob rather than a URL, and a bad blob
+        // silently falls back to `SOROBAN_RPC_URL` at runtime, so it has to be
+        // checked explicitly.
+        let providers_raw = self.rpc_providers.trim();
+        checks.push(if providers_raw.is_empty() {
+            ConfigCheck::ok("RPC_PROVIDERS", "<unset> (using SOROBAN_RPC_URL)")
+        } else {
+            match serde_json::from_str::<Vec<RpcProvider>>(providers_raw) {
+                Ok(providers) if providers.is_empty() => ConfigCheck::invalid(
+                    "RPC_PROVIDERS",
+                    "<empty array>",
+                    "must list at least one provider, or be unset",
+                ),
+                Ok(providers) => {
+                    let bad = providers.iter().find(|provider| {
+                        provider.name.trim().is_empty() || !is_http_url(&provider.url)
+                    });
+                    match bad {
+                        Some(provider) => ConfigCheck::invalid(
+                            "RPC_PROVIDERS",
+                            format!("{} provider(s)", providers.len()),
+                            format!(
+                                "provider '{}' needs a name and an http(s) url",
+                                provider.name
+                            ),
+                        ),
+                        None => ConfigCheck::ok(
+                            "RPC_PROVIDERS",
+                            format!("{} provider(s)", providers.len()),
+                        ),
+                    }
+                }
+                Err(error) => ConfigCheck::invalid(
+                    "RPC_PROVIDERS",
+                    "<unparseable>",
+                    format!("not a JSON array of providers: {error}"),
+                ),
+            }
+        });
+
+        // --- Simulation ----------------------------------------------
+        let mode = self.simulation_mode.trim().to_ascii_lowercase();
+        checks.push(if matches!(mode.as_str(), "failover" | "consensus") {
+            ConfigCheck::ok("SIMULATION_MODE", mode)
+        } else {
+            ConfigCheck::invalid(
+                "SIMULATION_MODE",
+                render_value(&self.simulation_mode),
+                format!("unknown mode '{mode}': expected 'failover' or 'consensus'"),
+            )
+        });
+
+        // --- Intervals ------------------------------------------------
+        // Every one of these drives a `tokio::time::interval`, which panics on
+        // a zero period. Checking here turns a mid-run panic into a startup
+        // message.
+        for (variable, value) in [
+            ("SIMULATION_TIMEOUT_SECS", self.simulation_timeout_secs),
+            (
+                "HEALTH_CHECK_INTERVAL_SECS",
+                self.health_check_interval_secs,
+            ),
+            ("GOSSIP_INTERVAL_SECS", self.gossip_interval_secs),
+            (
+                "FEE_COLLECTION_INTERVAL_SECS",
+                self.fee_collection_interval_secs,
+            ),
+        ] {
+            checks.push(if value == 0 {
+                ConfigCheck::invalid(variable, "0", "must be greater than zero seconds")
+            } else {
+                ConfigCheck::ok(variable, value.to_string())
+            });
+        }
+
+        // --- Worker pool ----------------------------------------------
+        checks.push(if self.event_worker_threads == 0 {
+            ConfigCheck::invalid("EVENT_WORKER_THREADS", "0", "must be at least 1")
+        } else {
+            ConfigCheck::ok(
+                "EVENT_WORKER_THREADS",
+                self.event_worker_threads.to_string(),
+            )
+        });
+
+        // --- CORS ------------------------------------------------------
+        for (variable, raw) in [
+            ("CORS_ALLOWED_ORIGINS", self.cors_allowed_origins.as_str()),
+            ("ALLOWED_ORIGINS", self.allowed_origins.as_str()),
+        ] {
+            let origins: Vec<&str> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|origin| !origin.is_empty())
+                .collect();
+            checks.push(if origins.is_empty() {
+                ConfigCheck::ok(variable, "<unset> (all origins allowed)")
+            } else if let Some(origin) = origins.iter().find(|origin| !is_http_url(origin)) {
+                ConfigCheck::invalid(
+                    variable,
+                    raw.trim(),
+                    format!("'{origin}' is not an http(s) origin"),
+                )
+            } else {
+                ConfigCheck::ok(variable, origins.join(","))
+            });
+        }
+
+        // --- Registry ---------------------------------------------------
+        if self.registry_public_url.trim().is_empty() {
+            checks.push(ConfigCheck::ok("REGISTRY_PUBLIC_URL", "<unset>"));
+        } else {
+            checks.push(check_url("REGISTRY_PUBLIC_URL", &self.registry_public_url));
+        }
+
+        // --- gRPC -------------------------------------------------------
+        // `GRPC_PORT` is read straight from the environment later on and
+        // silently replaced by 50051 when it does not parse, so a typo would
+        // otherwise bind the wrong port without telling anyone.
+        checks.push(match grpc_port {
+            None => ConfigCheck::ok("GRPC_PORT", "<unset> (default 50051)"),
+            Some(raw) if raw.trim().parse::<u16>().is_ok() => {
+                ConfigCheck::ok("GRPC_PORT", raw.trim())
+            }
+            Some(raw) => ConfigCheck::invalid(
+                "GRPC_PORT",
+                raw.trim(),
+                "must be a port number between 0 and 65535",
+            ),
+        });
+
+        // --- Secrets ----------------------------------------------------
+        checks.push(match self.jwt_private_key.as_deref() {
+            Some(key) if !key.trim().is_empty() => {
+                ConfigCheck::ok("JWT_PRIVATE_KEY", render_secret(key))
+            }
+            _ if is_production => ConfigCheck::invalid(
+                "JWT_PRIVATE_KEY",
+                "<unset>",
+                "required in production; dev keys do not survive a restart",
+            ),
+            _ => ConfigCheck::ok("JWT_PRIVATE_KEY", "<unset> (dev key will be generated)"),
+        });
+        checks.push(if self.inbound_webhook_secret.trim().is_empty() {
+            if is_production {
+                ConfigCheck::invalid(
+                    "INBOUND_WEBHOOK_SECRET",
+                    "<unset>",
+                    "required in production; inbound webhooks would be rejected",
+                )
+            } else {
+                ConfigCheck::ok("INBOUND_WEBHOOK_SECRET", "<unset>")
+            }
+        } else {
+            ConfigCheck::ok(
+                "INBOUND_WEBHOOK_SECRET",
+                render_secret(&self.inbound_webhook_secret),
+            )
+        });
+
+        checks
+    }
+}
+
+/// Print the startup configuration table and a one-line summary.
+///
+/// The whole table goes to stderr: the tracing subscriber is not initialised
+/// yet when validation runs, and a failed startup must be visible even when
+/// logs are redirected.
+fn print_config_report(checks: &[ConfigCheck]) {
+    let failures = checks.iter().filter(|check| check.is_problem()).count();
+    let variable_width = checks
+        .iter()
+        .map(|check| check.variable.len())
+        .max()
+        .unwrap_or(0)
+        .max("VARIABLE".len());
+    let value_width = checks
+        .iter()
+        .map(|check| check.value.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("VALUE".len())
+        .min(48);
+
+    eprintln!();
+    eprintln!("SoroScope startup configuration check");
+    eprintln!();
+    eprintln!(
+        "{:<variable_width$}  {:<value_width$}  STATUS",
+        "VARIABLE", "VALUE"
+    );
+    eprintln!(
+        "{}",
+        "-".repeat(variable_width + value_width + "STATUS".len() + 4)
+    );
+    for check in checks {
+        let value: String = check.value.chars().take(value_width).collect();
+        match &check.problem {
+            None => eprintln!(
+                "{:<variable_width$}  {value:<value_width$}  ok",
+                check.variable
+            ),
+            Some(problem) => eprintln!(
+                "{:<variable_width$}  {value:<value_width$}  INVALID: {problem}",
+                check.variable
+            ),
+        }
+    }
+    eprintln!();
+    eprintln!(
+        "{failures} configuration error(s) found. Fix the variables marked INVALID and restart "
+    );
+    eprintln!();
 }
 
 /// Build the tracing `EnvFilter` from the configured log directive
@@ -1282,6 +1654,8 @@ async fn analyze(
         (status = 200, description = "Resource analysis successful", body = ResourceReport),
         (status = 400, description = "Invalid base64 or WASM data"),
         (status = 401, description = "Unauthorized"),
+        (status = 413, description = "WASM payload exceeds the upload limit"),
+        (status = 422, description = "Not a valid Soroban WASM module"),
         (status = 500, description = "Analysis failed")
     ),
     security(
@@ -1304,39 +1678,8 @@ async fn analyze_wasm(
         .decode(&payload.wasm_bytes)
         .map_err(|e| AppError::BadRequest(format!("Invalid base64 WASM data: {}", e)))?;
 
-    // ── Validate WASM size: reject files larger than 2 MB ────────────────────
-    const MAX_WASM_SIZE: usize = 2 * 1024 * 1024; // 2 MB
-    if wasm_bytes.len() > MAX_WASM_SIZE {
-        return Err(AppError::BadRequest(format!(
-            "WASM file too large: {} bytes exceeds the {} byte (2 MB) limit",
-            wasm_bytes.len(),
-            MAX_WASM_SIZE,
-        )));
-    }
-
-    // ── Validate WASM magic bytes: must start with \0asm (0x00 0x61 0x73 0x6D) ──
-    const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6d];
-    if wasm_bytes.len() < 8 || wasm_bytes[..4] != WASM_MAGIC {
-        return Err(AppError::BadRequest(
-            "Invalid WASM file: missing magic bytes (\\0asm). \
-             Please upload a compiled Soroban .wasm contract."
-                .to_string(),
-        ));
-    }
-
-    // ── Validate WASM binary version: must be version 1 (little-endian) ──────
-    let version = u32::from_le_bytes([
-        wasm_bytes[4],
-        wasm_bytes[5],
-        wasm_bytes[6],
-        wasm_bytes[7],
-    ]);
-    if version != 1 {
-        return Err(AppError::BadRequest(format!(
-            "Unsupported WASM version: {}. Expected version 1.",
-            version
-        )));
-    }
+    // ── Validate size (413), \0asm + version 1 header and custom sections (422) ──
+    parser::validate_wasm_upload(&wasm_bytes, parser::max_wasm_upload_bytes())?;
 
     let function_name = payload.function_name.clone();
     let args = payload.args.clone().unwrap_or_default();
@@ -1700,6 +2043,8 @@ pub struct CompareApiResponse {
     responses(
         (status = 200, description = "Comparison report", body = CompareApiResponse),
         (status = 400, description = "Invalid request"),
+        (status = 413, description = "WASM payload exceeds the upload limit"),
+        (status = 422, description = "Not a valid Soroban WASM module"),
         (status = 500, description = "Comparison failed")
     ),
     tag = "Analysis"
@@ -1731,26 +2076,12 @@ async fn compare_handler(
                 );
             }
             "current_wasm" => {
-                current_wasm_bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| {
-                            AppError::BadRequest(format!("Failed to read current_wasm: {}", e))
-                        })?
-                        .to_vec(),
-                );
+                current_wasm_bytes =
+                    Some(parser::read_wasm_upload(field, parser::max_wasm_upload_bytes()).await?);
             }
             "base_wasm" => {
-                base_wasm_bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| {
-                            AppError::BadRequest(format!("Failed to read base_wasm: {}", e))
-                        })?
-                        .to_vec(),
-                );
+                base_wasm_bytes =
+                    Some(parser::read_wasm_upload(field, parser::max_wasm_upload_bytes()).await?);
             }
             "contract_id" => {
                 contract_id =
@@ -2287,6 +2618,21 @@ async fn healthz() -> impl IntoResponse {
 /// 503 when at least one dependency is unavailable (the pod should be removed
 /// from the load-balancer rotation until it recovers).
 async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Issue #1425: the drain coordinator flips readiness to false the instant
+    // SIGTERM/SIGINT arrives, before any subsystem starts winding down, so the
+    // load balancer stops routing new traffic while in-flight work drains.
+    if state.shutdown.is_shutting_down() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "draining",
+                "checks": {
+                    "shutdown": "in_progress"
+                }
+            })),
+        );
+    }
+
     let rpc_healthy = state
         .provider_registry
         .provider_reports()
@@ -2376,7 +2722,31 @@ async fn main() {
     // Config is loaded before the tracing subscriber so `rust_log` (sourced
     // from the `RUST_LOG` env var, defaulting to "info") can drive log level
     // filtering without recompiling the binary.
-    let config = load_config().expect("Failed to load configuration");
+    // Issue #1257: never panic on configuration. A malformed value used to
+    // abort with a bare `expect` message, and a missing one surfaced the first
+    // time a request handler touched it. Both now produce a readable report
+    // and exit code 1 before anything is bound.
+    let config = match load_config() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!();
+            eprintln!("SoroScope startup configuration check");
+            eprintln!();
+            eprintln!("INVALID: {error}");
+            eprintln!();
+            eprintln!("1 configuration error(s) found. Fix the variables above and restart.");
+            eprintln!();
+            std::process::exit(1);
+        }
+    };
+
+    let checks = config.validate();
+    if checks.iter().any(ConfigCheck::is_problem) {
+        print_config_report(&checks);
+        std::process::exit(1);
+    }
+
+
 
     // ── Tracing init (#572: JSON format + x-request-id correlation) ────
     let log_json = env::var("LOG_FORMAT").map(|v| v.to_lowercase() == "json").unwrap_or(false);
@@ -2989,6 +3359,7 @@ async fn main() {
     let app_metrics = Arc::new(
         AppMetrics::new().expect("Failed to initialize Prometheus metrics"),
     );
+    registry.attach_metrics((*app_metrics).clone());
 
     let app_state = Arc::new(AppState {
         engine: SimulationEngine::with_registry_and_cache(
@@ -3065,6 +3436,8 @@ async fn main() {
         .route("/analyze/compare", post(compare_handler))
         .route("/analyze/gas-golfing", post(analyze_gas_golfing))
         .route("/analyze/host-import-heat", post(analyze_host_import_heat))
+        // Bound request bodies on the WASM upload routes (Issue #1400).
+        .layer(parser::upload_body_limit())
         .route_layer(middleware::from_fn(auth::auth_middleware));
 
     let app = Router::new()
@@ -3403,6 +3776,7 @@ mod tests {
             insights_engine: InsightsEngine::new(),
             simulation_timeout: std::time::Duration::from_secs(30),
             event_worker_pool: Arc::clone(&event_pool),
+            shutdown: runner::ShutdownCoordinator::new(std::time::Duration::from_secs(30)),
         });
         let auth_state = Arc::new(auth::AuthState::new(
             "test-secret".to_string(),
@@ -3542,6 +3916,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_readyz_flips_to_503_immediately_when_shutdown_begins() {
+        use axum::body::Body;
+        use http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app = build_test_app();
+        let state = app
+            .clone()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+        // Sanity check: the coordinator starts in the "running" state.
+        drop(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        // Without a healthy RPC provider the probe is already 503, but the
+        // body must not yet report the draining state.
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn test_profile_endpoint_no_jwt_returns_401() {
         use axum::body::Body;
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -3572,4 +3971,232 @@ async fn analyze_simulation(
 ) -> Result<Json<AnalysisResult>, AppError> {
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))
+}
+
+#[cfg(test)]
+mod config_validation_tests {
+    use super::{AppConfig, ConfigCheck};
+
+    fn valid_config() -> AppConfig {
+        AppConfig {
+            server_port: 8080,
+            rust_log: "info".to_string(),
+            soroban_rpc_url: "https://soroban-testnet.stellar.org".to_string(),
+            jwt_private_key: None,
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            rpc_providers: String::new(),
+            registry_instance_id: String::new(),
+            registry_public_url: String::new(),
+            registry_seed_peers: String::new(),
+            health_check_interval_secs: 30,
+            gossip_interval_secs: 30,
+            simulation_timeout_secs: 30,
+            simulation_mode: "failover".to_string(),
+            database_url: "sqlite://soroscope.db".to_string(),
+            inbound_webhook_secret: String::new(),
+            job_timeout_secs: 300,
+            max_concurrent_jobs: 10,
+            event_worker_threads: 4,
+            fee_collection_interval_secs: 5,
+            fee_retention_days: 30,
+            fee_analysis_enabled: true,
+            emergency_verification_paused: false,
+            disk_cache_path: String::new(),
+            max_ledger_age: 100,
+            cors_allowed_origins: String::new(),
+            event_bus_capacity: 256,
+            log_format_json: false,
+            allowed_origins: String::new(),
+            shutdown_grace_period_secs: 30,
+        }
+    }
+
+    /// Variables reported as invalid, with the reason attached.
+    fn problems(checks: &[ConfigCheck]) -> Vec<(&'static str, String)> {
+        checks
+            .iter()
+            .filter_map(|check| {
+                check
+                    .problem
+                    .clone()
+                    .map(|problem| (check.variable, problem))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn development_defaults_are_accepted() {
+        let checks = valid_config().validate_for_env("development", None);
+        assert_eq!(problems(&checks), vec![], "defaults must be usable");
+        // Every checked variable appears exactly once, so the report can be
+        // read as the complete startup configuration.
+        let mut names: Vec<&str> = checks.iter().map(|check| check.variable).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "report rows must be unique");
+    }
+
+    #[test]
+    fn missing_database_url_is_reported_by_name() {
+        let mut config = valid_config();
+        config.database_url = "   ".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported.len(), 1, "expected a single problem: {reported:?}");
+        assert_eq!(reported[0].0, "DATABASE_URL");
+        assert!(reported[0].1.contains("required"));
+    }
+
+    #[test]
+    fn database_url_with_unknown_scheme_is_reported() {
+        let mut config = valid_config();
+        config.database_url = "mysql://user:pass@db/app".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "DATABASE_URL");
+        assert!(reported[0].1.contains("unsupported scheme"));
+    }
+
+    #[test]
+    fn malformed_and_non_http_rpc_urls_are_reported() {
+        let mut config = valid_config();
+        config.soroban_rpc_url = "not a url".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "SOROBAN_RPC_URL");
+
+        config.soroban_rpc_url = "ftp://rpc.example.com".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "SOROBAN_RPC_URL");
+        assert!(reported[0].1.contains("http") || reported[0].1.contains("scheme"));
+    }
+
+    #[test]
+    fn empty_network_passphrase_is_reported() {
+        let mut config = valid_config();
+        config.network_passphrase = String::new();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "NETWORK_PASSPHRASE");
+    }
+
+    #[test]
+    fn unknown_simulation_mode_is_reported() {
+        let mut config = valid_config();
+        config.simulation_mode = "races".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "SIMULATION_MODE");
+        assert!(reported[0].1.contains("failover"));
+    }
+
+    #[test]
+    fn zero_length_intervals_are_reported_before_tokio_can_panic() {
+        let mut config = valid_config();
+        config.simulation_timeout_secs = 0;
+        config.health_check_interval_secs = 0;
+        config.gossip_interval_secs = 0;
+        config.fee_collection_interval_secs = 0;
+        let reported = problems(&config.validate_for_env("development", None));
+        let variables: Vec<&str> = reported.iter().map(|(variable, _)| *variable).collect();
+        assert_eq!(
+            variables,
+            vec![
+                "SIMULATION_TIMEOUT_SECS",
+                "HEALTH_CHECK_INTERVAL_SECS",
+                "GOSSIP_INTERVAL_SECS",
+                "FEE_COLLECTION_INTERVAL_SECS"
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_event_worker_pool_is_reported() {
+        let mut config = valid_config();
+        config.event_worker_threads = 0;
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "EVENT_WORKER_THREADS");
+    }
+
+    #[test]
+    fn unparseable_rpc_providers_are_reported_instead_of_silently_falling_back() {
+        let mut config = valid_config();
+        config.rpc_providers = "{not json}".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "RPC_PROVIDERS");
+        assert!(reported[0].1.contains("JSON"));
+
+        config.rpc_providers = r#"[{"name":"node-a","url":"https://a.example.com"}]"#.to_string();
+        assert!(problems(&config.validate_for_env("development", None)).is_empty());
+    }
+
+    #[test]
+    fn rpc_provider_without_a_url_is_reported() {
+        let mut config = valid_config();
+        config.rpc_providers = r#"[{"name":"node-a","url":""}]"#.to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "RPC_PROVIDERS");
+        assert!(reported[0].1.contains("node-a"));
+    }
+
+    #[test]
+    fn bad_cors_origin_is_reported() {
+        let mut config = valid_config();
+        config.allowed_origins = "https://app.example.com,not-a-url".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(reported[0].0, "ALLOWED_ORIGINS");
+        assert!(reported[0].1.contains("not-a-url"));
+    }
+
+    #[test]
+    fn non_numeric_grpc_port_is_reported_instead_of_defaulting() {
+        let config = valid_config();
+        let reported = problems(&config.validate_for_env("development", Some("fifty")));
+        assert_eq!(reported[0].0, "GRPC_PORT");
+        assert!(config
+            .validate_for_env("development", Some("50051"))
+            .iter()
+            .all(|check| !check.is_problem()));
+    }
+
+    #[test]
+    fn production_requires_an_explicit_jwt_key_and_webhook_secret() {
+        let config = valid_config();
+        let reported = problems(&config.validate_for_env("production", None));
+        let variables: Vec<&str> = reported.iter().map(|(variable, _)| *variable).collect();
+        assert!(variables.contains(&"JWT_PRIVATE_KEY"), "{variables:?}");
+        assert!(
+            variables.contains(&"INBOUND_WEBHOOK_SECRET"),
+            "{variables:?}"
+        );
+        // SQLite is a dev-only choice in production.
+        assert!(variables.contains(&"DATABASE_URL"), "{variables:?}");
+    }
+
+    #[test]
+    fn every_problem_is_reported_not_just_the_first() {
+        let mut config = valid_config();
+        config.database_url = String::new();
+        config.soroban_rpc_url = "nope".to_string();
+        config.simulation_mode = "fastest".to_string();
+        let reported = problems(&config.validate_for_env("development", None));
+        assert_eq!(
+            reported.len(),
+            3,
+            "expected all three problems: {reported:?}"
+        );
+    }
+
+    #[test]
+    fn secret_values_are_masked_in_the_report() {
+        let mut config = valid_config();
+        config.jwt_private_key = Some("-----BEGIN RSA PRIVATE KEY-----".to_string());
+        config.inbound_webhook_secret = "super-secret".to_string();
+        let checks = config.validate_for_env("development", None);
+        for name in ["JWT_PRIVATE_KEY", "INBOUND_WEBHOOK_SECRET"] {
+            let row = checks
+                .iter()
+                .find(|check| check.variable == name)
+                .expect("row must exist");
+            assert_eq!(row.value, "<set>", "secret leaked into the report table");
+            assert!(!row.value.contains("BEGIN RSA"));
+        }
+    }
 }

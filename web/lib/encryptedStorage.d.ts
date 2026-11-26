@@ -5,4 +5,5 @@ export interface EncryptedStorage {
 }
 
 export function createEncryptedStorage(storage: Storage, cryptoProvider: Crypto): EncryptedStorage;
+export function createPlaintextFallbackStorage(storage: Storage): EncryptedStorage;
 export function getEncryptedLocalStorage(): EncryptedStorage | null;

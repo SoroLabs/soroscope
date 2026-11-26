@@ -1,6 +1,5 @@
-// Issue #814: Canvas heatmap renderer & matrix visualization
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Cpu, Database, HardDrive, Zap, Activity, Info, Sliders, Grid, AlertTriangle } from 'lucide-react';
+import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
+import { Cpu, Database, Zap, Activity, Info, Sliders, Flame, AlertTriangle, MemoryStick } from 'lucide-react';
 import { cn } from '../lib/utils';
 import type { CallGraph, CallNode } from '../lib/sorobantypes';
 
@@ -14,25 +13,61 @@ const LIMITS = {
   TX_SIZE:      70  * 1024,       // 70 KB
 };
 
-// Matrix canvas constants
-const CELL_SIZE = 32;
-const GAP = 8;
-const PADDING = 16;
-const GRID_COLS = 6;
-const GRID_ROWS = 6;
-const NATURAL_WIDTH = GRID_COLS * CELL_SIZE + (GRID_COLS - 1) * GAP + PADDING * 2;
-const NATURAL_HEIGHT = GRID_ROWS * CELL_SIZE + (GRID_ROWS - 1) * GAP + PADDING * 2;
+// ── Types ────────────────────────────────────────────────────────────────────
 
-interface Cell {
+type FnCategory = 'auth' | 'storage' | 'compute' | 'io' | 'util';
+
+interface CpuHotspotCell {
   id: string;
-  row: number;
-  col: number;
-  type: 'CPU' | 'RAM' | 'READ' | 'WRITE';
-  load: number;
+  /** Full qualified name, e.g. "contract::function" */
+  fnName: string;
+  /** Abbreviated label that fits inside the cell */
+  displayName: string;
+  category: FnCategory;
+  /** Share of this simulation's total CPU (0–100) */
+  cpuShare: number;
+  /** Absolute estimated instruction count */
+  cpuInstructions: number;
+  /** Call-graph depth; 0 = entry point */
+  depth: number;
+}
+
+// ── RAM allocation types ──────────────────────────────────────────────────────
+
+type RamRegion = 'heap' | 'stack' | 'host' | 'data' | 'auth' | 'buffer' | 'event';
+
+interface RamAllocCell {
+  id: string;
+  /** Human-readable allocation name */
+  label: string;
+  /** Short label for space-constrained contexts */
+  shortLabel: string;
+  region: RamRegion;
+  /** Absolute bytes allocated to this region */
+  bytes: number;
+  /** Share of this simulation's total RAM (0–100) */
+  share: number;
+}
+
+// ── Ledger segment types ──────────────────────────────────────────────────────
+
+type LedgerKind = 'read' | 'write';
+
+interface LedgerSegment {
+  id: string;
+  /** Full name shown in the inspector */
+  label: string;
+  /** Abbreviated name shown inside the segment row */
+  shortLabel: string;
+  kind: LedgerKind;
+  /** Absolute bytes for this sub-segment */
+  bytes: number;
+  /** Share of the parent kind total (0–100) */
+  share: number;
 }
 
 interface ResourceHeatmapProps {
-  resourceCost: {
+  resourceCost?: {
     cpu_instructions: number;
     ram_bytes: number;
     ledger_read_bytes: number;
@@ -49,37 +84,294 @@ interface ResourceHeatmapProps {
   callGraph?: CallGraph | null;
 }
 
-function getCellColors(load: number): { fill: string; stroke: string } {
-  if (load > 80) return { fill: 'rgba(244,63,94,0.8)', stroke: 'rgba(244,63,94,1)' };
-  if (load > 50) return { fill: 'rgba(245,158,11,0.6)', stroke: 'rgba(245,158,11,1)' };
-  if (load > 20) return { fill: 'rgba(8,145,178,0.4)', stroke: 'rgba(6,182,212,0.4)' };
-  if (load > 5) return { fill: 'rgba(6,78,59,0.2)', stroke: 'rgba(16,185,129,0.2)' };
-  return { fill: 'rgba(30,41,59,1)', stroke: 'rgba(51,65,85,1)' };
+// ── CPU hotspot data builders ─────────────────────────────────────────────────
+
+function categoize(fnName: string): FnCategory {
+  const n = fnName.toLowerCase();
+  if (n.includes('auth') || n.includes('verify') || n.includes('sign') || n.includes('check_auth')) return 'auth';
+  if (n.includes('write') || n.includes('store') || n.includes('set') || n.includes('put')) return 'storage';
+  if (n.includes('read') || n.includes('get') || n.includes('load') || n.includes('fetch')) return 'storage';
+  if (n.includes('event') || n.includes('emit') || n.includes('log') || n.includes('publish')) return 'io';
+  if (n.includes('util') || n.includes('parse') || n.includes('format') || n.includes('encode')) return 'util';
+  return 'compute';
 }
 
-export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
-  const [activeTab, setActiveTab] = useState<'gauges' | 'matrix' | 'footprint'>('gauges');
-  const [hoveredCell, setHoveredCell] = useState<string | null>(null);
-  const [hoveredKey, setHoveredKey] = useState<string | null>(null);
-  const [tooltip, setTooltip] = useState<{ x: number; y: number; cell: Cell } | null>(null);
+/**
+ * Flatten a call graph into hotspot cells.
+ *
+ * Budget split per depth level: root 40 % → children share 30 % → grandchildren 20 % → rest 10 %.
+ * Normalised so all shares sum to 100 %.
+ */
+function cellsFromCallGraph(root: CallNode, totalCpu: number): CpuHotspotCell[] {
+  const cells: CpuHotspotCell[] = [];
+  const DEPTH_BUDGET = [40, 30, 20, 10];
+  let counter = 0;
+
+  function traverse(node: CallNode, depth: number, levelShare: number) {
+    const budget = DEPTH_BUDGET[Math.min(depth, DEPTH_BUDGET.length - 1)];
+    const cpuShare = (budget * levelShare) / 100;
+    const displayName = node.function.length > 14
+      ? node.function.slice(0, 12) + '…'
+      : node.function;
+
+    cells.push({
+      id: `cg-${counter++}`,
+      fnName: `${node.contract_id}::${node.function}`,
+      displayName,
+      category: categoize(node.function),
+      cpuShare,
+      cpuInstructions: Math.round((cpuShare / 100) * totalCpu),
+      depth,
+    });
+
+    if (node.children.length > 0) {
+      const sharePerChild = 100 / node.children.length;
+      node.children.forEach(child => traverse(child, depth + 1, sharePerChild));
+    }
+  }
+
+  traverse(root, 0, 100);
+
+  // Normalise so shares sum to 100
+  const total = cells.reduce((s, c) => s + c.cpuShare, 0);
+  if (total > 0) {
+    cells.forEach(c => {
+      c.cpuShare = (c.cpuShare / total) * 100;
+      c.cpuInstructions = Math.round((c.cpuShare / 100) * totalCpu);
+    });
+  }
+
+  return cells.sort((a, b) => b.cpuShare - a.cpuShare).slice(0, 12);
+}
+
+/**
+ * Archetypal CPU hotspot cells representing typical Soroban contract phases.
+ * Used when no live call graph is available.
+ */
+function defaultHotspotCells(totalCpu: number): CpuHotspotCell[] {
+  const archetypes: Array<{
+    id: string; fnName: string; displayName: string; category: FnCategory; share: number;
+  }> = [
+    { id: 'def-0',  fnName: 'auth::verify_signature',    displayName: 'auth::verify_sig',  category: 'auth',    share: 24 },
+    { id: 'def-1',  fnName: 'data::deserialize_args',    displayName: 'data::deserialize', category: 'storage', share: 14 },
+    { id: 'def-2',  fnName: 'fn::core_logic',            displayName: 'fn::core_logic',    category: 'compute', share: 12 },
+    { id: 'def-3',  fnName: 'map::write_state',          displayName: 'map::write',        category: 'storage', share: 10 },
+    { id: 'def-4',  fnName: 'map::read_state',           displayName: 'map::read',         category: 'storage', share:  8 },
+    { id: 'def-5',  fnName: 'fn::validate_inputs',       displayName: 'validate_inputs',   category: 'util',    share:  7 },
+    { id: 'def-6',  fnName: 'host::cross_contract_call', displayName: 'host::invoke',      category: 'compute', share:  6 },
+    { id: 'def-7',  fnName: 'math::u128_arithmetic',     displayName: 'math::u128_ops',    category: 'compute', share:  6 },
+    { id: 'def-8',  fnName: 'token::balance_check',      displayName: 'balance_check',     category: 'compute', share:  5 },
+    { id: 'def-9',  fnName: 'event::publish_event',      displayName: 'event::publish',    category: 'io',      share:  4 },
+    { id: 'def-10', fnName: 'wasm::linear_memory_ops',   displayName: 'wasm::mem_ops',     category: 'util',    share:  4 },
+  ];
+
+  return archetypes.map(a => ({
+    ...a,
+    cpuShare: a.share,
+    cpuInstructions: Math.round((a.share / 100) * totalCpu),
+    depth: 0,
+  }));
+}
+
+// ── RAM allocation data builder ───────────────────────────────────────────────
+
+/**
+ * Distributes `totalBytes` across the seven Soroban WASM memory regions using
+ * ratios derived from empirical Soroban contract execution profiles.
+ *
+ * WASM Linear Memory dominates because it holds the contract heap; Host Objects
+ * are the next biggest consumer (Maps, Vectors, Bytes passed to/from the host).
+ */
+function defaultRamCells(totalBytes: number): RamAllocCell[] {
+  const regions: Array<{
+    id: string; label: string; shortLabel: string; region: RamRegion; share: number;
+  }> = [
+    { id: 'ram-0', label: 'WASM Linear Memory',  shortLabel: 'WASM Heap',   region: 'heap',   share: 44 },
+    { id: 'ram-1', label: 'Host Objects',         shortLabel: 'Host Objs',   region: 'host',   share: 21 },
+    { id: 'ram-2', label: 'WASM Call Stack',      shortLabel: 'WASM Stack',  region: 'stack',  share: 13 },
+    { id: 'ram-3', label: 'Contract Data',        shortLabel: 'Cntr Data',   region: 'data',   share:  9 },
+    { id: 'ram-4', label: 'Auth Context',         shortLabel: 'Auth Ctx',    region: 'auth',   share:  6 },
+    { id: 'ram-5', label: 'Temp Buffers',         shortLabel: 'Tmp Buf',     region: 'buffer', share:  4 },
+    { id: 'ram-6', label: 'Event Buffers',        shortLabel: 'Evt Buf',     region: 'event',  share:  3 },
+  ];
+
+  return regions.map(r => ({
+    ...r,
+    bytes: Math.round((r.share / 100) * totalBytes),
+  }));
+}
+
+// ── RAM region colours ────────────────────────────────────────────────────────
+
+interface RamColors {
+  hex: string;
+  bg: string;
+  border: string;
+  text: string;
+  badge: string;
+}
+
+const RAM_COLORS: Record<RamRegion, RamColors> = {
+  heap:   { hex: '#f59e0b', bg: 'bg-amber-500/20',   border: 'border-amber-500/50',  text: 'text-amber-300',  badge: 'bg-amber-900/70 text-amber-300 border-amber-700'   },
+  host:   { hex: '#10b981', bg: 'bg-emerald-500/20', border: 'border-emerald-500/50',text: 'text-emerald-300',badge: 'bg-emerald-900/70 text-emerald-300 border-emerald-700'},
+  stack:  { hex: '#0ea5e9', bg: 'bg-sky-500/20',     border: 'border-sky-500/50',    text: 'text-sky-300',    badge: 'bg-sky-900/70 text-sky-300 border-sky-700'           },
+  data:   { hex: '#8b5cf6', bg: 'bg-violet-500/20',  border: 'border-violet-500/50', text: 'text-violet-300', badge: 'bg-violet-900/70 text-violet-300 border-violet-700'  },
+  auth:   { hex: '#ec4899', bg: 'bg-pink-500/20',    border: 'border-pink-500/50',   text: 'text-pink-300',   badge: 'bg-pink-900/70 text-pink-300 border-pink-700'         },
+  buffer: { hex: '#64748b', bg: 'bg-slate-600/20',   border: 'border-slate-500/50',  text: 'text-slate-400',  badge: 'bg-slate-800/70 text-slate-400 border-slate-600'      },
+  event:  { hex: '#6366f1', bg: 'bg-indigo-500/20',  border: 'border-indigo-500/50', text: 'text-indigo-300', badge: 'bg-indigo-900/70 text-indigo-300 border-indigo-700'   },
+};
+
+// ── Ledger segment data builders ─────────────────────────────────────────────
+
+/**
+ * Soroban ledger reads come from three entry types: the contract's WASM bytecode
+ * (largest because the full module is paged in), persistent contract-data entries,
+ * and any account/trustline entries touched during auth.
+ */
+function buildReadSegments(totalReadBytes: number): LedgerSegment[] {
+  const defs = [
+    { id: 'r0', label: 'Contract Code (WASM)',   shortLabel: 'Contract Code', share: 48 },
+    { id: 'r1', label: 'Contract Data Entries',  shortLabel: 'Contract Data', share: 35 },
+    { id: 'r2', label: 'Account Ledger Entries', shortLabel: 'Account Data',  share: 17 },
+  ];
+  return defs.map(d => ({ ...d, kind: 'read' as LedgerKind, bytes: Math.round((d.share / 100) * totalReadBytes) }));
+}
+
+/**
+ * Soroban ledger writes go to two entry types: persistent contract-data entries
+ * (the dominant cost), and account state changes driven by token transfers or auth.
+ */
+function buildWriteSegments(totalWriteBytes: number): LedgerSegment[] {
+  const defs = [
+    { id: 'w0', label: 'Contract Data Writes',  shortLabel: 'Contract Data',  share: 68 },
+    { id: 'w1', label: 'Account State Changes', shortLabel: 'Account State',  share: 32 },
+  ];
+  return defs.map(d => ({ ...d, kind: 'write' as LedgerKind, bytes: Math.round((d.share / 100) * totalWriteBytes) }));
+}
+
+// Hex colours for the two kinds and their sub-segments
+const READ_SHADES  = ['#06b6d4', '#0891b2', '#0e7490'] as const;
+const WRITE_SHADES = ['#f43f5e', '#e11d48', '#be123c'] as const;
+
+// ── Colour helpers ────────────────────────────────────────────────────────────
+
+interface HotspotColors {
+  bg: string;
+  border: string;
+  text: string;
+  barHex: string;
+  badge: string;
+  label: string;
+}
+
+function hotspotColors(share: number): HotspotColors {
+  if (share >= 20) return { bg: 'bg-rose-500/75',   border: 'border-rose-400',   text: 'text-rose-100',   barHex: '#f43f5e', badge: 'bg-rose-900/80 text-rose-300',   label: 'CRITICAL' };
+  if (share >= 10) return { bg: 'bg-orange-500/65', border: 'border-orange-400', text: 'text-orange-100', barHex: '#f97316', badge: 'bg-orange-900/80 text-orange-300', label: 'HIGH'     };
+  if (share >=  5) return { bg: 'bg-amber-500/55',  border: 'border-amber-400',  text: 'text-amber-100',  barHex: '#eab308', badge: 'bg-amber-900/80 text-amber-300',   label: 'MEDIUM'   };
+  if (share >=  2) return { bg: 'bg-cyan-700/45',   border: 'border-cyan-500',   text: 'text-cyan-100',   barHex: '#06b6d4', badge: 'bg-cyan-900/80 text-cyan-300',     label: 'LOW'      };
+  return               { bg: 'bg-slate-800/65',  border: 'border-slate-700',  text: 'text-slate-400',  barHex: '#475569', badge: 'bg-slate-800 text-slate-500',        label: 'TRACE'    };
+}
+
+const CATEGORY_STYLE: Record<FnCategory, { label: string; cls: string }> = {
+  auth:    { label: 'AUTH',    cls: 'text-violet-400 border-violet-700 bg-violet-950/60' },
+  storage: { label: 'STORAGE', cls: 'text-blue-400   border-blue-700   bg-blue-950/60'  },
+  compute: { label: 'COMPUTE', cls: 'text-orange-400 border-orange-700 bg-orange-950/60'},
+  io:      { label: 'I/O',     cls: 'text-green-400  border-green-700  bg-green-950/60' },
+  util:    { label: 'UTIL',    cls: 'text-slate-400  border-slate-600  bg-slate-800/60' },
+};
+
+// ── Misc helpers ──────────────────────────────────────────────────────────────
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  if (bytes >= 1024)        return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function fmtInstr(n: number): string {
+  return new Intl.NumberFormat('en-US', { notation: 'compact', compactDisplay: 'short' }).format(n);
+}
+
+// ── Canvas heatmap geometry helpers ──────────────────────────────────────────
+
+/** Number of columns in the canvas heatmap grid. */
+export const HEATMAP_COLS = 6;
+/** Number of rows in the canvas heatmap grid. */
+export const HEATMAP_ROWS = 6;
+
+/**
+ * Map a pointer position (in CSS pixels, relative to the canvas element) to a
+ * heatmap grid cell index. Returns `null` when the point falls outside the grid.
+ *
+ * `cssWidth` / `cssHeight` are the element's layout size (CSS pixels), NOT the
+ * backing-store size. Callers must divide `offsetX` / `offsetY` by
+ * `devicePixelRatio` when the canvas backing store is scaled for HiDPI.
+ */
+export function hitTestHeatmapCell(
+  offsetX: number,
+  offsetY: number,
+  cssWidth: number,
+  cssHeight: number,
+  cols: number = HEATMAP_COLS,
+  rows: number = HEATMAP_ROWS,
+): number | null {
+  if (!(cssWidth > 0) || !(cssHeight > 0)) return null;
+  if (offsetX < 0 || offsetY < 0 || offsetX >= cssWidth || offsetY >= cssHeight) return null;
+  const col = Math.min(Math.floor((offsetX / cssWidth) * cols), cols - 1);
+  const row = Math.min(Math.floor((offsetY / cssHeight) * rows), rows - 1);
+  return row * cols + col;
+}
+
+/**
+ * Convert a raw pointer offset (which may be in device pixels on some browsers
+ * when the backing store is scaled) into CSS pixels using the DPR.
+ */
+export function toCssOffset(offset: number, dpr: number): number {
+  const safeDpr = dpr > 0 ? dpr : 1;
+  return offset / safeDpr;
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
+export function ResourceHeatmap({ resourceCost, callGraph }: ResourceHeatmapProps) {
+  type Tab = 'gauges' | 'ram' | 'hotspot' | 'footprint';
+  const [activeTab, setActiveTab] = useState<Tab>('gauges');
+  const [hoveredCellId, setHoveredCellId] = useState<string | null>(null);
+  const [hoveredRamId,      setHoveredRamId]      = useState<string | null>(null);
+  const [hoveredSegmentId,  setHoveredSegmentId]  = useState<string | null>(null);
+  const [hoveredKey,        setHoveredKey]         = useState<string | null>(null);
+
+  // ── Canvas heatmap refs ─────────────────────────────────────────────────────
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const rafHandleRef = useRef<number | null>(null);
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  const [hoveredCanvasCell, setHoveredCanvasCell] = useState<number | null>(null);
 
   const {
-    cpu_instructions,
-    ram_bytes,
-    ledger_read_bytes,
-    ledger_write_bytes,
-    transaction_size_bytes,
+    cpu_instructions = 0,
+    ram_bytes = 0,
+    ledger_read_bytes = 0,
+    ledger_write_bytes = 0,
+    transaction_size_bytes = 0,
     cost_stroops = 120,
     state_snapshot
-  } = resourceCost;
+  } = resourceCost ?? {};
+  // Coerce to numbers so undefined / null from an empty API response does not
+  // produce NaN percentages or crash downstream math.
+  const cpuInstructions = Number(cpu_instructions) || 0;
+  const ramBytes = Number(ram_bytes) || 0;
+  const ledgerReadBytes = Number(ledger_read_bytes) || 0;
+  const ledgerWriteBytes = Number(ledger_write_bytes) || 0;
+  const txSizeBytes = Number(transaction_size_bytes) || 0;
+  const costStroops = Number(cost_stroops) || 0;
 
   // ── Budget percentages ──────────────────────────────────────────────────────
-  const cpuPct     = Math.min((cpu_instructions         / LIMITS.CPU)          * 100, 100);
-  const ramPct     = Math.min((ram_bytes                / LIMITS.RAM)          * 100, 100);
-  const ioReadPct  = Math.min((ledger_read_bytes        / LIMITS.LEDGER_READ)  * 100, 100);
-  const ioWritePct = Math.min((ledger_write_bytes       / LIMITS.LEDGER_WRITE) * 100, 100);
-  const txSizePct  = Math.min((transaction_size_bytes   / LIMITS.TX_SIZE)      * 100, 100);
-  const ioPct      = Math.min(((ledger_read_bytes + ledger_write_bytes) / (LIMITS.LEDGER_READ + LIMITS.LEDGER_WRITE)) * 100, 100);
+  const cpuPct     = Math.min((cpuInstructions      / LIMITS.CPU)          * 100, 100);
+  const ramPct     = Math.min((ramBytes             / LIMITS.RAM)          * 100, 100);
+  const ioReadPct  = Math.min((ledgerReadBytes      / LIMITS.LEDGER_READ)  * 100, 100);
+  const ioWritePct = Math.min((ledgerWriteBytes     / LIMITS.LEDGER_WRITE) * 100, 100);
+  const txSizePct  = Math.min((txSizeBytes          / LIMITS.TX_SIZE)      * 100, 100);
+  const ioPct      = Math.min(((ledgerReadBytes + ledgerWriteBytes) / (LIMITS.LEDGER_READ + LIMITS.LEDGER_WRITE)) * 100, 100);
 
   const statusColor = (pct: number) => {
     if (pct > 80) return { text: 'text-rose-400',  ring: '#f43f5e', glow: 'drop-shadow-[0_0_6px_rgba(244,63,94,0.4)]'  };
@@ -96,379 +388,216 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
 
   // ── CPU hotspot cells ───────────────────────────────────────────────────────
   const hotspotCells = useMemo<CpuHotspotCell[]>(() => {
-    if (callGraph?.root) return cellsFromCallGraph(callGraph.root, cpu_instructions);
-    return defaultHotspotCells(cpu_instructions);
-  }, [callGraph, cpu_instructions]);
+    if (callGraph?.root) return cellsFromCallGraph(callGraph.root, cpuInstructions);
+    return defaultHotspotCells(cpuInstructions);
+  }, [callGraph, cpuInstructions]);
 
   const hoveredCell  = hotspotCells.find(c => c.id === hoveredCellId) ?? null;
   const isLiveData   = Boolean(callGraph?.root);
   const top3Share    = hotspotCells.slice(0, 3).reduce((s, c) => s + c.cpuShare, 0);
 
   // ── RAM allocation cells ────────────────────────────────────────────────────
-  const ramCells    = useMemo<RamAllocCell[]>(() => defaultRamCells(ram_bytes), [ram_bytes]);
+  const ramCells    = useMemo<RamAllocCell[]>(() => defaultRamCells(ramBytes), [ramBytes]);
   const hoveredRam  = ramCells.find(c => c.id === hoveredRamId) ?? null;
 
   // ── Ledger segment cells ────────────────────────────────────────────────────
-  const readSegments  = useMemo(() => buildReadSegments(ledger_read_bytes),   [ledger_read_bytes]);
-  const writeSegments = useMemo(() => buildWriteSegments(ledger_write_bytes), [ledger_write_bytes]);
+  const readSegments  = useMemo(() => buildReadSegments(ledgerReadBytes),   [ledgerReadBytes]);
+  const writeSegments = useMemo(() => buildWriteSegments(ledgerWriteBytes), [ledgerWriteBytes]);
   const allSegments   = [...readSegments, ...writeSegments];
   const hoveredSeg    = allSegments.find(s => s.id === hoveredSegmentId) ?? null;
-  const totalIoBytes  = ledger_read_bytes + ledger_write_bytes;
+  const totalIoBytes  = ledgerReadBytes + ledgerWriteBytes;
 
   // ── Ledger footprint ────────────────────────────────────────────────────────
+  // Guard against null/undefined state_snapshot and its sub-fields so empty
+  // API responses do not throw in Object.entries() or .map() (issue #1275).
   const ledgerEntries = state_snapshot?.ledger_entries ?? {};
   const ttlEntries    = state_snapshot?.ttl_entries    ?? {};
+  const dataEntries = (Object.entries(ledgerEntries ?? {}) ?? []) as Array<[string, string]>;
 
-  const footprintItems = Object.keys(ledgerEntries).length > 0
+  const footprintItems = (ledgerEntries && Object.keys(ledgerEntries).length > 0)
     ? Object.entries(ledgerEntries).map(([key, value]) => {
-        const sizeBytes = Math.floor((key.length + value.length) * 0.75);
-        const isWrite = ledger_write_bytes > 0 && Math.random() > 0.6;
-        const ttl = ttlEntries[key] || Math.floor(Math.random() * 4000) + 1000;
-        return { key, sizeBytes, isWrite, ttl, name: key };
+        const safeValue = String(value ?? '');
+        const safeKey = String(key ?? '');
+        return {
+          key: safeKey,
+          name: safeKey,
+          sizeBytes: Math.floor((safeKey.length + safeValue.length) * 0.75),
+          isWrite: ledgerWriteBytes > 0 && (safeKey.charCodeAt(0) % 3 === 0),
+          ttl: ttlEntries[safeKey] ?? 3000,
+        };
       })
     : [
-        { key: 'admin_thresholds', sizeBytes: 120, isWrite: false, ttl: 4800, name: 'Admin Thresholds (Key: ADM-1)' },
-        { key: 'contract_instance', sizeBytes: 2048, isWrite: false, ttl: 6200, name: 'Contract Code Instance (Key: INST-1)' },
-        { key: 'balance_owner_acc', sizeBytes: 256, isWrite: true, ttl: 2900, name: 'Balance Store (Key: ACC-BAL-1)' },
-        { key: 'allowance_recipient', sizeBytes: 192, isWrite: true, ttl: 1200, name: 'Allowance Map (Key: ALLOW-2)' },
-        { key: 'metadata_desc', sizeBytes: 512, isWrite: false, ttl: 9200, name: 'Token Metadata (Key: META-DESC)' },
-        { key: 'auth_signatures', sizeBytes: 1024, isWrite: false, ttl: 3400, name: 'Auth Registry (Key: SIGN-AUTH)' },
-        { key: 'event_sequence', sizeBytes: 64, isWrite: true, ttl: 800, name: 'Sequence Counter (Key: SEQ-CTR)' },
-        { key: 'temporary_nonce', sizeBytes: 128, isWrite: true, ttl: 450, name: 'Replay Nonce (Key: NONCE-TMP)' },
+        { key: 'admin_thresholds',    name: 'Admin Thresholds (Key: ADM-1)',           sizeBytes: 120,  isWrite: false, ttl: 4800 },
+        { key: 'contract_instance',   name: 'Contract Code Instance (Key: INST-1)',    sizeBytes: 2048, isWrite: false, ttl: 6200 },
+        { key: 'balance_owner_acc',   name: 'Balance Store (Key: ACC-BAL-1)',          sizeBytes: 256,  isWrite: true,  ttl: 2900 },
+        { key: 'allowance_recipient', name: 'Allowance Map (Key: ALLOW-2)',            sizeBytes: 192,  isWrite: true,  ttl: 1200 },
+        { key: 'metadata_desc',       name: 'Token Metadata (Key: META-DESC)',         sizeBytes: 512,  isWrite: false, ttl: 9200 },
+        { key: 'auth_signatures',     name: 'Auth Registry (Key: SIGN-AUTH)',          sizeBytes: 1024, isWrite: false, ttl: 3400 },
+        { key: 'event_sequence',      name: 'Sequence Counter (Key: SEQ-CTR)',         sizeBytes: 64,   isWrite: true,  ttl: 800  },
+        { key: 'temporary_nonce',     name: 'Replay Nonce (Key: NONCE-TMP)',           sizeBytes: 128,  isWrite: true,  ttl: 450  },
       ];
 
   const formatKey = (key: string) =>
     key.length <= 16 ? key : `${key.slice(0, 8)}…${key.slice(-8)}`;
 
-  // Generate 6x6 Core Matrix points (memoized for canvas performance)
-  const matrixCells = useMemo(() => Array.from({ length: 36 }).map((_, index) => {
-    const row = Math.floor(index / 6);
-    const col = index % 6;
-    
-    let metricType: 'CPU' | 'RAM' | 'READ' | 'WRITE';
-    let weight = 0;
-    
-    if (row < 2) {
-      metricType = 'CPU';
-      weight = cpuPct * (0.4 + Math.sin(index + 1) * 0.3);
-    } else if (row < 4) {
-      metricType = 'RAM';
-      weight = ramPct * (0.5 + Math.cos(index) * 0.25);
-    } else if (col < 3) {
-      metricType = 'READ';
-      weight = ioReadPct * (0.6 + Math.sin(col) * 0.2);
-    } else {
-      metricType = 'WRITE';
-      weight = ioWritePct * (0.4 + Math.cos(row) * 0.3);
-    }
-
-    weight = Math.max(2, Math.min(weight, 100));
-
-    return {
-      id: `cell-${row}-${col}`,
-      row,
-      col,
-      type: metricType,
-      load: weight,
-    };
-  }), [cpuPct, ramPct, ioReadPct, ioWritePct]);
-
-  // Canvas refs and transform state for matrix zoom/pan
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const transformRef = useRef({ scale: 1, offsetX: 0, offsetY: 0 });
-  const isPanning = useRef(false);
-  const panStart = useRef({ x: 0, y: 0 });
-  const animationFrameRef = useRef<number | null>(null);
-  const hoveredCellRef = useRef<string | null>(null);
-  const tooltipRef = useRef<HTMLDivElement>(null);
-  const touchGestureRef = useRef<{
-    startX: number;
-    startY: number;
-    lastX: number;
-    lastY: number;
-    moved: boolean;
-    pinched: boolean;
-    startDistance: number;
-    startScale: number;
-    startOffsetX: number;
-    startOffsetY: number;
-    startCenterX: number;
-    startCenterY: number;
-  } | null>(null);
-
-  const requestRedraw = useCallback(() => {
-    if (animationFrameRef.current !== null) {
-      cancelAnimationFrame(animationFrameRef.current);
-    }
-    animationFrameRef.current = requestAnimationFrame(() => {
-      drawMatrix();
-      animationFrameRef.current = null;
-    });
-  }, []);
-
-  const drawMatrix = useCallback(() => {
+  // ── Canvas heatmap drawing (HiDPI-aware) ────────────────────────────────────
+  const drawHeatmap = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const { scale, offsetX, offsetY } = transformRef.current;
-
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.save();
-    ctx.translate(offsetX, offsetY);
-    ctx.scale(scale, scale);
-
-    const totalCellSize = CELL_SIZE + GAP;
-
-    for (const cell of matrixCells) {
-      const x = PADDING + cell.col * totalCellSize;
-      const y = PADDING + cell.row * totalCellSize;
-      const colors = getCellColors(cell.load);
-
-      // Cell fill
-      ctx.fillStyle = colors.fill;
-      ctx.fillRect(x, y, CELL_SIZE, CELL_SIZE);
-
-      // Cell border
-      ctx.strokeStyle = colors.stroke;
-      ctx.lineWidth = 1 / scale;
-      ctx.strokeRect(x, y, CELL_SIZE, CELL_SIZE);
-
-      // Type letter
-      ctx.fillStyle = 'rgba(148,163,184,0.2)';
-      ctx.font = `${Math.max(8, 12 / scale)}px monospace`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(cell.type[0], x + CELL_SIZE / 2, y + CELL_SIZE / 2);
-
-      // Hover highlight
-      if (hoveredCellRef.current === cell.id) {
-        ctx.strokeStyle = 'rgba(255,255,255,0.9)';
-        ctx.lineWidth = 2 / scale;
-        ctx.strokeRect(x - 1, y - 1, CELL_SIZE + 2, CELL_SIZE + 2);
-      }
-    }
-
-    ctx.restore();
-  }, [matrixCells]);
-
-  // Initial draw and resize handling
-  useEffect(() => {
-    drawMatrix();
-  }, [drawMatrix]);
-
-  useEffect(() => {
-    const handleResize = () => requestRedraw();
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, [requestRedraw]);
-
-  const handleWheel = useCallback((e: React.WheelEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
     const rect = canvas.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
+    const cssWidth = rect.width;
+    const cssHeight = rect.height;
+    if (!(cssWidth > 0) || !(cssHeight > 0)) return;
 
-    const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
-    const { scale, offsetX, offsetY } = transformRef.current;
-    const newScale = Math.min(Math.max(scale * zoomFactor, 0.1), 10);
+    const dpr = window.devicePixelRatio || 1;
 
-    const newOffsetX = mouseX - (mouseX - offsetX) * (newScale / scale);
-    const newOffsetY = mouseY - (mouseY - offsetY) * (newScale / scale);
+    // Scale the backing store by DPR for crisp Retina rendering.
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+    // Keep the CSS layout size at the logical (CSS pixel) dimensions.
+    canvas.style.width = `${cssWidth}px`;
+    canvas.style.height = `${cssHeight}px`;
 
-    transformRef.current = { scale: newScale, offsetX: newOffsetX, offsetY: newOffsetY };
-    requestRedraw();
-  }, [requestRedraw]);
+    // Normalise the drawing coordinate system back to CSS pixels.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
 
-  const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    isPanning.current = true;
-    panStart.current = { x: e.clientX - transformRef.current.offsetX, y: e.clientY - transformRef.current.offsetY };
-    if (canvasRef.current) {
-      canvasRef.current.style.cursor = 'grabbing';
-    }
-  }, []);
+    const cellW = cssWidth / HEATMAP_COLS;
+    const cellH = cssHeight / HEATMAP_ROWS;
 
-  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (isPanning.current) {
-      transformRef.current.offsetX = e.clientX - panStart.current.x;
-      transformRef.current.offsetY = e.clientY - panStart.current.y;
-      requestRedraw();
-      return;
-    }
+    for (let row = 0; row < HEATMAP_ROWS; row++) {
+      for (let col = 0; col < HEATMAP_COLS; col++) {
+        const idx = row * HEATMAP_COLS + col;
+        const cell = hotspotCells[idx];
+        const share = cell?.cpuShare ?? 0;
+        const clr = hotspotColors(share);
+        const isHovered = hoveredCanvasCell === idx;
 
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
+        ctx.fillStyle = clr.barHex;
+        ctx.globalAlpha = isHovered ? 0.95 : 0.55;
+        ctx.fillRect(col * cellW + 1, row * cellH + 1, cellW - 2, cellH - 2);
 
-    const { scale, offsetX, offsetY } = transformRef.current;
-    const canvasX = (mouseX - offsetX) / scale;
-    const canvasY = (mouseY - offsetY) / scale;
-
-    const totalCellSize = CELL_SIZE + GAP;
-    let found: Cell | null = null;
-    for (const cell of matrixCells) {
-      const x = PADDING + cell.col * totalCellSize;
-      const y = PADDING + cell.row * totalCellSize;
-      if (canvasX >= x && canvasX < x + CELL_SIZE && canvasY >= y && canvasY < y + CELL_SIZE) {
-        found = cell;
-        break;
-      }
-    }
-
-    const newHoveredId = found ? found.id : null;
-    if (hoveredCellRef.current !== newHoveredId) {
-      hoveredCellRef.current = newHoveredId;
-      setHoveredCell(newHoveredId);
-      if (found) {
-        setTooltip({ x: e.clientX, y: e.clientY, cell: found });
-      } else {
-        setTooltip(null);
-      }
-      requestRedraw();
-    } else if (found && tooltip) {
-      setTooltip({ ...tooltip, x: e.clientX, y: e.clientY });
-    }
-  }, [matrixCells, requestRedraw, tooltip]);
-
-  const handleMouseUp = useCallback(() => {
-    isPanning.current = false;
-    if (canvasRef.current) {
-      canvasRef.current.style.cursor = 'crosshair';
-    }
-  }, []);
-
-  const handleMouseLeave = useCallback(() => {
-    isPanning.current = false;
-    hoveredCellRef.current = null;
-    setHoveredCell(null);
-    setTooltip(null);
-    if (canvasRef.current) {
-      canvasRef.current.style.cursor = 'crosshair';
-    }
-    requestRedraw();
-  }, [requestRedraw]);
-
-  const findCellAt = useCallback((clientX: number, clientY: number) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return null;
-    const rect = canvas.getBoundingClientRect();
-    const { scale, offsetX, offsetY } = transformRef.current;
-    const canvasX = (clientX - rect.left - offsetX) / scale;
-    const canvasY = (clientY - rect.top - offsetY) / scale;
-    const totalCellSize = CELL_SIZE + GAP;
-    return matrixCells.find((cell) => {
-      const x = PADDING + cell.col * totalCellSize;
-      const y = PADDING + cell.row * totalCellSize;
-      return canvasX >= x && canvasX < x + CELL_SIZE && canvasY >= y && canvasY < y + CELL_SIZE;
-    }) ?? null;
-  }, [matrixCells]);
-
-  const handleTouchStart = useCallback((e: React.TouchEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    const touches = Array.from(e.touches);
-    if (touches.length === 0) return;
-    const first = touches[0];
-    const second = touches[1];
-    const centerX = second ? (first.clientX + second.clientX) / 2 : first.clientX;
-    const centerY = second ? (first.clientY + second.clientY) / 2 : first.clientY;
-    const distance = second ? Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY) : 0;
-    const transform = transformRef.current;
-    touchGestureRef.current = {
-      startX: first.clientX,
-      startY: first.clientY,
-      lastX: first.clientX,
-      lastY: first.clientY,
-      moved: false,
-      pinched: touches.length > 1,
-      startDistance: distance,
-      startScale: transform.scale,
-      startOffsetX: transform.offsetX,
-      startOffsetY: transform.offsetY,
-      startCenterX: centerX,
-      startCenterY: centerY,
-    };
-    isPanning.current = false;
-    setTooltip(null);
-  }, []);
-
-  const handleTouchMove = useCallback((e: React.TouchEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    const gesture = touchGestureRef.current;
-    const touches = Array.from(e.touches);
-    if (!gesture || touches.length === 0) return;
-    const first = touches[0];
-    const second = touches[1];
-    if (Math.hypot(first.clientX - gesture.startX, first.clientY - gesture.startY) > 8) {
-      gesture.moved = true;
-    }
-
-    if (second) {
-      gesture.pinched = true;
-      const distance = Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY);
-      const centerX = (first.clientX + second.clientX) / 2;
-      const centerY = (first.clientY + second.clientY) / 2;
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const rect = canvas.getBoundingClientRect();
-      const startLocalX = gesture.startCenterX - rect.left;
-      const startLocalY = gesture.startCenterY - rect.top;
-      const currentLocalX = centerX - rect.left;
-      const currentLocalY = centerY - rect.top;
-      const scale = Math.min(10, Math.max(0.5, gesture.startScale * distance / Math.max(gesture.startDistance, 1)));
-      const ratio = scale / gesture.startScale;
-      transformRef.current = {
-        scale,
-        offsetX: currentLocalX - (startLocalX - gesture.startOffsetX) * ratio,
-        offsetY: currentLocalY - (startLocalY - gesture.startOffsetY) * ratio,
-      };
-      requestRedraw();
-      return;
-    }
-
-    if (!gesture.pinched) {
-      transformRef.current.offsetX += first.clientX - gesture.lastX;
-      transformRef.current.offsetY += first.clientY - gesture.lastY;
-      requestRedraw();
-    }
-    gesture.lastX = first.clientX;
-    gesture.lastY = first.clientY;
-  }, [requestRedraw]);
-
-  const handleTouchEnd = useCallback((e: React.TouchEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    const gesture = touchGestureRef.current;
-    if (e.touches.length === 0) {
-      if (gesture && !gesture.moved && !gesture.pinched && e.changedTouches.length > 0) {
-        const touch = e.changedTouches[0];
-        const cell = findCellAt(touch.clientX, touch.clientY);
-        if (cell) {
-          hoveredCellRef.current = cell.id;
-          setHoveredCell(cell.id);
-          setTooltip({ x: touch.clientX, y: touch.clientY, cell });
-          requestRedraw();
-        } else {
-          hoveredCellRef.current = null;
-          setHoveredCell(null);
-          setTooltip(null);
+        if (isHovered) {
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(col * cellW + 1, row * cellH + 1, cellW - 2, cellH - 2);
         }
       }
-      touchGestureRef.current = null;
-    } else if (e.touches.length === 1 && gesture) {
-      // A finger lifted from a pinch should not become a fresh pan or tap.
-      gesture.lastX = e.touches[0].clientX;
-      gesture.lastY = e.touches[0].clientY;
     }
-  }, [findCellAt, requestRedraw]);
+    ctx.globalAlpha = 1;
+  }, [hotspotCells, hoveredCanvasCell]);
 
-  const handleTouchCancel = useCallback(() => {
-    touchGestureRef.current = null;
+  // Draw + observe size changes; clean up observer and pending RAF on unmount.
+  useEffect(() => {
+    drawHeatmap();
+
+    const canvas = canvasRef.current;
+    if (!canvas || typeof ResizeObserver === 'undefined') {
+      return () => {
+        if (rafHandleRef.current !== null) {
+          cancelAnimationFrame(rafHandleRef.current);
+          rafHandleRef.current = null;
+        }
+      };
+    }
+
+    const observer = new ResizeObserver(() => {
+      if (rafHandleRef.current !== null) cancelAnimationFrame(rafHandleRef.current);
+      rafHandleRef.current = requestAnimationFrame(() => {
+        rafHandleRef.current = null;
+        drawHeatmap();
+      });
+    });
+    resizeObserverRef.current = observer;
+    observer.observe(canvas);
+
+    return () => {
+      observer.disconnect();
+      resizeObserverRef.current = null;
+      if (rafHandleRef.current !== null) {
+        cancelAnimationFrame(rafHandleRef.current);
+        rafHandleRef.current = null;
+      }
+    };
+  }, [drawHeatmap]);
+
+  const handleCanvasMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    // Normalise pointer offsets to CSS pixels before hit-testing.
+    const x = toCssOffset(e.nativeEvent.offsetX, dpr);
+    const y = toCssOffset(e.nativeEvent.offsetY, dpr);
+    const idx = hitTestHeatmapCell(x, y, rect.width, rect.height);
+    setHoveredCanvasCell(idx);
   }, []);
+
+  const handleCanvasMouseLeave = useCallback(() => {
+    setHoveredCanvasCell(null);
+  }, []);
+
+  // ── Tabs ────────────────────────────────────────────────────────────────────
+  const tabs: Array<{ key: Tab; label: string; icon: React.ReactNode }> = [
+    { key: 'gauges',   label: 'Gauges',      icon: <Sliders     className="h-3.5 w-3.5" /> },
+    { key: 'ram',      label: 'RAM',         icon: <MemoryStick className="h-3.5 w-3.5" /> },
+    { key: 'hotspot',  label: 'CPU Hotspot', icon: <Flame       className="h-3.5 w-3.5" /> },
+    { key: 'footprint',label: 'Footprint',   icon: <Database    className="h-3.5 w-3.5" /> },
+  ];
+
+  // ── SVG Ring helper ─────────────────────────────────────────────────────────
+  const CIRCUMFERENCE = 2 * Math.PI * 50; // r = 50
+
+  function Ring({
+    pct, stroke, label, sublabel, icon,
+  }: {
+    pct: number; stroke: string; label: string; sublabel: string; icon: React.ReactNode;
+  }) {
+    const clr = statusColor(pct);
+    return (
+      <div className="flex flex-col items-center bg-slate-950/40 p-5 rounded-xl border border-slate-800/60 shadow-sm relative group hover:border-slate-700 transition-all duration-300">
+        <span className="absolute top-2 right-2 text-[10px] font-mono text-slate-500 uppercase tracking-widest">BUDGET</span>
+        <div className="relative h-32 w-32 flex items-center justify-center mt-2">
+          <svg className="absolute inset-0 h-full w-full -rotate-90" viewBox="0 0 128 128">
+            <circle cx="64" cy="64" r="50" fill="transparent" stroke="#1e293b" strokeWidth="6" />
+            <circle
+              cx="64" cy="64" r="50" fill="transparent"
+              stroke={stroke} strokeWidth="7"
+              strokeDasharray={CIRCUMFERENCE}
+              strokeDashoffset={CIRCUMFERENCE - (pct / 100) * CIRCUMFERENCE}
+              strokeLinecap="round"
+              className={cn('transition-all duration-1000 ease-out', clr.glow)}
+            />
+          </svg>
+          <div className="text-center">
+            <div className={cn('text-xl font-extrabold font-mono mt-0.5 tracking-tight', clr.text)}>
+              {pct.toFixed(1)}%
+            </div>
+            <span className="text-[9px] font-mono text-slate-400">{sublabel}</span>
+          </div>
+        </div>
+        <div className="mt-4 w-full border-t border-slate-800/80 pt-3 text-center">
+          <p className="text-[11px] font-mono text-slate-400 flex items-center justify-center gap-1.5">
+            {icon}
+            {label}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!resourceCost) {
+    return (
+      <div className="w-full rounded-xl border border-slate-800 bg-slate-900/90 p-6">
+        <p className="py-16 text-center text-sm text-slate-500">No data</p>
+      </div>
+    );
+  }
 
   return (
     <div className="w-full bg-slate-900/90 backdrop-blur-2xl border border-slate-800 rounded-xl shadow-2xl p-6 relative overflow-hidden font-sans select-none">
@@ -518,41 +647,38 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
         {/* Panel 1 — Circular Gauges */}
         {activeTab === 'gauges' && (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-center">
-            {/* SVG Ring 1: CPU Instructions */}
-            <div className="flex flex-col items-center bg-slate-950/40 p-5 rounded-xl border border-slate-800/60 shadow-sm relative group hover:border-slate-800 transition-all duration-300">
-              <div className="absolute top-2 right-2 flex gap-1">
-                <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">BUDGET</span>
-              </div>
-              <div className="relative h-32 w-32 flex items-center justify-center mt-2">
-                <svg className="absolute inset-0 h-full w-full -rotate-90">
-                  <circle cx="64" cy="64" r="50" fill="transparent" stroke="#1e293b" strokeWidth="6" />
-                  <circle 
-                    cx="64" 
-                    cy="64" 
-                    r="50" 
-                    fill="transparent" 
-                    stroke="#06b6d4" 
-                    strokeWidth="7" 
-                    strokeDasharray="314.16"
-                    strokeDashoffset={314.16 - (cpuPct / 100) * 314.16}
-                    strokeLinecap="round"
-                    className="transition-all duration-1000 ease-out drop-shadow-[0_0_6px_rgba(6,182,212,0.4)]"
-                  />
-                </svg>
-                <div className="text-center">
-                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">CPU LOAD</span>
-                  <div className="text-xl font-extrabold text-cyan-400 font-mono mt-0.5 tracking-tight">
-                    {cpuPct.toFixed(1)}%
-                  </div>
-                  <span className="text-[9px] font-mono text-slate-400">
-                    {new Intl.NumberFormat('en-US', { notation: 'compact' }).format(cpu_instructions)} ops
-                  </span>
-                </div>
-              </div>
-              <div className="mt-4 w-full border-t border-slate-800/80 pt-3 text-center">
-                <p className="text-[11px] font-mono text-slate-400 flex items-center justify-center gap-1.5">
-                  <Cpu className="h-3.5 w-3.5 text-slate-500" />
-                  Limit: 100M instructions
+            <Ring
+              pct={cpuPct} stroke={cpuStyle.ring}
+              label="Limit: 100M instructions" sublabel={`${fmtInstr(cpuInstructions)} ops`}
+              icon={<Cpu className="h-3.5 w-3.5 text-slate-500" />}
+            />
+            <Ring
+              pct={ramPct} stroke={ramStyle.ring}
+              label="Limit: 40 MB RAM" sublabel={formatBytes(ramBytes)}
+              icon={<Activity className="h-3.5 w-3.5 text-slate-500" />}
+            />
+            <Ring
+              pct={ioPct} stroke={ioStyle.ring}
+              label="Limit: 250 KB Total I/O" sublabel={formatBytes(ledgerReadBytes + ledgerWriteBytes)}
+              icon={<Database className="h-3.5 w-3.5 text-slate-500" />}
+            />
+          </div>
+        )}
+
+        {/* ── Panel 2 — RAM Allocation Breakdown ─────────────────────────── */}
+        {activeTab === 'ram' && (
+          <div className="flex flex-col gap-5">
+
+            {/* Sub-header */}
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <h4 className="text-sm font-bold text-slate-100 uppercase tracking-widest font-mono flex items-center gap-2">
+                  <MemoryStick className="h-4 w-4 text-amber-400" />
+                  RAM Allocation Breakdown
+                </h4>
+                <p className="text-[11px] text-slate-500 mt-0.5 font-mono">
+                  {formatBytes(ramBytes)} allocated across {ramCells.length} memory regions
+                  {' • '}{ramPct.toFixed(1)}% of 40 MB budget
                 </p>
               </div>
               <div className={cn(
@@ -569,7 +695,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
             <div>
               <div className="flex items-center justify-between mb-1 text-[9px] font-mono text-slate-500">
                 <span>0 B</span>
-                <span className="text-slate-400 font-bold">{formatBytes(ram_bytes)} used</span>
+                <span className="text-slate-400 font-bold">{formatBytes(ramBytes)} used</span>
                 <span>40 MB limit</span>
               </div>
               <div className="h-2.5 w-full bg-slate-950 rounded-full overflow-hidden border border-slate-800">
@@ -587,25 +713,21 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
               </div>
             </div>
 
-            {/* SVG Ring 3: Ledger I/O */}
-            <div className="flex flex-col items-center bg-slate-950/40 p-5 rounded-xl border border-slate-800/60 shadow-sm relative group hover:border-slate-800 transition-all duration-300">
-              <div className="absolute top-2 right-2 flex gap-1">
-                <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">BUDGET</span>
-              </div>
-              <div className="relative h-32 w-32 flex items-center justify-center mt-2">
-                <svg className="absolute inset-0 h-full w-full -rotate-90">
-                  <circle cx="64" cy="64" r="50" fill="transparent" stroke="#1e293b" strokeWidth="6" />
-                  <circle 
-                    cx="64" 
-                    cy="64" 
-                    r="50" 
-                    fill="transparent" 
-                    stroke="#a371f7" 
-                    strokeWidth="7" 
-                    strokeDasharray="314.16"
-                    strokeDashoffset={314.16 - (((ledger_read_bytes + ledger_write_bytes) / (LIMITS.LEDGER_READ + LIMITS.LEDGER_WRITE)) * 100) * 3.1416}
-                    strokeLinecap="round"
-                    className="transition-all duration-1000 ease-out drop-shadow-[0_0_6px_rgba(163,113,247,0.4)]"
+            {/* Stacked proportional bar — each region is a coloured segment */}
+            <div>
+              <div className="text-[9px] font-mono text-slate-500 uppercase mb-1.5">Region Breakdown</div>
+              <div className="flex h-7 w-full rounded-lg overflow-hidden border border-slate-800/80 gap-px bg-slate-800/80">
+                {ramCells.map(cell => (
+                  <div
+                    key={`seg-${cell.id}`}
+                    title={`${cell.label}: ${formatBytes(cell.bytes)} (${cell.share}%)`}
+                    onMouseEnter={() => setHoveredRamId(cell.id)}
+                    onMouseLeave={() => setHoveredRamId(null)}
+                    className={cn(
+                      'h-full transition-all duration-300 cursor-pointer relative',
+                      hoveredRamId === cell.id ? 'brightness-125 scale-y-110 z-10' : 'hover:brightness-110',
+                    )}
+                    style={{ width: `${cell.share}%`, backgroundColor: RAM_COLORS[cell.region].hex }}
                   />
                 ))}
               </div>
@@ -774,7 +896,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                 </div>
 
                 <div className="border-t border-slate-900 pt-2 mt-4 text-[9px] font-mono text-slate-600 flex items-center justify-between">
-                  <span>TOTAL: {formatBytes(ram_bytes)}</span>
+                  <span>TOTAL: {formatBytes(ramBytes)}</span>
                   <span className="flex items-center gap-1">
                     <Info className="h-3 w-3" /> 7 regions
                   </span>
@@ -784,43 +906,26 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
           </div>
         )}
 
-        {/* Panel 2: Core Matrix View */}
-        {activeTab === 'matrix' && (
-          <div className="flex flex-col lg:flex-row gap-6 items-center">
-            
-            {/* Canvas-based 6x6 Thermal Grid Map */}
-            <div className="relative w-fit">
-              <canvas
-                ref={canvasRef}
-                width={NATURAL_WIDTH}
-                height={NATURAL_HEIGHT}
-                className="rounded-xl border border-slate-800/70 shadow-inner cursor-crosshair"
-                style={{ width: NATURAL_WIDTH, height: NATURAL_HEIGHT, touchAction: 'none' }}
-                onWheel={handleWheel}
-                onMouseDown={handleMouseDown}
-                onMouseMove={handleMouseMove}
-                onMouseUp={handleMouseUp}
-                onMouseLeave={handleMouseLeave}
-                onTouchStart={handleTouchStart}
-                onTouchMove={handleTouchMove}
-                onTouchEnd={handleTouchEnd}
-                onTouchCancel={handleTouchCancel}
-              />
-              {tooltip && (
-                <div
-                  ref={tooltipRef}
-                  className="fixed z-50 pointer-events-none bg-slate-950/95 border border-slate-800 rounded-lg px-3 py-2 text-xs shadow-xl backdrop-blur-xl"
-                  style={{ left: tooltip.x + 12, top: tooltip.y + 12 }}
-                >
-                  <div className="font-bold text-slate-100 mb-1">{tooltip.cell.type} Core</div>
-                  <div className="text-slate-400">Load: {tooltip.cell.load.toFixed(1)}%</div>
-                  <div className="text-slate-500 text-[10px] mt-1">
-                    {tooltip.cell.type === 'CPU' && `${((tooltip.cell.load / 100) * LIMITS.CPU).toLocaleString(undefined, { maximumFractionDigits: 0 })} instr`}
-                    {tooltip.cell.type === 'RAM' && formatBytes((tooltip.cell.load / 100) * LIMITS.RAM)}
-                    {tooltip.cell.type === 'READ' && formatBytes((tooltip.cell.load / 100) * LIMITS.LEDGER_READ)}
-                    {tooltip.cell.type === 'WRITE' && formatBytes((tooltip.cell.load / 100) * LIMITS.LEDGER_WRITE)}
-                  </div>
-                </div>
+        {/* ── Panel 3 — CPU Instruction Hotspot Grid ──────────────────────── */}
+        {activeTab === 'hotspot' && (
+          <div className="flex flex-col gap-5">
+
+            {/* Sub-header */}
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <h4 className="text-sm font-bold text-slate-100 uppercase tracking-widest font-mono flex items-center gap-2">
+                  <Flame className="h-4 w-4 text-orange-400" />
+                  CPU Instruction Hotspots
+                </h4>
+                <p className="text-[11px] text-slate-500 mt-0.5 font-mono">
+                  {isLiveData ? 'Live call graph data' : 'Estimated function breakdown'}
+                  {' • '}{fmtInstr(cpu_instructions)} total instructions ({cpuPct.toFixed(1)}% of budget)
+                </p>
+              </div>
+              {!isLiveData && (
+                <span className="text-[9px] font-mono bg-slate-800 text-slate-400 border border-slate-700 px-2 py-1 rounded uppercase tracking-widest">
+                  Estimated
+                </span>
               )}
             </div>
 
@@ -884,6 +989,20 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                       </button>
                     );
                   })}
+                </div>
+
+                {/* HiDPI-aware canvas heatmap */}
+                <div className="mt-4">
+                  <div className="text-[9px] font-mono text-slate-500 uppercase mb-1.5">
+                    Instruction Density Map
+                  </div>
+                  <canvas
+                    ref={canvasRef}
+                    onMouseMove={handleCanvasMouseMove}
+                    onMouseLeave={handleCanvasMouseLeave}
+                    className="w-full rounded-lg border border-slate-800/80 bg-slate-950/60 cursor-crosshair"
+                    style={{ height: '120px' }}
+                  />
                 </div>
 
                 {/* Colour legend */}
@@ -1056,14 +1175,14 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                 </h4>
                 <p className="text-[11px] text-slate-500 mt-0.5 font-mono">
                   Total I/O: {formatBytes(totalIoBytes)}
-                  {' • '}Reads: {formatBytes(ledger_read_bytes)}
-                  {' • '}Writes: {formatBytes(ledger_write_bytes)}
+                  {' • '}Reads: {formatBytes(ledgerReadBytes)}
+                  {' • '}Writes: {formatBytes(ledgerWriteBytes)}
                 </p>
               </div>
               {/* Write-ratio pill */}
               {totalIoBytes > 0 && (
                 <div className="text-[9px] font-mono bg-slate-800 border border-slate-700 text-slate-400 px-2 py-1 rounded uppercase tracking-widest">
-                  Write ratio: {((ledger_write_bytes / totalIoBytes) * 100).toFixed(0)}%
+                  Write ratio: {((ledgerWriteBytes / totalIoBytes) * 100).toFixed(0)}%
                 </div>
               )}
             </div>
@@ -1077,42 +1196,42 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                 </div>
                 <div className="flex h-8 w-full rounded-lg overflow-hidden border border-slate-800/80 gap-px bg-slate-800/80">
                   {/* Read segment */}
-                  {ledger_read_bytes > 0 && (
+                  {ledgerReadBytes > 0 && (
                     <div
                       className="h-full flex items-center justify-center transition-all duration-500 cursor-pointer hover:brightness-110"
                       style={{
-                        width: `${(ledger_read_bytes / totalIoBytes) * 100}%`,
+                        width: `${(ledgerReadBytes / totalIoBytes) * 100}%`,
                         background: 'linear-gradient(90deg, #0e7490, #06b6d4)',
                       }}
-                      title={`Reads: ${formatBytes(ledger_read_bytes)}`}
+                      title={`Reads: ${formatBytes(ledgerReadBytes)}`}
                     >
                       <span className="text-[9px] font-mono font-bold text-cyan-950 select-none truncate px-1">
-                        {ledger_read_bytes > totalIoBytes * 0.15 ? `R ${formatBytes(ledger_read_bytes)}` : ''}
+                        {ledgerReadBytes > totalIoBytes * 0.15 ? `R ${formatBytes(ledgerReadBytes)}` : ''}
                       </span>
                     </div>
                   )}
                   {/* Write segment */}
-                  {ledger_write_bytes > 0 && (
+                  {ledgerWriteBytes > 0 && (
                     <div
                       className="h-full flex items-center justify-center transition-all duration-500 cursor-pointer hover:brightness-110"
                       style={{
-                        width: `${(ledger_write_bytes / totalIoBytes) * 100}%`,
+                        width: `${(ledgerWriteBytes / totalIoBytes) * 100}%`,
                         background: 'linear-gradient(90deg, #e11d48, #f43f5e)',
                       }}
-                      title={`Writes: ${formatBytes(ledger_write_bytes)}`}
+                      title={`Writes: ${formatBytes(ledgerWriteBytes)}`}
                     >
                       <span className="text-[9px] font-mono font-bold text-rose-950 select-none truncate px-1">
-                        {ledger_write_bytes > totalIoBytes * 0.15 ? `W ${formatBytes(ledger_write_bytes)}` : ''}
+                        {ledgerWriteBytes > totalIoBytes * 0.15 ? `W ${formatBytes(ledgerWriteBytes)}` : ''}
                       </span>
                     </div>
                   )}
                 </div>
                 <div className="flex justify-between text-[8px] font-mono text-slate-600 mt-0.5 px-0.5">
                   <span className="text-cyan-600">
-                    ← Reads ({((ledger_read_bytes / totalIoBytes) * 100).toFixed(0)}%)
+                    ← Reads ({((ledgerReadBytes / totalIoBytes) * 100).toFixed(0)}%)
                   </span>
                   <span className="text-rose-600">
-                    Writes ({((ledger_write_bytes / totalIoBytes) * 100).toFixed(0)}%) →
+                    Writes ({((ledgerWriteBytes / totalIoBytes) * 100).toFixed(0)}%) →
                   </span>
                 </div>
               </div>
@@ -1136,7 +1255,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                       Ledger Reads
                     </span>
                     <span className="text-[9px] font-mono text-slate-500">
-                      {formatBytes(ledger_read_bytes)} / {formatBytes(LIMITS.LEDGER_READ)} limit
+                      {formatBytes(ledgerReadBytes)} / {formatBytes(LIMITS.LEDGER_READ)} limit
                     </span>
                   </div>
                   {/* Budget fill bar */}
@@ -1155,7 +1274,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                   </div>
                   <div className="flex justify-between text-[8px] font-mono text-slate-600 mb-3">
                     <span>{ioReadPct.toFixed(1)}% of 150 KB budget consumed</span>
-                    <span>{formatBytes(LIMITS.LEDGER_READ - ledger_read_bytes)} remaining</span>
+                    <span>{formatBytes(LIMITS.LEDGER_READ - ledgerReadBytes)} remaining</span>
                   </div>
 
                   {/* Read sub-segment rows */}
@@ -1203,7 +1322,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                       Ledger Writes
                     </span>
                     <span className="text-[9px] font-mono text-slate-500">
-                      {formatBytes(ledger_write_bytes)} / {formatBytes(LIMITS.LEDGER_WRITE)} limit
+                      {formatBytes(ledgerWriteBytes)} / {formatBytes(LIMITS.LEDGER_WRITE)} limit
                     </span>
                   </div>
                   {/* Budget fill bar */}
@@ -1222,7 +1341,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                   </div>
                   <div className="flex justify-between text-[8px] font-mono text-slate-600 mb-3">
                     <span>{ioWritePct.toFixed(1)}% of 100 KB budget consumed</span>
-                    <span>{formatBytes(LIMITS.LEDGER_WRITE - ledger_write_bytes)} remaining</span>
+                    <span>{formatBytes(LIMITS.LEDGER_WRITE - ledgerWriteBytes)} remaining</span>
                   </div>
 
                   {/* Write sub-segment rows */}
@@ -1268,7 +1387,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                       Transaction Size
                     </span>
                     <span className="text-[9px] font-mono text-slate-500">
-                      {formatBytes(transaction_size_bytes)} / {formatBytes(LIMITS.TX_SIZE)} limit
+                      {formatBytes(txSizeBytes)} / {formatBytes(LIMITS.TX_SIZE)} limit
                     </span>
                   </div>
                   <div className="h-1.5 w-full bg-slate-950 rounded-full overflow-hidden border border-slate-800">
@@ -1286,7 +1405,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                   </div>
                   <div className="flex justify-between text-[8px] font-mono text-slate-600 mt-1">
                     <span>{txSizePct.toFixed(1)}% of 70 KB budget</span>
-                    <span className={txStyle.text}>{formatBytes(transaction_size_bytes)}</span>
+                    <span className={txStyle.text}>{formatBytes(txSizeBytes)}</span>
                   </div>
                 </div>
               </div>
@@ -1301,7 +1420,7 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
                   {hoveredSeg ? (() => {
                     const isRead = hoveredSeg.kind === 'read';
                     const budgetBytes = isRead ? LIMITS.LEDGER_READ : LIMITS.LEDGER_WRITE;
-                    const kindTotal   = isRead ? ledger_read_bytes  : ledger_write_bytes;
+                    const kindTotal   = isRead ? ledgerReadBytes  : ledgerWriteBytes;
                     const kindPct     = isRead ? ioReadPct : ioWritePct;
                     const segHex      = isRead ? READ_SHADES[readSegments.findIndex(s => s.id === hoveredSeg.id)] ?? READ_SHADES[0]
                                                : WRITE_SHADES[writeSegments.findIndex(s => s.id === hoveredSeg.id)] ?? WRITE_SHADES[0];
@@ -1480,24 +1599,24 @@ export function ResourceHeatmap({ resourceCost }: ResourceHeatmapProps) {
       <div className="mt-6 pt-4 border-t border-slate-800/80 grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
         <div className="bg-slate-950/40 p-2.5 rounded-lg border border-slate-800/40">
           <span className="text-[9px] font-mono text-slate-500 block uppercase">STROOP FEE</span>
-          <span className="text-xs font-mono font-bold text-slate-300 mt-1 block">{cost_stroops.toLocaleString()} stroops</span>
+          <span className="text-xs font-mono font-bold text-slate-300 mt-1 block">{costStroops.toLocaleString()} stroops</span>
         </div>
         <div className="bg-slate-950/40 p-2.5 rounded-lg border border-slate-800/40">
           <span className="text-[9px] font-mono text-slate-500 block uppercase">TX SIZE</span>
           <span className={cn('text-xs font-mono font-bold mt-1 block', txStyle.text)}>
-            {formatBytes(transaction_size_bytes)} ({txSizePct.toFixed(1)}%)
+            {formatBytes(txSizeBytes)} ({txSizePct.toFixed(1)}%)
           </span>
         </div>
         <div className="bg-slate-950/40 p-2.5 rounded-lg border border-slate-800/40">
           <span className="text-[9px] font-mono text-slate-500 block uppercase">LEDGER READS</span>
           <span className={cn('text-xs font-mono font-bold mt-1 block', readStyle.text)}>
-            {formatBytes(ledger_read_bytes)} ({ioReadPct.toFixed(1)}%)
+            {formatBytes(ledgerReadBytes)} ({ioReadPct.toFixed(1)}%)
           </span>
         </div>
         <div className="bg-slate-950/40 p-2.5 rounded-lg border border-slate-800/40">
           <span className="text-[9px] font-mono text-slate-500 block uppercase">LEDGER WRITES</span>
           <span className={cn('text-xs font-mono font-bold mt-1 block', writeStyle.text)}>
-            {formatBytes(ledger_write_bytes)} ({ioWritePct.toFixed(1)}%)
+            {formatBytes(ledgerWriteBytes)} ({ioWritePct.toFixed(1)}%)
           </span>
         </div>
       </div>

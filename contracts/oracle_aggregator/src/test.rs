@@ -2,7 +2,9 @@
 
 use super::*;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, testutils::Ledger as _, Address, Env, Vec,
+    contract, contractimpl, contracttype,
+    testutils::{Address as _, Ledger as _},
+    Address, Env, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -203,10 +205,13 @@ fn test_stale_source_excluded_when_three_fresh_remain() {
     let aggregator_id = env.register(OracleAggregator, ());
     let client = OracleAggregatorClient::new(&env, &aggregator_id);
 
-    // max_age_seconds = 60 → stale source (age 500 s) is excluded.
-    // We now reject the entire aggregation if any source is stale.
+    // max_age_seconds = 60 → stale source (age 500 s) is rejected, even when
+    // three fresh sources remain.
     let sources = Vec::from_array(&env, [fresh_100, fresh_101, fresh_99, stale]);
-    assert_eq!(client.aggregate_price(&sources, &60), 100);
+    assert_eq!(
+        client.try_aggregate_price(&sources, &60),
+        Err(Ok(Error::InvalidOraclePrice))
+    );
 }
 
 #[test]
@@ -405,7 +410,7 @@ fn test_twap_equals_snapshot_when_no_time_elapsed() {
     let aggregator_id = env.register(OracleAggregator, ());
     let client = OracleAggregatorClient::new(&env, &aggregator_id);
 
-    assert_eq!(client.get_twap(), 0);
+    assert_eq!(client.get_rolling_twap(), 0);
     assert_eq!(
         client.aggregate_price(
             &Vec::from_array(&env, [fresh_100, fresh_101, fresh_99]),
@@ -414,7 +419,7 @@ fn test_twap_equals_snapshot_when_no_time_elapsed() {
         100
     );
     // Single observation with dt = 0 falls back to the latest snapshot.
-    assert_eq!(client.get_twap(), 100);
+    assert_eq!(client.get_rolling_twap(), 100);
 }
 
 #[test]
@@ -439,11 +444,11 @@ fn test_rolling_twap_weights_prices_by_elapsed_time() {
 
     // Immediately after the 200 snapshot the 200 price has zero duration, so
     // TWAP is still 100 (100 * 100s / 100s).
-    assert_eq!(client.get_twap(), 100);
+    assert_eq!(client.get_rolling_twap(), 100);
 
     // Hold 200 for another 200 seconds: TWAP = (100*100 + 200*200) / 300 = 166.
     env.ledger().with_mut(|li| li.timestamp = 1_300);
-    assert_eq!(client.get_twap(), 166);
+    assert_eq!(client.get_rolling_twap(), 166);
 }
 
 #[test]
@@ -469,12 +474,12 @@ fn test_twap_window_drops_expired_samples() {
     // Window start = 1250 - 200 = 1050. The 50-price sample at t=1000 is kept
     // as the pre-window boundary price and weighted only from 1050 → 1250
     // (200s), then 150 is open until now (dt = 0) → TWAP = 50.
-    assert_eq!(client.get_twap(), 50);
+    assert_eq!(client.get_rolling_twap(), 50);
 
     env.ledger().with_mut(|li| li.timestamp = 1_500);
     // Window start = 1300. The 50-price interval (1000→1250) no longer
     // overlaps the window, so only 150 (1300→1500) is weighted → TWAP = 150.
-    assert_eq!(client.get_twap(), 150);
+    assert_eq!(client.get_rolling_twap(), 150);
 }
 
 #[test]
@@ -483,4 +488,113 @@ fn test_initialize_rejects_zero_window() {
     let aggregator_id = env.register(OracleAggregator, ());
     let client = OracleAggregatorClient::new(&env, &aggregator_id);
     assert_eq!(client.try_initialize(&0), Err(Ok(Error::InvalidWindow)));
+}
+
+// ---------------------------------------------------------------------------
+// Tests – bounded, deduplicated oracle provider list
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_register_provider_rejects_duplicates() {
+    let env = Env::default();
+    let aggregator_id = env.register(OracleAggregator, ());
+    let client = OracleAggregatorClient::new(&env, &aggregator_id);
+    let provider = Address::generate(&env);
+
+    assert_eq!(client.try_register_provider(&provider), Ok(Ok(())));
+    assert_eq!(
+        client.try_register_provider(&provider),
+        Err(Ok(Error::DuplicateProvider))
+    );
+    assert_eq!(client.get_providers(), Vec::from_array(&env, [provider]));
+}
+
+#[test]
+fn test_register_provider_enforces_max_cap() {
+    let env = Env::default();
+    let aggregator_id = env.register(OracleAggregator, ());
+    let client = OracleAggregatorClient::new(&env, &aggregator_id);
+
+    for idx in 0..MAX_ORACLE_PROVIDERS {
+        let provider = Address::generate(&env);
+        assert_eq!(
+            client.try_register_provider(&provider),
+            Ok(Ok(())),
+            "registration {idx} should fit within the cap"
+        );
+    }
+
+    let extra = Address::generate(&env);
+    assert_eq!(
+        client.try_register_provider(&extra),
+        Err(Ok(Error::TooManyProviders))
+    );
+    assert_eq!(client.get_providers().len(), MAX_ORACLE_PROVIDERS);
+}
+
+#[test]
+fn test_remove_provider_cleans_up_active_list() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (a, b, c, _, _, _) = register_all(&env);
+    let aggregator_id = env.register(OracleAggregator, ());
+    let client = OracleAggregatorClient::new(&env, &aggregator_id);
+
+    for provider in [a.clone(), b.clone(), c.clone()] {
+        assert_eq!(client.try_register_provider(&provider), Ok(Ok(())));
+    }
+    assert_eq!(client.get_price(&60), 100);
+
+    assert_eq!(client.try_remove_provider(&b), Ok(Ok(())));
+    assert_eq!(
+        client.get_providers(),
+        Vec::from_array(&env, [a.clone(), c.clone()])
+    );
+    assert_eq!(
+        client.try_remove_provider(&b),
+        Err(Ok(Error::ProviderNotFound))
+    );
+    // `get_price` reads the active list, so only two feeds remain available.
+    assert_eq!(client.try_get_price(&60), Err(Ok(Error::NotEnoughSources)));
+
+    // Re-registering the removed address succeeds: no stale entry is left.
+    assert_eq!(client.try_register_provider(&b), Ok(Ok(())));
+    assert_eq!(client.get_providers().len(), 3);
+    assert_eq!(client.get_price(&60), 100);
+}
+
+#[test]
+fn test_aggregate_price_rejects_oversized_source_vector() {
+    let env = Env::default();
+    let aggregator_id = env.register(OracleAggregator, ());
+    let client = OracleAggregatorClient::new(&env, &aggregator_id);
+
+    let mut sources = Vec::new(&env);
+    for _ in 0..=MAX_ORACLE_PROVIDERS {
+        sources.push_back(Address::generate(&env));
+    }
+    assert_eq!(sources.len(), MAX_ORACLE_PROVIDERS + 1);
+    assert_eq!(
+        client.try_aggregate_price(&sources, &60),
+        Err(Ok(Error::TooManyProviders))
+    );
+}
+
+#[test]
+fn test_aggregate_price_accepts_cap_sized_source_vector() {
+    let env = Env::default();
+    let aggregator_id = env.register(OracleAggregator, ());
+    let client = OracleAggregatorClient::new(&env, &aggregator_id);
+
+    let mut sources = Vec::new(&env);
+    for _ in 0..MAX_ORACLE_PROVIDERS {
+        sources.push_back(env.register(unresponsive_source::Contract, ()));
+    }
+
+    // The cap-sized vector passes the guard; the error comes from the feeds
+    // themselves rather than from vector-size validation.
+    assert_eq!(
+        client.try_aggregate_price(&sources, &60),
+        Err(Ok(Error::OracleStaleness))
+    );
 }
