@@ -68,6 +68,8 @@ pub enum Error {
     BorrowPaused = 11,
     /// Receiver contract does not implement the FlashLoanReceiver interface.
     InvalidReceiver = 12,
+    /// Token is not supported by this vault.
+    UnsupportedToken = 13,
 }
 
 // Event types
@@ -110,6 +112,14 @@ pub struct FeesCollectedEvent {
     pub amount: i128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeExemptUpdatedEvent {
+    pub admin: Address,
+    pub account: Address,
+    pub exempt: bool,
+}
+
 // Storage keys
 
 #[contracttype]
@@ -131,6 +141,8 @@ pub enum DataKey {
     BorrowRecord(Address),
     /// Accumulated flash loan fees claimable by the admin.
     AccumulatedFees,
+    /// Fee-exempt addresses (e.g. internal protocol liquidators).
+    FeeExempt(Address),
 }
 
 // Flash loan receiver interface
@@ -266,6 +278,13 @@ fn is_borrow_paused(e: &Env) -> bool {
 
 fn set_borrow_paused(e: &Env, paused: bool) {
     e.storage().instance().set(&DataKey::BorrowPaused, &paused);
+}
+
+fn is_fee_exempt_internal(e: &Env, account: &Address) -> bool {
+    e.storage()
+        .instance()
+        .get(&DataKey::FeeExempt(account.clone()))
+        .unwrap_or(false)
 }
 
 // Contract
@@ -439,6 +458,33 @@ impl FlashLoanVault {
         Ok(fees)
     }
 
+    /// Admin-only: configure fee exemption for an address (e.g. internal protocol liquidators).
+    pub fn set_fee_exempt(e: Env, account: Address, exempt: bool) -> Result<(), Error> {
+        check_no_flash_loan_active(&e)?;
+        let admin = load_admin(&e)?;
+        admin.require_auth();
+
+        e.storage()
+            .instance()
+            .set(&DataKey::FeeExempt(account.clone()), &exempt);
+
+        e.events().publish(
+            (Symbol::new(&e, "fee_exempt_updated"), admin.clone()),
+            FeeExemptUpdatedEvent {
+                admin,
+                account,
+                exempt,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Check whether an address is exempt from flash loan fees.
+    pub fn is_fee_exempt(e: Env, account: Address) -> bool {
+        is_fee_exempt_internal(&e, &account)
+    }
+
     /// Admin-only: pause or unpause flash loan operations.
     pub fn set_paused(e: Env, admin: Address, paused: bool) -> Result<(), Error> {
         check_no_flash_loan_active(&e)?;
@@ -528,8 +574,12 @@ impl FlashLoanVault {
             return Err(Error::InsufficientVaultBalance);
         }
 
-        // 6. Calculate fee using configured basis points with ceiling division.
-        let fee = calculate_fee(&e, amount);
+        // 6. Calculate fee using configured basis points with ceiling division (or 0 if exempt).
+        let fee = if is_fee_exempt_internal(&e, &initiator) || is_fee_exempt_internal(&e, &receiver) {
+            0
+        } else {
+            calculate_fee(&e, amount)
+        };
 
         // 7. Set reentrancy guard.
         set_flash_loan_active(&e, true);
@@ -550,7 +600,7 @@ impl FlashLoanVault {
         // 10. Verify repayment: after lending `amount`, the receiver must
         // return `amount + fee`, leaving the vault contract address with its original balance
         // plus the dynamically verified fee.
-        let expected_fee = calculate_fee(&e, amount);
+        let expected_fee = fee;
         let required_balance = pre_balance + expected_fee;
         let post_balance = token.balance(&e.current_contract_address());
         if post_balance < required_balance {
@@ -617,8 +667,12 @@ impl FlashLoanVault {
             return Err(Error::InsufficientVaultBalance);
         }
 
-        // 5. Calculate fee and total repayment.
-        let fee = calculate_fee(&e, amount);
+        // 5. Calculate fee and total repayment (or 0 if exempt).
+        let fee = if is_fee_exempt_internal(&e, &borrower) {
+            0
+        } else {
+            calculate_fee(&e, amount)
+        };
         let total_repayment = amount + fee;
 
         // 6. Effects: set reentrancy guard and store borrow record.
@@ -652,7 +706,7 @@ impl FlashLoanVault {
         }
 
         // 9. Verify repayment: vault balance must be >= pre_balance + expected_fee.
-        let expected_fee = calculate_fee(&e, amount);
+        let expected_fee = fee;
         let required_balance = pre_balance + expected_fee;
         let post_balance = token.balance(&e.current_contract_address());
         if post_balance < required_balance {
@@ -735,5 +789,38 @@ impl FlashLoanVault {
     /// Returns the accumulated fees claimable by the admin.
     pub fn get_accumulated_fees(e: Env) -> i128 {
         get_accumulated_fees(&e)
+    }
+
+    /// EIP-3156: The amount of currency available to be lent.
+    /// Returns 0 if borrow is paused or if the token is unsupported.
+    pub fn max_flash_loan(e: Env, token: Address) -> i128 {
+        if is_borrow_paused(&e) || EmergencyGuard::is_paused(e.clone(), PauseType::BORROW) {
+            return 0;
+        }
+        match load_token(&e) {
+            Ok(vault_token) => {
+                if token != vault_token {
+                    0
+                } else {
+                    soroban_sdk::token::Client::new(&e, &vault_token)
+                        .balance(&e.current_contract_address())
+                }
+            }
+            Err(_) => 0,
+        }
+    }
+
+    /// EIP-3156: The fee to be charged for a given loan.
+    /// Reverts if token is unsupported or amount <= 0.
+    /// Uses ceiling rounding (amount * fee_bps + 9999) / 10000.
+    pub fn flash_fee(e: Env, token: Address, amount: i128) -> Result<i128, Error> {
+        let vault_token = load_token(&e)?;
+        if token != vault_token {
+            return Err(Error::UnsupportedToken);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        Ok(calculate_fee(&e, amount))
     }
 }
