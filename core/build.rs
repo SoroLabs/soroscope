@@ -4,13 +4,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::set_var("PROTOC", protoc_path);
         }
     }
+    // Encoded FileDescriptorSet for gRPC server reflection (Issue #1404).
+    let descriptor_path =
+        std::path::Path::new(&std::env::var("OUT_DIR")?).join("soroscope_descriptor.bin");
     if let Err(e) = tonic_build::configure()
         .build_server(true)
         .build_client(false)
+        .file_descriptor_set_path(&descriptor_path)
         .compile_protos(&["proto/events.proto", "proto/telemetry.proto"], &["proto"])
     {
         println!("cargo:warning=Failed to compile protos (protoc not found): {}", e);
         let out_dir = std::env::var("OUT_DIR")?;
+        // An empty (but valid) descriptor set keeps `include_file_descriptor_set!`
+        // compiling; reflection then simply lists no proto services.
+        std::fs::write(&descriptor_path, b"")?;
         let proto_file = std::path::Path::new(&out_dir).join("soroscope.events.v1.rs");
         let stub = r#"
 #[derive(Clone, PartialEq, ::prost::Message)]
