@@ -8,7 +8,8 @@
 //! Axum router.
 
 use async_graphql::{
-    Context, EmptyMutation, EmptySubscription, Enum, Object, Schema, SimpleObject,
+    Context, EmptyMutation, EmptySubscription, Enum, IntrospectionMode, Object, Schema,
+    SchemaBuilder, SimpleObject,
 };
 
 use crate::jobs::{Job, JobListFilter, JobPayload, JobQueue, JobResult};
@@ -18,12 +19,55 @@ use crate::simulation::{SimulationEngine, SorobanResources};
 /// The soroscope-core GraphQL schema: query-only (no mutations/subscriptions).
 pub type SoroscopeSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
 
+/// Maximum nesting depth of a GraphQL query (Issue #1405).
+pub const MAX_QUERY_DEPTH: usize = 8;
+/// Maximum complexity (number of selected fields) of a GraphQL query (Issue #1405).
+pub const MAX_QUERY_COMPLEXITY: usize = 150;
+/// Maximum page size accepted by paginated queries; larger `limit`s are
+/// clamped (Issue #1405).
+pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// Clamp a requested page size to `0..=MAX_PAGE_SIZE`.
+fn clamp_limit(limit: i32) -> i64 {
+    i64::from(limit.clamp(0, MAX_PAGE_SIZE))
+}
+
+/// Introspection is disabled in production unless explicitly re-enabled with
+/// `GRAPHQL_INTROSPECTION=true`.
+fn introspection_allowed(app_env: &str, introspection_flag: Option<&str>) -> bool {
+    if !app_env.eq_ignore_ascii_case("production") {
+        return true;
+    }
+    introspection_flag.is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// Read the deployment environment (`APP_ENV`, falling back to `ENV`) and the
+/// `GRAPHQL_INTROSPECTION` override from the process environment.
+fn introspection_enabled() -> bool {
+    let app_env = std::env::var("APP_ENV")
+        .or_else(|_| std::env::var("ENV"))
+        .unwrap_or_default();
+    let flag = std::env::var("GRAPHQL_INTROSPECTION").ok();
+    introspection_allowed(&app_env, flag.as_deref())
+}
+
+/// Schema builder with depth and complexity limits applied, so queries over
+/// the limits are rejected during validation, before any resolver runs.
+fn schema_builder() -> SchemaBuilder<QueryRoot, EmptyMutation, EmptySubscription> {
+    Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+        .limit_depth(MAX_QUERY_DEPTH)
+        .limit_complexity(MAX_QUERY_COMPLEXITY)
+}
+
 /// Build the schema, wiring in the data sources resolvers read from.
 pub fn build_schema(job_queue: JobQueue, engine: SimulationEngine) -> SoroscopeSchema {
-    Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
-        .data(job_queue)
-        .data(engine)
-        .finish()
+    let builder = schema_builder().data(job_queue).data(engine);
+    let builder = if introspection_enabled() {
+        builder
+    } else {
+        builder.introspection_mode(IntrospectionMode::Disabled)
+    };
+    builder.finish()
 }
 
 /// Mirrors [`crate::jobs::JobStatus`] as a GraphQL-facing filter enum.
@@ -219,7 +263,8 @@ pub struct QueryRoot;
 #[Object]
 impl QueryRoot {
     /// Contract execution history, most-recent-first, with optional
-    /// filtering and offset/limit pagination.
+    /// filtering and offset/limit pagination. `limit` is clamped to
+    /// [`MAX_PAGE_SIZE`].
     async fn contract_executions(
         &self,
         ctx: &Context<'_>,
@@ -237,7 +282,7 @@ impl QueryRoot {
         };
 
         let jobs = job_queue
-            .list(&filter, limit as i64, offset as i64)
+            .list(&filter, clamp_limit(limit), offset as i64)
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
@@ -453,6 +498,84 @@ mod tests {
         assert_eq!(
             CoreJobType::from(JobTypeFilter::OptimizeLimits),
             CoreJobType::OptimizeLimits
+        );
+    }
+
+    // ── Query depth, complexity & pagination bounds (Issue #1405) ─────────
+
+    #[tokio::test]
+    async fn queries_deeper_than_the_limit_are_rejected() {
+        let schema = schema_builder().finish();
+        let query = "{ __schema { types { fields { type { ofType { ofType { ofType { ofType { name } } } } } } } } }";
+
+        let response = schema.execute(query).await;
+
+        assert!(!response.errors.is_empty(), "deep query must be rejected");
+        assert!(
+            response.errors[0].message.contains("nested too deep"),
+            "unexpected error: {}",
+            response.errors[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn queries_over_the_complexity_limit_are_rejected() {
+        let schema = schema_builder().finish();
+        let fields: Vec<String> = (0..80)
+            .map(|i| format!("t{i}: tokenMetadata(contractId: \"C{i}\") {{ name }}"))
+            .collect();
+        let query = format!("{{ {} }}", fields.join(" "));
+
+        let response = schema.execute(query).await;
+
+        assert!(
+            !response.errors.is_empty(),
+            "complex query must be rejected"
+        );
+        assert!(
+            response.errors[0].message.contains("too complex"),
+            "unexpected error: {}",
+            response.errors[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn queries_within_the_limits_pass_validation() {
+        let schema = schema_builder().finish();
+
+        let response = schema.execute("{ __typename }").await;
+
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+    }
+
+    #[test]
+    fn page_size_is_clamped_to_the_maximum() {
+        assert_eq!(clamp_limit(500), 100);
+        assert_eq!(clamp_limit(100), 100);
+        assert_eq!(clamp_limit(20), 20);
+        assert_eq!(clamp_limit(-5), 0);
+    }
+
+    #[test]
+    fn introspection_is_disabled_in_production_unless_enabled() {
+        assert!(introspection_allowed("development", None));
+        assert!(!introspection_allowed("production", None));
+        assert!(!introspection_allowed("PRODUCTION", Some("false")));
+        assert!(introspection_allowed("production", Some("true")));
+    }
+
+    #[tokio::test]
+    async fn disabled_introspection_rejects_schema_queries() {
+        let schema = schema_builder()
+            .introspection_mode(IntrospectionMode::Disabled)
+            .finish();
+
+        let response = schema.execute("{ __schema { queryType { name } } }").await;
+
+        let data = response.data.into_json().expect("json data");
+        assert!(
+            !response.errors.is_empty() || data["__schema"].is_null(),
+            "introspection must not return the schema when disabled"
         );
     }
 }

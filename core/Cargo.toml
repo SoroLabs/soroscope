@@ -68,6 +68,10 @@ sysinfo = "0.32"
 # The `tls` feature pulls in rustls so the gRPC server can terminate TLS and
 # present a proper certificate chain (Issue #918).
 tonic = { version = "0.12", features = ["transport", "tls"] }
+# Standard grpc.health.v1.Health service and server reflection for Kubernetes
+# gRPC probes, Envoy and grpcurl (Issue #1404).
+tonic-health = "0.12"
+tonic-reflection = "0.12"
 prost = "0.13"
 tokio-stream = { version = "0.1", features = ["sync", "net"] }
 # Enables precise PEM parsing so the whole certificate chain (leaf + any

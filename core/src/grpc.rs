@@ -35,12 +35,27 @@
 //! grpcurl -plaintext -d '{"contract_id":"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"}' \
 //!   localhost:50051 soroscope.events.v1.EventStreamService/StreamContractEvents
 //! ```
+//!
+//! # Health checks, reflection and keepalive (Issue #1404)
+//!
+//! The server also exposes the standard `grpc.health.v1.Health` service (for
+//! Kubernetes gRPC probes and Envoy) and server reflection (for `grpcurl list`).
+//! Health is `SERVING` while the readiness signal passed to [`serve`] is
+//! `true` (DB and RPC provider healthy) and `NOT_SERVING` otherwise. HTTP/2
+//! keepalive pings and a max-concurrent-streams limit are enforced on every
+//! connection.
+//!
+//! ```bash
+//! grpcurl -plaintext localhost:50051 list
+//! grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check
+//! ```
 
 use std::fs;
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -50,6 +65,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status};
+use tonic_health::server::HealthReporter;
+use tonic_health::ServingStatus;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::ws::{SimulationBus, SimulationEvent};
@@ -62,6 +79,10 @@ pub mod proto {
 pub mod telemetry_proto {
     tonic::include_proto!("soroscope.telemetry.v1");
 }
+
+/// Encoded `FileDescriptorSet` of every service compiled from `proto/`, served
+/// through gRPC reflection (Issue #1404).
+pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("soroscope_descriptor");
 
 use proto::event_stream_service_server::EventStreamService;
 pub use proto::event_stream_service_server::EventStreamServiceServer;
@@ -275,19 +296,100 @@ fn translate_event(
     })
 }
 
+// ── Health, reflection & keepalive (Issue #1404) ──────────────────────────────
+
+/// Interval between HTTP/2 keepalive pings sent to idle clients.
+const GRPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// How long to wait for a keepalive ping ack before closing the connection.
+const GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum number of concurrent HTTP/2 streams per connection.
+const GRPC_MAX_CONCURRENT_STREAMS: u32 = 1024;
+
+/// Apply keepalive and stream limits to a Tonic server builder.
+fn configure_server(builder: tonic::transport::Server) -> tonic::transport::Server {
+    builder
+        .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
+        .max_concurrent_streams(Some(GRPC_MAX_CONCURRENT_STREAMS))
+}
+
+/// Names reported by the health service: the overall server (`""`) and every
+/// registered telemetry service.
+fn health_service_names() -> [&'static str; 3] {
+    [
+        "",
+        <EventStreamServiceServer<EventStreamServiceImpl> as tonic::server::NamedService>::NAME,
+        <TelemetryStreamServiceServer<TelemetryStreamServiceImpl> as tonic::server::NamedService>::NAME,
+    ]
+}
+
+/// Report every registered service as `SERVING` or `NOT_SERVING`.
+async fn set_health(reporter: &mut HealthReporter, ready: bool) {
+    let status = if ready {
+        ServingStatus::Serving
+    } else {
+        ServingStatus::NotServing
+    };
+    for name in health_service_names() {
+        reporter.set_service_status(name, status).await;
+    }
+}
+
+/// Keep the gRPC health status in sync with the readiness signal (DB and RPC
+/// provider health, published by `main`).
+fn spawn_health_sync(mut reporter: HealthReporter, mut ready: watch::Receiver<bool>) {
+    tokio::spawn(async move {
+        loop {
+            let is_ready = *ready.borrow_and_update();
+            set_health(&mut reporter, is_ready).await;
+            if ready.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Register the health, reflection and telemetry services on a server builder,
+/// applying keepalive and stream limits.
+fn build_router(
+    builder: tonic::transport::Server,
+    bus: Arc<SimulationBus>,
+    ready: watch::Receiver<bool>,
+) -> Result<tonic::transport::server::Router, tonic_reflection::server::Error> {
+    let (reporter, health_service) = tonic_health::server::health_reporter();
+    spawn_health_sync(reporter, ready);
+
+    let reflection_service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+
+    let mut builder = configure_server(builder);
+    Ok(builder
+        .add_service(health_service)
+        .add_service(reflection_service)
+        .add_service(EventStreamServiceServer::new(EventStreamServiceImpl::new(
+            Arc::clone(&bus),
+        )))
+        .add_service(TelemetryStreamServiceServer::new(
+            TelemetryStreamServiceImpl::new(bus),
+        )))
+}
+
 // ── Server startup helper ─────────────────────────────────────────────────────
 
 /// Bind and serve the gRPC endpoint on `addr` over plaintext (no TLS).
 ///
 /// This is called from `main` and runs in a separate Tokio task alongside the
 /// existing Axum HTTP server. For a TLS-enabled listener use [`serve_tls`].
-///
-/// The server runs until it is dropped; use [`serve_with_shutdown`] (or
-/// [`serve_with_tls_from_env_and_shutdown`]) when the drain coordinator must be
-/// able to stop it gracefully.
-pub async fn serve(addr: std::net::SocketAddr, bus: Arc<SimulationBus>) {
+/// `ready` drives the `grpc.health.v1.Health` status.
+pub async fn serve(
+    addr: std::net::SocketAddr,
+    bus: Arc<SimulationBus>,
+    ready: watch::Receiver<bool>,
+) {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    serve_with_shutdown(addr, bus, shutdown_rx).await;
+    serve_with_shutdown(addr, bus, ready, shutdown_rx).await;
 }
 
 /// Bind and serve the gRPC endpoint on `addr` over plaintext (no TLS), stopping
@@ -295,22 +397,24 @@ pub async fn serve(addr: std::net::SocketAddr, bus: Arc<SimulationBus>) {
 ///
 /// On shutdown the listener stops accepting new connections/streams and tonic
 /// waits for in-flight RPCs to finish. The caller is responsible for bounding
-/// that wait with the configured grace period (e.g. by wrapping the returned
-/// future in `tokio::time::timeout`).
+/// that wait with the configured grace period.
 pub async fn serve_with_shutdown(
     addr: std::net::SocketAddr,
     bus: Arc<SimulationBus>,
+    ready: watch::Receiver<bool>,
     shutdown: watch::Receiver<bool>,
 ) {
-    let svc = EventStreamServiceServer::new(EventStreamServiceImpl::new(bus));
+    let router = match build_router(tonic::transport::Server::builder(), bus, ready) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build gRPC reflection service");
+            return;
+        }
+    };
 
     tracing::info!(grpc_addr = %addr, tls = false, "gRPC EventStreamService listening");
 
-    if let Err(e) = tonic::transport::Server::builder()
-        .add_service(svc)
-        .serve_with_shutdown(addr, shutdown_signal(shutdown))
-        .await
-    {
+    if let Err(e) = router.serve_with_shutdown(addr, shutdown_signal(shutdown)).await {
         tracing::error!(error = %e, "gRPC server terminated with error");
     }
 }
@@ -472,9 +576,14 @@ fn build_server_tls(tls: &TlsConfig) -> io::Result<ServerTlsConfig> {
 /// The Tonic server builder is configured with an [`Identity`] that carries the
 /// full certificate chain (see [`load_cert_chain`]). If a custom CA root is
 /// configured it is registered so client certificates are validated against it.
-pub async fn serve_tls(addr: std::net::SocketAddr, bus: Arc<SimulationBus>, tls: TlsConfig) {
+pub async fn serve_tls(
+    addr: std::net::SocketAddr,
+    bus: Arc<SimulationBus>,
+    tls: TlsConfig,
+    ready: watch::Receiver<bool>,
+) {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    serve_tls_with_shutdown(addr, bus, tls, shutdown_rx).await;
+    serve_tls_with_shutdown(addr, bus, tls, ready, shutdown_rx).await;
 }
 
 /// Bind and serve the gRPC endpoint on `addr` over TLS, stopping gracefully when
@@ -487,6 +596,7 @@ pub async fn serve_tls_with_shutdown(
     addr: std::net::SocketAddr,
     bus: Arc<SimulationBus>,
     tls: TlsConfig,
+    ready: watch::Receiver<bool>,
     shutdown: watch::Receiver<bool>,
 ) {
     let server_tls = match build_server_tls(&tls) {
@@ -496,7 +606,6 @@ pub async fn serve_tls_with_shutdown(
             return;
         }
     };
-    let svc = EventStreamServiceServer::new(EventStreamServiceImpl::new(bus));
 
     tracing::info!(
         grpc_addr = %addr,
@@ -504,18 +613,21 @@ pub async fn serve_tls_with_shutdown(
         "gRPC EventStreamService listening with TLS"
     );
 
-    let mut builder = match tonic::transport::Server::builder().tls_config(server_tls) {
+    let builder = match tonic::transport::Server::builder().tls_config(server_tls) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(error = %e, "invalid gRPC TLS server configuration");
             return;
         }
     };
-    if let Err(e) = builder
-        .add_service(svc)
-        .serve_with_shutdown(addr, shutdown_signal(shutdown))
-        .await
-    {
+    let router = match build_router(builder, bus, ready) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build gRPC reflection service");
+            return;
+        }
+    };
+    if let Err(e) = router.serve_with_shutdown(addr, shutdown_signal(shutdown)).await {
         tracing::error!(error = %e, "gRPC TLS server terminated with error");
     }
 }
@@ -524,9 +636,13 @@ pub async fn serve_tls_with_shutdown(
 /// `GRPC_TLS_KEY` are present in the environment, otherwise serving plaintext.
 ///
 /// Convenience entry point used by `main` so a single call always "just works".
-pub async fn serve_with_tls_from_env(addr: std::net::SocketAddr, bus: Arc<SimulationBus>) {
+pub async fn serve_with_tls_from_env(
+    addr: std::net::SocketAddr,
+    bus: Arc<SimulationBus>,
+    ready: watch::Receiver<bool>,
+) {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    serve_with_tls_from_env_and_shutdown(addr, bus, shutdown_rx).await;
+    serve_with_tls_from_env_and_shutdown(addr, bus, ready, shutdown_rx).await;
 }
 
 /// Run the gRPC server (TLS when configured, plaintext otherwise) and stop it
@@ -538,16 +654,17 @@ pub async fn serve_with_tls_from_env(addr: std::net::SocketAddr, bus: Arc<Simula
 pub async fn serve_with_tls_from_env_and_shutdown(
     addr: std::net::SocketAddr,
     bus: Arc<SimulationBus>,
+    ready: watch::Receiver<bool>,
     shutdown: watch::Receiver<bool>,
 ) {
     match TlsConfig::from_env() {
-        Ok(Some(tls)) => serve_tls_with_shutdown(addr, bus, tls, shutdown).await,
+        Ok(Some(tls)) => serve_tls_with_shutdown(addr, bus, tls, ready, shutdown).await,
         Ok(None) => {
             tracing::warn!(
                 grpc_addr = %addr,
                 "GRPC_TLS_CERT not set; gRPC server running without TLS"
             );
-            serve_with_shutdown(addr, bus, shutdown).await;
+            serve_with_shutdown(addr, bus, ready, shutdown).await;
         }
         Err(e) => {
             tracing::error!(error = %e, "invalid gRPC TLS configuration");
@@ -723,7 +840,8 @@ mod tests {
             ca_cert: None,
         };
         let bus = crate::ws::SimulationBus::new();
-        let server = tokio::spawn(serve_tls(addr, bus, tls));
+        let (_ready_tx, ready_rx) = watch::channel(true);
+        let server = tokio::spawn(serve_tls(addr, bus, tls, ready_rx));
 
         // The client trusts only the shared test root CA. A successful
         // handshake proves the server presented the full, valid chain.
@@ -808,6 +926,103 @@ mod tests {
             loaded.matches("END CERTIFICATE").count(),
             2,
             "expected both certificate terminators to be preserved"
+        );
+    }
+
+    // ── Health check service & reflection (Issue #1404) ───────────────────
+
+    use tonic::transport::Channel;
+    use tonic_health::pb::health_check_response::ServingStatus as PbServingStatus;
+    use tonic_health::pb::health_client::HealthClient;
+    use tonic_health::pb::HealthCheckRequest;
+
+    /// Connect a health client, retrying briefly while the server binds.
+    async fn connect_health_client(addr: SocketAddr) -> HealthClient<Channel> {
+        let mut attempt = 0;
+        loop {
+            match HealthClient::connect(format!("http://{addr}")).await {
+                Ok(client) => return client,
+                Err(_) if attempt < 50 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("failed to connect to gRPC health service: {e}"),
+            }
+        }
+    }
+
+    /// Poll `grpc.health.v1.Health/Check` until `service` reports `expected`.
+    async fn wait_for_status(
+        client: &mut HealthClient<Channel>,
+        service: &str,
+        expected: PbServingStatus,
+    ) {
+        for _ in 0..100 {
+            let request = HealthCheckRequest {
+                service: service.to_string(),
+            };
+            if let Ok(response) = client.check(request).await {
+                if response.into_inner().status == expected as i32 {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("health status of {service:?} never became {expected:?}");
+    }
+
+    #[tokio::test]
+    async fn grpc_health_check_follows_readiness() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("free port probe");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+
+        let (ready_tx, ready_rx) = watch::channel(true);
+        let server = tokio::spawn(serve(addr, crate::ws::SimulationBus::new(), ready_rx));
+        let mut client = connect_health_client(addr).await;
+
+        // Dependencies healthy: every service reports SERVING.
+        for name in health_service_names() {
+            wait_for_status(&mut client, name, PbServingStatus::Serving).await;
+        }
+
+        // Dependencies degraded: every service flips to NOT_SERVING.
+        ready_tx.send(false).expect("health sync task is listening");
+        for name in health_service_names() {
+            wait_for_status(&mut client, name, PbServingStatus::NotServing).await;
+        }
+
+        // Recovery is reported again.
+        ready_tx.send(true).expect("health sync task is listening");
+        wait_for_status(&mut client, "", PbServingStatus::Serving).await;
+
+        server.abort();
+    }
+
+    #[test]
+    fn reflection_descriptor_set_lists_telemetry_services() {
+        for service in ["EventStreamService", "TelemetryStreamService"] {
+            assert!(
+                FILE_DESCRIPTOR_SET
+                    .windows(service.len())
+                    .any(|w| w == service.as_bytes()),
+                "reflection descriptor set is missing {service}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reflection_service_builds_from_descriptor_sets() {
+        let (_ready_tx, ready_rx) = watch::channel(true);
+        assert!(
+            build_router(
+                tonic::transport::Server::builder(),
+                crate::ws::SimulationBus::new(),
+                ready_rx
+            )
+            .is_ok(),
+            "health + reflection + telemetry services must register"
         );
     }
 }
