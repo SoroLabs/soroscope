@@ -1,21 +1,45 @@
 import React from "react";
 import { Card, CardHeader, CardTitle, CardContent } from "./ui/card";
-import { Cpu, Database, HardDrive, AlertTriangle, Zap } from "lucide-react";
+import { Cpu, Database, HardDrive, AlertTriangle, Zap, FileSpreadsheet } from "lucide-react";
 import { cn } from "../lib/utils";
 
-interface ResourceMetricProps {
-  label: string;
-  value: number; // percentage 0-100
-  icon: React.ElementType;
+export interface SorobanLimits {
+  cpuInstructions: number; // default: 100_000_000 (100M)
+  ramBytes: number;        // default: 40 * 1024 * 1024 (40MB)
+  writeBytes: number;      // default: 64 * 1024 (64KB)
+  footprintKeys: number;   // default: 100
 }
 
-const getStatusColor = (value: number) => {
-  if (value > 85) return "bg-rose-500 shadow-[0_0_12px_rgba(244,63,94,0.6)]"; // Critical
-  if (value >= 60) return "bg-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.6)]"; // Warning
-  return "bg-emerald-500 shadow-[0_0_12px_rgba(16,185,129,0.6)]"; // Safe
+export const DEFAULT_SOROBAN_LIMITS: SorobanLimits = {
+  cpuInstructions: 100_000_000,
+  ramBytes: 40 * 1024 * 1024,
+  writeBytes: 64 * 1024,
+  footprintKeys: 100,
 };
 
-const getTextColor = (value: number) => {
+export function calculateHeadroom(used: number, limit: number): {
+  consumedPct: number;
+  headroomPct: number;
+  txsPerLedger: number;
+  isExceeded: boolean;
+} {
+  if (limit <= 0) {
+    return { consumedPct: 100, headroomPct: 0, txsPerLedger: 0, isExceeded: true };
+  }
+  const consumedPct = Math.round((used / limit) * 1000) / 10;
+  const headroomPct = Math.max(0, Math.round((100 - (used / limit) * 100) * 10) / 10);
+  const txsPerLedger = used > 0 ? Math.floor(limit / used) : Infinity;
+  const isExceeded = used > limit || consumedPct > 100;
+  return { consumedPct, headroomPct, txsPerLedger, isExceeded };
+}
+
+export const getStatusColor = (value: number) => {
+  if (value > 85) return "bg-rose-500 shadow-[0_0_12px_rgba(244,63,94,0.6)] animate-pulse"; // Pulsing red (>85% or exceeded)
+  if (value >= 60) return "bg-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.6)]"; // Warning amber (60-85%)
+  return "bg-emerald-500 shadow-[0_0_12px_rgba(16,185,129,0.6)]"; // Safe green (<60%)
+};
+
+export const getTextColor = (value: number) => {
   if (value > 85)
     return "text-rose-400 drop-shadow-[0_0_8px_rgba(244,63,94,0.5)]";
   if (value >= 60)
@@ -23,7 +47,29 @@ const getTextColor = (value: number) => {
   return "text-emerald-400 drop-shadow-[0_0_8px_rgba(16,185,129,0.5)]";
 };
 
-const ResourceMetric = ({ label, value, icon: Icon }: ResourceMetricProps) => {
+interface ResourceMetricProps {
+  label: string;
+  value: number; // percentage 0-100+
+  icon: React.ElementType;
+  rawUsed?: number;
+  limit?: number;
+}
+
+const ResourceMetric = ({
+  label,
+  value,
+  icon: Icon,
+  rawUsed,
+  limit,
+}: ResourceMetricProps) => {
+  const isExceeded = value > 100;
+  const headroomPct = Math.max(0, Math.round((100 - value) * 10) / 10);
+  const txsPerLedger =
+    limit && rawUsed && rawUsed > 0
+      ? Math.floor(limit / rawUsed)
+      : value > 0
+      ? Math.floor(100 / value)
+      : 999;
   const statusColor = getStatusColor(value);
   const textColor = getTextColor(value);
 
@@ -34,18 +80,30 @@ const ResourceMetric = ({ label, value, icon: Icon }: ResourceMetricProps) => {
           <div className="p-1.5 rounded-md bg-slate-800/80 border border-slate-700/50 shadow-inner">
             <Icon className="h-3.5 w-3.5 text-slate-400 group-hover/metric:text-slate-200 transition-colors" />
           </div>
-          <span className="text-xs font-semibold uppercase tracking-wider text-slate-400 group-hover/metric:text-slate-300 transition-colors">
-            {label}
+          <div className="flex flex-col">
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-400 group-hover/metric:text-slate-300 transition-colors">
+              {label}
+            </span>
+            <span className="text-[10px] text-slate-500 font-mono">
+              Headroom: {headroomPct}% · ~{txsPerLedger} tx/ledger
+            </span>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {isExceeded && (
+            <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30 uppercase animate-pulse">
+              Limit Exceeded
+            </span>
+          )}
+          <span
+            className={cn(
+              "text-base font-bold font-mono tracking-tight",
+              textColor,
+            )}
+          >
+            {value}%
           </span>
         </div>
-        <span
-          className={cn(
-            "text-base font-bold font-mono tracking-tight",
-            textColor,
-          )}
-        >
-          {value}%
-        </span>
       </div>
 
       {/* Progress Bar Container with "Groove" effect */}
@@ -65,23 +123,48 @@ const ResourceMetric = ({ label, value, icon: Icon }: ResourceMetricProps) => {
   );
 };
 
-interface ResourceLabelProps {
+export interface ResourceLabelProps {
   cpuUsage: number;
   ramUsage: number;
   footprintUsage: number;
+  writeBytesUsage?: number;
+  limits?: Partial<SorobanLimits>;
+  rawUsage?: {
+    cpu?: number;
+    ram?: number;
+    footprint?: number;
+    writeBytes?: number;
+  };
 }
 
 export function ResourceLabel({
   cpuUsage,
   ramUsage,
   footprintUsage,
+  writeBytesUsage,
+  limits,
+  rawUsage,
 }: ResourceLabelProps) {
-  const hasCritical = cpuUsage > 85 || ramUsage > 85 || footprintUsage > 85;
+  const effectiveLimits = { ...DEFAULT_SOROBAN_LIMITS, ...limits };
+  const isAnyExceeded =
+    cpuUsage > 100 ||
+    ramUsage > 100 ||
+    footprintUsage > 100 ||
+    (writeBytesUsage !== undefined && writeBytesUsage > 100) ||
+    (rawUsage?.cpu !== undefined && rawUsage.cpu > effectiveLimits.cpuInstructions) ||
+    (rawUsage?.ram !== undefined && rawUsage.ram > effectiveLimits.ramBytes) ||
+    (rawUsage?.footprint !== undefined && rawUsage.footprint > effectiveLimits.footprintKeys) ||
+    (rawUsage?.writeBytes !== undefined && rawUsage.writeBytes > effectiveLimits.writeBytes);
+
+  const hasCritical =
+    cpuUsage > 85 ||
+    ramUsage > 85 ||
+    footprintUsage > 85 ||
+    (writeBytesUsage ?? 0) > 85 ||
+    isAnyExceeded;
 
   return (
     <Card className="w-full max-w-md bg-slate-900/80 backdrop-blur-xl border border-white/10 shadow-2xl relative overflow-hidden group">
-      {/* Tempered Glass Physical Attributes */}
-
       {/* 1. Noise Texture Overlay */}
       <div className="absolute inset-0 opacity-[0.03] pointer-events-none mix-blend-overlay bg-[url('https://grainy-gradients.vercel.app/noise.svg')]" />
 
@@ -107,7 +190,12 @@ export function ResourceLabel({
               SYSTEM STATUS
             </span>
           </CardTitle>
-          {hasCritical ? (
+          {isAnyExceeded ? (
+            <div className="flex items-center gap-1.5 rounded bg-rose-600/90 px-3 py-1 text-[10px] font-bold tracking-widest text-white border border-rose-400 shadow-[0_0_15px_rgba(244,63,94,0.4)] animate-pulse uppercase">
+              <AlertTriangle className="h-3 w-3 mb-0.5" />
+              Exceeds Network Limit
+            </div>
+          ) : hasCritical ? (
             <div className="flex items-center gap-1.5 rounded bg-rose-500/10 px-3 py-1 text-[10px] font-bold tracking-widest text-rose-400 border border-rose-500/20 shadow-[0_0_15px_rgba(244,63,94,0.15)] animate-pulse uppercase">
               <AlertTriangle className="h-3 w-3 mb-0.5" />
               Critical
@@ -124,13 +212,36 @@ export function ResourceLabel({
       </CardHeader>
 
       <CardContent className="grid gap-7 relative z-10">
-        <ResourceMetric label="CPU Load" value={cpuUsage} icon={Cpu} />
+        <ResourceMetric
+          label="CPU Load"
+          value={cpuUsage}
+          icon={Cpu}
+          rawUsed={rawUsage?.cpu}
+          limit={effectiveLimits.cpuInstructions}
+        />
         <ResourceMetric
           label="Ledger Size"
           value={footprintUsage}
           icon={Database}
+          rawUsed={rawUsage?.footprint}
+          limit={effectiveLimits.footprintKeys}
         />
-        <ResourceMetric label="RAM Alloc" value={ramUsage} icon={HardDrive} />
+        <ResourceMetric
+          label="RAM Alloc"
+          value={ramUsage}
+          icon={HardDrive}
+          rawUsed={rawUsage?.ram}
+          limit={effectiveLimits.ramBytes}
+        />
+        {writeBytesUsage !== undefined && (
+          <ResourceMetric
+            label="Write Bytes"
+            value={writeBytesUsage}
+            icon={FileSpreadsheet}
+            rawUsed={rawUsage?.writeBytes}
+            limit={effectiveLimits.writeBytes}
+          />
+        )}
 
         {/* Footer Technical Detail */}
         <div className="mt-2 flex justify-between items-center border-t border-white/5 pt-4">

@@ -1575,3 +1575,29 @@ impl EmergencyGuardTrait for LiquidityPool {
         DefaultEmergencyGuard::is_admin(env, addr)
     }
 }
+// Check existing total supply (or minted shares tracked in storage)
+if total_shares == 0 {
+    // Compute initial shares from deposited amounts (e.g., isqrt(amount_a * amount_b) or pool's existing formula)
+    let initial_shares: i128 = compute_initial_shares(amount_a, amount_b)?;
+
+    if initial_shares <= MINIMUM_LIQUIDITY {
+        return Err(Error::ZeroSharesMinted); // or appropriate insufficient initial liquidity error
+    }
+
+    let user_shares = initial_shares - MINIMUM_LIQUIDITY;
+
+    // Permanently lock MINIMUM_LIQUIDITY shares under the contract/pool address (or dead address)
+    mint_shares(&env, &env.current_contract_address(), MINIMUM_LIQUIDITY);
+    mint_shares(&env, &depositor, user_shares);
+    set_total_shares(&env, initial_shares);
+} else {
+    // Subsequent deposits: (amount * total_shares) / reserve (use checked/wide arithmetic like i128/u128 or I256)
+    let shares_to_mint: i128 = compute_subsequent_shares(amount_a, amount_b, reserve_a, reserve_b, total_shares)?;
+
+    if shares_to_mint <= 0 {
+        return Err(Error::ZeroSharesMinted);
+    }
+
+    mint_shares(&env, &depositor, shares_to_mint);
+    set_total_shares(&env, total_shares + shares_to_mint);
+}

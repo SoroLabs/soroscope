@@ -1009,3 +1009,74 @@ fn test_set_flash_fee_bps_updates_calculation() {
     assert_eq!(collected, 20);
     assert_eq!(s.vault_client.get_accumulated_fees(), 0);
 }
+
+#[test]
+fn test_eip3156_flash_fee_ceiling_rounding() {
+    let s = setup();
+    fund_vault(&s, 20_000);
+
+    // Default fee is 5 bps (0.05%).
+    // For 1 stroop: (1 * 5 + 9999) / 10000 = 10004 / 10000 = 1.
+    let fee_1 = s.vault_client.flash_fee(&s.token_id, &1);
+    assert_eq!(fee_1, 1);
+
+    // For 10_000: (10_000 * 5 + 9999) / 10000 = 59999 / 10000 = 5.
+    let fee_10k = s.vault_client.flash_fee(&s.token_id, &10_000);
+    assert_eq!(fee_10k, 5);
+
+    // For 2_000: (2000 * 5 + 9999) / 10000 = 19999 / 10000 = 1.
+    let fee_2k = s.vault_client.flash_fee(&s.token_id, &2_000);
+    assert_eq!(fee_2k, 1);
+}
+
+#[test]
+fn test_eip3156_flash_fee_unsupported_token() {
+    let s = setup();
+    let unsupported_token = Address::generate(&s.e);
+    let res = s.vault_client.try_flash_fee(&unsupported_token, &10_000);
+    assert_eq!(res, Err(Ok(Error::UnsupportedToken)));
+}
+
+#[test]
+fn test_eip3156_max_flash_loan_available_and_paused() {
+    let s = setup();
+    fund_vault(&s, 50_000);
+
+    // When active and token matches:
+    assert_eq!(s.vault_client.max_flash_loan(&s.token_id), 50_000);
+
+    // When token does not match:
+    let unsupported_token = Address::generate(&s.e);
+    assert_eq!(s.vault_client.max_flash_loan(&unsupported_token), 0);
+
+    // When borrow paused:
+    s.vault_client.pause_borrow();
+    assert_eq!(s.vault_client.max_flash_loan(&s.token_id), 0);
+
+    // Resumed:
+    s.vault_client.resume_borrow();
+    assert_eq!(s.vault_client.max_flash_loan(&s.token_id), 50_000);
+}
+
+#[test]
+fn test_fee_exempt_address_pays_zero_fee() {
+    let s = setup();
+    fund_vault(&s, 20_000);
+
+    let liquidator = Address::generate(&s.e);
+    assert_eq!(s.vault_client.is_fee_exempt(&liquidator), false);
+
+    // Admin sets liquidator as fee exempt
+    s.vault_client.set_fee_exempt(&liquidator, &true);
+    assert_eq!(s.vault_client.is_fee_exempt(&liquidator), true);
+
+    let receiver_id = s.e.register(good::GoodReceiver, ());
+    let receiver_client = good::GoodReceiverClient::new(&s.e, &receiver_id);
+    receiver_client.set_vault(&s.vault_id);
+
+    // Fee-exempt initiator pays 0 fee
+    let fee = s.vault_client.flash_loan(&liquidator, &receiver_id, &10_000);
+    assert_eq!(fee, 0);
+    assert_eq!(s.vault_client.get_accumulated_fees(), 0);
+}
+

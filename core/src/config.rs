@@ -112,6 +112,10 @@ fn default_simulation_timeout_secs() -> u64 {
     30
 }
 
+fn default_simulation_timeout_ms() -> u64 {
+    5000
+}
+
 fn default_job_timeout_secs() -> u64 {
     300
 }
@@ -155,6 +159,10 @@ fn default_event_bus_capacity() -> usize {
 
 fn default_log_format_json() -> bool {
     false
+}
+
+fn default_shutdown_grace_period_secs() -> u64 {
+    30
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +291,13 @@ pub struct AppConfig {
     #[serde(default = "default_simulation_timeout_secs")]
     pub simulation_timeout_secs: u64,
 
+    /// Wall-clock budget for a single host simulation, in milliseconds.
+    /// A simulation still running when it expires is cancelled and fails with
+    /// `SimulationError::TimeoutExceeded`.
+    /// Env: `SIMULATION_TIMEOUT_MS` · Default: `5000`
+    #[serde(default = "default_simulation_timeout_ms")]
+    pub simulation_timeout_ms: u64,
+
     /// Execution mode: `"failover"` or `"consensus"`.
     /// Env: `SIMULATION_MODE` · Default: `"failover"`
     #[serde(default = "default_simulation_mode")]
@@ -350,6 +365,15 @@ pub struct AppConfig {
     /// Env: `EVENT_BUS_CAPACITY` · Default: `256`
     #[serde(default = "default_event_bus_capacity")]
     pub event_bus_capacity: usize,
+
+    // --- Graceful shutdown ---
+
+    /// Maximum time (seconds) the drain coordinator waits for in-flight
+    /// simulations and webhook dispatches to complete after a shutdown signal
+    /// (SIGTERM/SIGINT) before forcing exit.
+    /// Env: `SHUTDOWN_GRACE_PERIOD_SECS` · Default: `30`
+    #[serde(default = "default_shutdown_grace_period_secs")]
+    pub shutdown_grace_period_secs: u64,
 
     // --- Deployment environment ---
 
@@ -514,6 +538,7 @@ pub fn load_config() -> Result<AppConfig, ConfigLoadError> {
         .set_default("health_check_interval_secs", default_health_check_interval_secs())?
         .set_default("gossip_interval_secs", default_gossip_interval_secs())?
         .set_default("simulation_timeout_secs", default_simulation_timeout_secs())?
+        .set_default("simulation_timeout_ms", default_simulation_timeout_ms())?
         .set_default("job_timeout_secs", default_job_timeout_secs())?
         .set_default("max_concurrent_jobs", default_max_concurrent_jobs())?
         .set_default("event_worker_threads", default_event_worker_threads())?
@@ -530,6 +555,10 @@ pub fn load_config() -> Result<AppConfig, ConfigLoadError> {
         .set_default("disk_cache_path", default_disk_cache_path())?
         .set_default("max_ledger_age", default_max_ledger_age())?
         .set_default("event_bus_capacity", default_event_bus_capacity())?
+        .set_default(
+            "shutdown_grace_period_secs",
+            default_shutdown_grace_period_secs(),
+        )?
         .set_default("cors_allowed_origins", "")?
         .set_default("allowed_origins", "")?
         .set_default("inbound_webhook_secret", "")?
@@ -576,6 +605,7 @@ mod tests {
             "NETWORK_PASSPHRASE",
             "DATABASE_URL",
             "APP_ENV",
+            "SHUTDOWN_GRACE_PERIOD_SECS",
         ];
         for k in &keys {
             env::remove_var(k);
@@ -592,6 +622,7 @@ mod tests {
             "Test SDF Network ; September 2015"
         );
         assert_eq!(cfg.database_url, "sqlite://soroscope.db");
+        assert_eq!(cfg.shutdown_grace_period_secs, 30);
         assert!(!cfg.is_production());
     }
 
@@ -618,6 +649,19 @@ mod tests {
         assert_eq!(cfg.server_port, 9090);
         assert_eq!(cfg.rust_log, "debug");
         assert_eq!(cfg.database_url, "sqlite://custom.db");
+    }
+
+    #[test]
+    fn shutdown_grace_period_env_override() {
+        let _guard = EnvGuard(vec![
+            "SHUTDOWN_GRACE_PERIOD_SECS".into(),
+            "APP_ENV".into(),
+        ]);
+        env::set_var("SHUTDOWN_GRACE_PERIOD_SECS", "45");
+        env::set_var("APP_ENV", "development");
+
+        let cfg = load_config().expect("load_config should succeed");
+        assert_eq!(cfg.shutdown_grace_period_secs, 45);
     }
 
     // ------------------------------------------------------------------
@@ -654,6 +698,11 @@ mod tests {
         assert_eq!(cfg.clamped_event_bus_capacity(), 512);
     }
 
+    #[test]
+    fn simulation_timeout_ms_defaults_to_5000() {
+        assert_eq!(default_simulation_timeout_ms(), 5000);
+    }
+
     // ------------------------------------------------------------------
     // Production validation
     // ------------------------------------------------------------------
@@ -681,6 +730,7 @@ mod tests {
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
+            simulation_timeout_ms: 5000,
             simulation_mode: "failover".to_string(),
             job_timeout_secs: 300,
             max_concurrent_jobs: 10,
@@ -692,6 +742,7 @@ mod tests {
             disk_cache_path: String::new(),
             max_ledger_age: 100,
             event_bus_capacity: 256,
+            shutdown_grace_period_secs: 30,
         };
 
         assert!(cfg.validate_production().is_ok());
@@ -720,6 +771,7 @@ mod tests {
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
+            simulation_timeout_ms: 5000,
             simulation_mode: "failover".to_string(),
             job_timeout_secs: 300,
             max_concurrent_jobs: 10,
@@ -731,6 +783,7 @@ mod tests {
             disk_cache_path: String::new(),
             max_ledger_age: 100,
             event_bus_capacity: 256,
+            shutdown_grace_period_secs: 30,
         };
 
         let result = cfg.validate_production();
@@ -772,6 +825,7 @@ mod tests {
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
+            simulation_timeout_ms: 5000,
             simulation_mode: "failover".to_string(),
             job_timeout_secs: 300,
             max_concurrent_jobs: 10,
@@ -783,6 +837,7 @@ mod tests {
             disk_cache_path: String::new(),
             max_ledger_age: 100,
             event_bus_capacity: 256,
+            shutdown_grace_period_secs: 30,
         };
 
         assert!(

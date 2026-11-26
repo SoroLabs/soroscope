@@ -7,6 +7,7 @@ pub struct VerificationMethod {
     pub type_: String, // e.g., "Ed25519VerificationKey2020"
     pub controller: Address,
     pub public_key_multibase: Bytes, // or whatever format
+    pub deactivated: bool,
 }
 
 #[contracttype]
@@ -15,6 +16,14 @@ pub struct Service {
     pub id: String,
     pub type_: String,
     pub service_endpoint: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceEndpoint {
+    pub id: Symbol,
+    pub service_type: Symbol,
+    pub uri: String,
 }
 
 #[contracttype]
@@ -29,6 +38,8 @@ pub struct DIDDocument {
     pub capability_invocation: Vec<String>,
     pub capability_delegation: Vec<String>,
     pub service: Vec<Service>,
+    pub controllers: Vec<Address>,
+    pub service_endpoints: Vec<ServiceEndpoint>,
 }
 
 #[contracttype]
@@ -54,6 +65,8 @@ pub struct Attestation {
 pub struct DIDMetadata {
     pub expiration_timestamp: Option<u64>,
     pub revocation_bitmap: u64,
+    pub deactivated: bool,
+    pub deactivated_at: Option<u64>,
 }
 
 #[contracttype]
@@ -61,6 +74,41 @@ pub struct DIDMetadata {
 pub struct DIDUpdated {
     pub did: String,
     pub action: String,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DIDCreated {
+    pub did: String,
+    pub controllers: Vec<Address>,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerificationMethodAdded {
+    pub did: String,
+    pub method_id: String,
+    pub controller: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceEndpointUpdated {
+    pub did: String,
+    pub service_id: Symbol,
+    pub service_type: Symbol,
+    pub uri: String,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DIDDeactivated {
+    pub did: String,
+    pub controller: Address,
     pub timestamp: u64,
 }
 

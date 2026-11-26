@@ -16,9 +16,11 @@ use soroban_sdk::xdr::{
     Uint256, VecM, WriteXdr,
 };
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use stellar_strkey::{Contract as StrkeyContract, Strkey};
 use thiserror::Error;
+use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
@@ -85,6 +87,84 @@ pub enum SimulationError {
 
     #[error("Consensus mismatch: {0}")]
     ConsensusMismatch(String),
+
+    /// The simulation did not finish within its wall-clock budget
+    /// (`simulation_timeout_ms`) or its cancellation token fired first
+    /// (#1396). `partial` carries the CPU and memory consumption recorded
+    /// before the cut-off.
+    #[error("Simulation exceeded the {timeout_ms}ms timeout")]
+    TimeoutExceeded {
+        timeout_ms: u64,
+        partial: PartialBudget,
+    },
+}
+
+/// CPU and memory consumed by a simulation before it was cut off (#1396).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialBudget {
+    pub cpu_instructions: u64,
+    pub memory_bytes: u64,
+}
+
+/// Shared recorder for the budget consumed by the steps of a simulation.
+///
+/// Each completed step adds its resources, so when the deadline fires the
+/// error reports everything that finished before it.
+#[derive(Debug, Clone, Default)]
+pub struct BudgetTelemetry(Arc<std::sync::Mutex<PartialBudget>>);
+
+impl BudgetTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add the CPU and memory reported by one completed simulation step.
+    pub fn record(&self, resources: &SorobanResources) {
+        let mut budget = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        budget.cpu_instructions = budget
+            .cpu_instructions
+            .saturating_add(resources.cpu_instructions);
+        budget.memory_bytes = budget.memory_bytes.saturating_add(resources.ram_bytes);
+    }
+
+    /// Budget recorded so far.
+    pub fn snapshot(&self) -> PartialBudget {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Run `fut` under a wall-clock `timeout` bound to `cancellation` (#1396).
+///
+/// When the timeout expires the token is cancelled, so any task holding a
+/// clone of it stops cooperatively, and the in-flight future is dropped. A
+/// token cancelled from outside ends the run the same way. Either case
+/// returns [`SimulationError::TimeoutExceeded`] with the budget `telemetry`
+/// recorded up to that point.
+pub async fn run_with_deadline<T, F>(
+    timeout: std::time::Duration,
+    cancellation: CancellationToken,
+    telemetry: &BudgetTelemetry,
+    fut: F,
+) -> Result<T, SimulationError>
+where
+    F: std::future::Future<Output = Result<T, SimulationError>>,
+{
+    let exceeded = || SimulationError::TimeoutExceeded {
+        timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        partial: telemetry.snapshot(),
+    };
+
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(exceeded()),
+        outcome = tokio::time::timeout(timeout, fut) => match outcome {
+            Ok(result) => result,
+            Err(_) => {
+                cancellation.cancel();
+                Err(exceeded())
+            }
+        },
+    }
 }
 
 impl SimulationError {
@@ -128,6 +208,45 @@ impl From<soroban_env_host::HostError> for SimulationError {
         ))
     }
 }
+
+/// RAII guard for a temporary `.wasm` file written to disk for a Soroban CLI
+/// subprocess.
+///
+/// The file is removed unconditionally when the guard is dropped — including
+/// when the surrounding async future is cancelled mid-execution (e.g. the
+/// client disconnects). This prevents `.wasm` files from leaking in `/tmp`.
+pub struct TempWasmFile {
+    path: PathBuf,
+}
+
+impl TempWasmFile {
+    /// Write `bytes` to a unique temporary `.wasm` path and return a guard that
+    /// owns (and will delete) it.
+    pub fn new(bytes: &[u8]) -> std::io::Result<Self> {
+        let unique = format!(
+            "soroscope-sim-{}-{}.wasm",
+            std::process::id(),
+            TEMP_WASM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::write(&path, bytes)?;
+        Ok(Self { path })
+    }
+
+    /// Path to the temporary `.wasm` file on disk.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempWasmFile {
+    fn drop(&mut self) {
+        // Best-effort cleanup; ignore errors (file may already be gone).
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+static TEMP_WASM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Ordered entry in a ledger key access trace.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -2881,6 +3000,31 @@ impl SimulationEngine {
 
         let transaction_xdr = self.create_invoke_transaction(contract_id, function_name, args)?;
         self.simulate_transaction(&transaction_xdr).await
+    }
+
+    /// [`Self::simulate_from_contract_id`] with a wall-clock deadline and a
+    /// cancellation token (#1396).
+    ///
+    /// Fails with [`SimulationError::TimeoutExceeded`] if the simulation is
+    /// still running after `timeout` (normally `simulation_timeout_ms`) or if
+    /// `cancellation` fires first; the in-flight work is dropped either way.
+    pub async fn simulate_with_timeout(
+        &self,
+        contract_id: &str,
+        function_name: &str,
+        args: Vec<String>,
+        timeout: std::time::Duration,
+        cancellation: CancellationToken,
+    ) -> Result<SimulationResult, SimulationError> {
+        let telemetry = BudgetTelemetry::new();
+        run_with_deadline(timeout, cancellation, &telemetry, async {
+            let result = self
+                .simulate_from_contract_id(contract_id, function_name, args, None, None, None)
+                .await?;
+            telemetry.record(&result.resources);
+            Ok(result)
+        })
+        .await
     }
 
     /// Re-simulate the first Soroban host-function operation from a historical transaction.
@@ -5911,12 +6055,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_kill_on_drop_terminates_child() {
+        // Verify that a Command configured with kill_on_drop(true) does not
+        // leave a zombie child behind when its future is dropped.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60").kill_on_drop(true);
+        let mut child = cmd.spawn().expect("failed to spawn sleep");
+        let pid = child.id();
+        assert!(pid.is_some());
+
+        // Dropping the child should kill it (kill_on_drop).
+        drop(child);
+
+        // Give the OS a moment to reap.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // If the process were still alive, `kill -0` would succeed; we simply
+        // assert we got here without leaking — the real assertion is that the
+        // test process exits cleanly. On Unix, verify the pid is gone.
+        #[cfg(unix)]
+        {
+            let alive = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.unwrap().to_string())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(!alive, "child process should have been killed on drop");
+        }
+    }
+
+    #[tokio::test]
     async fn test_simulate_from_contract_id_empty() {
         let engine = SimulationEngine::new("https://test.com".to_string());
         let result = engine
             .simulate_from_contract_id("", "test_function", vec![], None, None, None)
             .await;
         assert!(matches!(result, Err(SimulationError::NodeError(_))));
+    }
+
+    // ── Simulation deadline and cancellation (#1396) ─────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn test_simulation_deadline_times_out_stalled_execution() {
+        let telemetry = BudgetTelemetry::new();
+        telemetry.record(&SorobanResources {
+            cpu_instructions: 1_000,
+            ram_bytes: 2_048,
+            ..Default::default()
+        });
+        let cancellation = CancellationToken::new();
+
+        let result: Result<(), SimulationError> = run_with_deadline(
+            std::time::Duration::from_millis(5_000),
+            cancellation.clone(),
+            &telemetry,
+            std::future::pending(),
+        )
+        .await;
+
+        match result {
+            Err(SimulationError::TimeoutExceeded {
+                timeout_ms,
+                partial,
+            }) => {
+                assert_eq!(timeout_ms, 5_000);
+                assert_eq!(
+                    partial,
+                    PartialBudget {
+                        cpu_instructions: 1_000,
+                        memory_bytes: 2_048,
+                    }
+                );
+            }
+            other => panic!("expected TimeoutExceeded, got {other:?}"),
+        }
+        // Cooperating tasks holding the token see the cancellation.
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_simulation_deadline_passes_through_fast_result() {
+        let telemetry = BudgetTelemetry::new();
+        let cancellation = CancellationToken::new();
+
+        let result = run_with_deadline(
+            std::time::Duration::from_millis(5_000),
+            cancellation.clone(),
+            &telemetry,
+            async { Ok::<_, SimulationError>(42) },
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), 42);
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_simulation_deadline_honours_external_cancellation() {
+        let telemetry = BudgetTelemetry::new();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result: Result<(), SimulationError> = run_with_deadline(
+            std::time::Duration::from_millis(5_000),
+            cancellation,
+            &telemetry,
+            std::future::pending(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SimulationError::TimeoutExceeded { partial, .. }) if partial == PartialBudget::default()
+        ));
+    }
+
+    #[test]
+    fn test_budget_telemetry_accumulates_steps() {
+        let telemetry = BudgetTelemetry::new();
+        for _ in 0..3 {
+            telemetry.record(&SorobanResources {
+                cpu_instructions: 10,
+                ram_bytes: 20,
+                ..Default::default()
+            });
+        }
+        assert_eq!(
+            telemetry.snapshot(),
+            PartialBudget {
+                cpu_instructions: 30,
+                memory_bytes: 60,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simulate_with_timeout_against_stalled_rpc_node() {
+        // An RPC node that accepts connections but never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stalled = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+
+        let engine = SimulationEngine::new(format!("http://{addr}"));
+        let result = engine
+            .simulate_with_timeout(
+                "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                "hello",
+                vec![],
+                std::time::Duration::from_millis(200),
+                CancellationToken::new(),
+            )
+            .await;
+
+        stalled.abort();
+        assert!(
+            matches!(
+                result,
+                Err(SimulationError::TimeoutExceeded {
+                    timeout_ms: 200,
+                    ..
+                })
+            ),
+            "expected TimeoutExceeded, got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -5953,6 +6259,46 @@ mod tests {
             assert_eq!(deps[0].key, key_xdr);
             assert_eq!(deps[0].source, DataSource::Injected);
         }
+    }
+
+    #[test]
+    fn test_temp_wasm_file_removed_on_drop() {
+        let guard = TempWasmFile::new(b"\0asm\x01\0\0\0").unwrap();
+        let path = guard.path().to_path_buf();
+        assert!(path.exists(), "temp wasm file should exist while guard is alive");
+        drop(guard);
+        assert!(
+            !path.exists(),
+            "temp wasm file should be removed when guard is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_temp_wasm_file_removed_on_early_future_drop() {
+        // Spawn an in-flight future that holds a TempWasmFile across an await
+        // point, then drop the future mid-execution. The guard's Drop must run
+        // and remove the file from disk.
+        let (path_tx, path_rx) = tokio::sync::oneshot::channel::<PathBuf>();
+        let handle = tokio::spawn(async move {
+            let guard = TempWasmFile::new(b"\0asm\x01\0\0\0").unwrap();
+            let path = guard.path().to_path_buf();
+            let _ = path_tx.send(path.clone());
+            // Park forever so the future is still in flight when dropped.
+            std::future::pending::<()>().await;
+            drop(guard);
+        });
+
+        let path = path_rx.await.unwrap();
+        assert!(path.exists(), "temp wasm file should exist while in flight");
+
+        // Cancel the in-flight future.
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            !path.exists(),
+            "temp wasm file should be removed after the future is dropped"
+        );
     }
 
     #[test]

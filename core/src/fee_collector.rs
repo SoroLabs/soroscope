@@ -4,10 +4,16 @@ use crate::rpc_provider::ProviderRegistry;
 use crate::AppMetrics;
 use chrono::Utc;
 use reqwest::Client;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing;
+
+/// Maximum number of fee samples retained in memory while waiting to be
+/// persisted. Bounds memory growth during prolonged storage outages.
+pub const MAX_BUFFERED_SAMPLES: usize = 2_000;
 
 /// Errors that can occur during fee collection
 #[derive(Error, Debug)]
@@ -55,12 +61,17 @@ pub struct FeeCollector {
     store: Arc<FeeStore>,
     client: Client,
     config: FeeCollectorConfig,
-    last_collected_sequence: std::sync::atomic::AtomicU64,
+    last_collected_sequence: AtomicU64,
     metrics: Arc<AppMetrics>,
     /// Leader-election lease. Only the instance holding it persists ledger
     /// fee samples, so running multiple Core instances doesn't cause
     /// duplicate collection or racing writes to `FeeStore`.
     leader_lock: Arc<RedisLeaderLock>,
+    /// Bounded ring buffer of fee samples awaiting persistence. Samples are
+    /// only removed after a successful `store.upsert_ledger_sample`.
+    buffered_samples: Mutex<VecDeque<LedgerFeeSample>>,
+    /// Total number of samples evicted from the buffer because it was full.
+    dropped_fee_samples_total: AtomicU64,
 }
 
 impl FeeCollector {
@@ -80,9 +91,88 @@ impl FeeCollector {
                 .build()
                 .expect("Failed to create HTTP client"),
             config,
-            last_collected_sequence: std::sync::atomic::AtomicU64::new(0),
+            last_collected_sequence: AtomicU64::new(0),
             metrics,
             leader_lock,
+            buffered_samples: Mutex::new(VecDeque::with_capacity(MAX_BUFFERED_SAMPLES)),
+            dropped_fee_samples_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Number of fee samples dropped because the in-memory buffer was full.
+    pub fn dropped_fee_samples_total(&self) -> u64 {
+        self.dropped_fee_samples_total.load(Ordering::Relaxed)
+    }
+
+    /// Current number of buffered (not yet persisted) fee samples.
+    pub fn buffered_sample_count(&self) -> usize {
+        self.buffered_samples
+            .lock()
+            .expect("buffered_samples mutex poisoned")
+            .len()
+    }
+
+    /// Insert a sample into the bounded buffer, deduplicating by
+    /// `ledger_sequence` and evicting the oldest entry when full.
+    fn buffer_sample(&self, sample: LedgerFeeSample) {
+        let mut buffer = self
+            .buffered_samples
+            .lock()
+            .expect("buffered_samples mutex poisoned");
+
+        // Deduplicate: repeated RPC polls of the same ledger must not insert
+        // duplicate entries.
+        if buffer
+            .iter()
+            .any(|s| s.ledger_sequence == sample.ledger_sequence)
+        {
+            return;
+        }
+
+        buffer.push_back(sample);
+
+        while buffer.len() > MAX_BUFFERED_SAMPLES {
+            buffer.pop_front();
+            self.dropped_fee_samples_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Attempt to persist all buffered samples. Samples are only removed from
+    /// the buffer after a successful write, so a storage failure retains at
+    /// most `MAX_BUFFERED_SAMPLES` entries.
+    async fn flush_buffered_samples(&self) -> Result<(), FeeCollectorError> {
+        loop {
+            let next = {
+                let buffer = self
+                    .buffered_samples
+                    .lock()
+                    .expect("buffered_samples mutex poisoned");
+                buffer.front().cloned()
+            };
+
+            let Some(sample) = next else {
+                return Ok(());
+            };
+
+            self.store
+                .upsert_ledger_sample(&sample)
+                .await
+                .map_err(|e| FeeCollectorError::StoreError(e.to_string()))?;
+
+            let mut buffer = self
+                .buffered_samples
+                .lock()
+                .expect("buffered_samples mutex poisoned");
+            // Remove the sample we just persisted (it should be at the front).
+            if buffer
+                .front()
+                .map(|s| s.ledger_sequence == sample.ledger_sequence)
+                .unwrap_or(false)
+            {
+                buffer.pop_front();
+            } else {
+                buffer.retain(|s| s.ledger_sequence != sample.ledger_sequence);
+            }
         }
     }
 
@@ -209,11 +299,37 @@ impl FeeCollector {
         // Fetch latest ledger details
         let sample = self.fetch_ledger_fee_data(latest_sequence).await?;
 
-        // Store in database
+        // Buffer the sample (bounded + deduplicated) before persisting.
+        self.buffer_sample(sample.clone());
+
+        // Store in database. On failure the sample remains buffered (bounded),
+        // so memory growth is capped during storage outages.
         self.store
             .upsert_ledger_sample(&sample)
             .await
             .map_err(|e| FeeCollectorError::StoreError(e.to_string()))?;
+
+        // Remove the persisted sample from the buffer.
+        {
+            let mut buffer = self
+                .buffered_samples
+                .lock()
+                .expect("buffered_samples mutex poisoned");
+            if buffer
+                .front()
+                .map(|s| s.ledger_sequence == sample.ledger_sequence)
+                .unwrap_or(false)
+            {
+                buffer.pop_front();
+            } else {
+                buffer.retain(|s| s.ledger_sequence != sample.ledger_sequence);
+            }
+        }
+
+        // Drain any previously buffered samples now that storage is healthy.
+        if let Err(e) = self.flush_buffered_samples().await {
+            tracing::warn!(error = %e, "Failed to flush buffered fee samples");
+        }
 
         // Update last collected sequence
         self.last_collected_sequence
@@ -502,6 +618,102 @@ mod tests {
         assert_eq!(config.collection_interval_secs, 5);
         assert_eq!(config.batch_size, 10);
         assert_eq!(config.request_timeout, Duration::from_secs(10));
+    }
+
+    fn sample(sequence: i64) -> LedgerFeeSample {
+        LedgerFeeSample {
+            ledger_sequence: sequence,
+            collected_at: Utc::now(),
+            base_reserve: 0,
+            base_fee: 100,
+            max_fee: 100,
+            fee_charged: 0,
+            transaction_count: 0,
+            ledger_close_time: Utc::now(),
+        }
+    }
+
+    async fn test_collector() -> Arc<FeeCollector> {
+        let registry = ProviderRegistry::new(vec![crate::rpc_provider::RpcProvider {
+            name: "test".to_string(),
+            url: "http://127.0.0.1:9".to_string(),
+            auth_header: None,
+            auth_value: None,
+            advertise: None,
+        }]);
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        let store = Arc::new(FeeStore::new(pool));
+        let metrics = Arc::new(AppMetrics::new().expect("metrics"));
+        let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+        let leader_lock = Arc::new(RedisLeaderLock::new(
+            redis_client,
+            "test_fee_collector",
+            Duration::from_secs(10),
+        ));
+        Arc::new(FeeCollector::new(
+            registry,
+            store,
+            FeeCollectorConfig::default(),
+            metrics,
+            leader_lock,
+        ))
+    }
+
+    #[tokio::test]
+    async fn duplicate_ledger_samples_are_deduplicated() {
+        let collector = test_collector().await;
+
+        for _ in 0..5 {
+            collector.buffer_sample(sample(42));
+        }
+
+        assert_eq!(collector.buffered_sample_count(), 1);
+        assert_eq!(collector.dropped_fee_samples_total(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffer_never_exceeds_max_capacity() {
+        let collector = test_collector().await;
+
+        let total = MAX_BUFFERED_SAMPLES + 500;
+        for seq in 0..total {
+            collector.buffer_sample(sample(seq as i64));
+        }
+
+        assert_eq!(collector.buffered_sample_count(), MAX_BUFFERED_SAMPLES);
+        assert_eq!(collector.dropped_fee_samples_total(), 500);
+
+        // The oldest samples should have been evicted.
+        let buffer = collector
+            .buffered_samples
+            .lock()
+            .expect("buffered_samples mutex poisoned");
+        assert_eq!(buffer.front().unwrap().ledger_sequence, 500);
+        assert_eq!(
+            buffer.back().unwrap().ledger_sequence,
+            (total - 1) as i64
+        );
+    }
+
+    #[tokio::test]
+    async fn buffer_stays_bounded_during_storage_outage() {
+        let collector = test_collector().await;
+
+        // Simulate a prolonged storage outage by buffering many samples
+        // without ever flushing them.
+        for seq in 0..(MAX_BUFFERED_SAMPLES * 3) {
+            collector.buffer_sample(sample(seq as i64));
+        }
+
+        assert!(collector.buffered_sample_count() <= MAX_BUFFERED_SAMPLES);
+        assert_eq!(collector.buffered_sample_count(), MAX_BUFFERED_SAMPLES);
+        assert_eq!(
+            collector.dropped_fee_samples_total(),
+            (MAX_BUFFERED_SAMPLES * 2) as u64
+        );
     }
 
     #[tokio::test]
