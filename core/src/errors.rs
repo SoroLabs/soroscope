@@ -24,6 +24,10 @@ pub enum AppError {
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
 
+    /// The worker pool shed the request under load (issue #1409).
+    #[error("Service overloaded: {0}")]
+    ServiceOverloaded(String),
+
     #[error("Payload too large: {0}")]
     PayloadTooLarge(String),
 
@@ -60,6 +64,7 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::ServiceOverloaded(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
@@ -72,6 +77,7 @@ impl AppError {
             Self::NotFound(_) => "not-found",
             Self::BadRequest(_) => "bad-request",
             Self::Unauthorized(_) => "unauthorized",
+            Self::ServiceOverloaded(_) => "service-overloaded",
             Self::PayloadTooLarge(_) => "payload-too-large",
             Self::UnprocessableEntity(_) => "unprocessable-entity",
             Self::TooManyRequests(_) => "too-many-requests",
@@ -84,6 +90,7 @@ impl AppError {
             Self::NotFound(_) => "Not Found",
             Self::BadRequest(_) => "Bad Request",
             Self::Unauthorized(_) => "Unauthorized",
+            Self::ServiceOverloaded(_) => "Service Overloaded",
             Self::PayloadTooLarge(_) => "Payload Too Large",
             Self::UnprocessableEntity(_) => "Unprocessable Entity",
             Self::TooManyRequests(_) => "Too Many Requests",

@@ -1001,6 +1001,10 @@ impl JobQueue {
                         break;
                     }
                     _ = interval.tick() => {
+                        if crate::sys_alarms::resource_alarm_state().should_pause_background_jobs() {
+                            tracing::warn!("Fee store maintenance paused by critical resource alarm");
+                            continue;
+                        }
                         if !leader_lock.try_acquire_or_renew().await {
                             tracing::debug!("not leader this cycle, skipping fee store maintenance");
                             continue;

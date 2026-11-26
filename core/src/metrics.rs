@@ -28,6 +28,16 @@ pub struct AppMetrics {
     pub fee_quote_cache_hits_total: prometheus::IntCounter,
     /// Fee quote cache lookups that had to fetch a fresh quote (issue #1259).
     pub fee_quote_cache_misses_total: prometheus::IntCounter,
+    /// Bounded worker pool tasks currently executing (issue #1409).
+    pub worker_pool_active_tasks: prometheus::IntGauge,
+    /// Bounded worker pool tasks admitted and waiting for a worker (issue #1409).
+    pub worker_pool_queued_tasks: prometheus::IntGauge,
+    /// Tasks shed by the bounded worker pool: rejected when full or skipped
+    /// after waiting longer than `max_queue_wait_ms` (issue #1409).
+    pub worker_pool_shed_total: prometheus::IntCounter,
+    /// Resource exhaustion alarm severity per resource: 0 normal, 1 warning,
+    /// 2 critical (issue #1411).
+    pub resource_alarm_severity: prometheus::IntGaugeVec,
     /// Contract profile lookups served from the in-memory L1 (issue #1397).
     pub cache_l1_hits_total: prometheus::IntCounter,
     /// Contract profile lookups served from the shared L2 (issue #1397).
@@ -37,6 +47,18 @@ pub struct AppMetrics {
     /// RPC provider circuit breaker transitions, by provider and target
     /// state (`open`, `half_open`, `closed`) (issue #1398).
     pub rpc_circuit_breaker_transitions_total: IntCounterVec,
+}
+
+/// The `resource_alarm_severity{resource}` gauge published by
+/// `sys_alarms::ResourceAlarmMonitor` (issue #1411).
+pub fn resource_alarm_severity_gauge() -> Result<prometheus::IntGaugeVec, prometheus::Error> {
+    prometheus::IntGaugeVec::new(
+        Opts::new(
+            "resource_alarm_severity",
+            "Resource exhaustion alarm severity (0 normal, 1 warning, 2 critical)",
+        ),
+        &["resource"],
+    )
 }
 
 impl AppMetrics {
@@ -125,6 +147,18 @@ impl AppMetrics {
             "fee_quote_cache_misses_total",
             "Fee quote lookups that required a fresh fetch",
         )?;
+        let worker_pool_active_tasks = prometheus::IntGauge::new(
+            "worker_pool_active_tasks",
+            "Bounded worker pool tasks currently executing",
+        )?;
+        let worker_pool_queued_tasks = prometheus::IntGauge::new(
+            "worker_pool_queued_tasks",
+            "Bounded worker pool tasks waiting for a worker",
+        )?;
+        let worker_pool_shed_total = prometheus::IntCounter::new(
+            "worker_pool_shed_total",
+            "Tasks shed by the bounded worker pool (queue full or queue wait exceeded)",
+        )?;
         let cache_l1_hits_total = prometheus::IntCounter::new(
             "cache_l1_hits_total",
             "Contract profile lookups served from the in-memory L1 cache",
@@ -158,6 +192,11 @@ impl AppMetrics {
         registry.register(Box::new(job_queue_depth.clone()))?;
         registry.register(Box::new(fee_quote_cache_hits_total.clone()))?;
         registry.register(Box::new(fee_quote_cache_misses_total.clone()))?;
+        registry.register(Box::new(worker_pool_active_tasks.clone()))?;
+        registry.register(Box::new(worker_pool_queued_tasks.clone()))?;
+        registry.register(Box::new(worker_pool_shed_total.clone()))?;
+        let resource_alarm_severity = resource_alarm_severity_gauge()?;
+        registry.register(Box::new(resource_alarm_severity.clone()))?;
         registry.register(Box::new(cache_l1_hits_total.clone()))?;
         registry.register(Box::new(cache_l2_hits_total.clone()))?;
         registry.register(Box::new(cache_misses_total.clone()))?;
@@ -178,10 +217,23 @@ impl AppMetrics {
             job_queue_depth,
             fee_quote_cache_hits_total,
             fee_quote_cache_misses_total,
+            worker_pool_active_tasks,
+            worker_pool_queued_tasks,
+            worker_pool_shed_total,
+            resource_alarm_severity,
             cache_l1_hits_total,
             cache_l2_hits_total,
             cache_misses_total,
             rpc_circuit_breaker_transitions_total,
         })
+    }
+
+    /// Handles for [`crate::worker_pool::EventWorkerPool::with_metrics`].
+    pub fn worker_pool_metrics(&self) -> crate::worker_pool::WorkerPoolMetrics {
+        crate::worker_pool::WorkerPoolMetrics {
+            active_tasks: self.worker_pool_active_tasks.clone(),
+            queued_tasks: self.worker_pool_queued_tasks.clone(),
+            shed_total: self.worker_pool_shed_total.clone(),
+        }
     }
 }
