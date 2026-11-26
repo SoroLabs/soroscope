@@ -166,4 +166,3 @@ fn test_m_of_n_guardian_multi_sig_pause_and_unpause() {
     assert_eq!(client.get_pause_type(), PauseType::Unpaused);
     assert_eq!(client.get_pause_votes(), 0); // pause votes reset after unpause
 }
-

@@ -1,9 +1,6 @@
 #![no_std]
 
-use emergency_guard::{
-    DefaultEmergencyGuard, EmergencyGuard, EmergencyGuardTrait, GuardDataKey, GuardError,
-    PauseMask, PauseType,
-};
+use emergency_guard::{EmergencyGuard, GuardDataKey, GuardError, PauseMask, PauseType};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, IntoVal,
     Vec,
@@ -270,6 +267,9 @@ pub enum Error {
     Paused = 4,
     PairAlreadyExists = 5,
     InvalidThreshold = 6,
+    PoolAlreadyExists = 7,
+    IdenticalTokens = 8,
+    WasmHashNotApproved = 9,
 }
 
 #[contracttype]
@@ -280,6 +280,7 @@ pub enum DataKey {
     Instance(Address),
     Creator(Address),
     AllInstances,
+    ApprovedWasmHash(BytesN<32>),
 }
 
 #[contracttype]
@@ -305,6 +306,29 @@ fn map_guard_err(err: GuardError) -> Error {
         | GuardError::Unauthorized
         | GuardError::AdminNotFound => Error::Unauthorized,
         GuardError::Paused => Error::Paused,
+        GuardError::GuardianNotFound => Error::Unauthorized,
+        GuardError::TimelockNotElapsed => Error::Paused,
+    }
+}
+
+impl LiquidityPoolFactory {
+    fn register_instance(env: Env, address: Address, creator: Address) -> Result<(), Error> {
+        env.storage()
+            .instance()
+            .set(&DataKey::Instance(address.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::Creator(address.clone()), &creator);
+
+        let mut all: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllInstances)
+            .unwrap_or_else(|| Vec::new(&env));
+        all.push_back(address);
+        env.storage().instance().set(&DataKey::AllInstances, &all);
+
+        Ok(())
     }
 }
 
@@ -455,6 +479,39 @@ impl LiquidityPoolFactory {
         EmergencyGuard::resume(env, approvers)
     }
 
+    /// Approve a WASM hash for pool deployments (multi-signature required).
+    pub fn approve_wasm_hash(
+        env: Env,
+        approvers: Vec<Address>,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        EmergencyGuard::validate_multi_sig(env.clone(), approvers).map_err(map_guard_err)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::ApprovedWasmHash(wasm_hash), &true);
+        Ok(())
+    }
+
+    /// Revoke a previously approved WASM hash (multi-signature required).
+    pub fn revoke_wasm_hash(
+        env: Env,
+        approvers: Vec<Address>,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        EmergencyGuard::validate_multi_sig(env.clone(), approvers).map_err(map_guard_err)?;
+        env.storage()
+            .instance()
+            .remove(&DataKey::ApprovedWasmHash(wasm_hash));
+        Ok(())
+    }
+
+    /// Return whether a WASM hash is approved for pool deployments.
+    pub fn is_wasm_hash_approved(env: Env, wasm_hash: BytesN<32>) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::ApprovedWasmHash(wasm_hash))
+    }
+
     pub fn create_pair(
         env: Env,
         token_a: Address,
@@ -465,6 +522,19 @@ impl LiquidityPoolFactory {
             return Err(Error::Paused);
         }
 
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::ApprovedWasmHash(wasm_hash.clone()))
+        {
+            return Err(Error::WasmHashNotApproved);
+        }
+
+        if token_a == token_b {
+            return Err(Error::IdenticalTokens);
+        }
+
+        // Canonicalize the pair so (A, B) and (B, A) share one registry key.
         let (token_0, token_1) = if token_a < token_b {
             (token_a, token_b)
         } else {
@@ -476,7 +546,7 @@ impl LiquidityPoolFactory {
             .instance()
             .has(&DataKey::Pair(token_0.clone(), token_1.clone()))
         {
-            return Err(Error::PairAlreadyExists);
+            return Err(Error::PoolAlreadyExists);
         }
 
         let salt = env
