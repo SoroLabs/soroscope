@@ -1,8 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    FromRow, SqlitePool,
+};
+use std::str::FromStr;
 use thiserror::Error;
-use tracing;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -45,15 +48,42 @@ pub struct TransactionFeeRecord {
     pub recorded_at: DateTime<Utc>,
 }
 
-/// Thread-safe fee data store backed by SQLite/PostgreSQL
+/// Thread-safe fee data store backed by SQLite
 pub struct FeeStore {
     pool: SqlitePool,
 }
 
 impl FeeStore {
-    /// Create a new fee store with the given database pool
+    /// Create a new fee store, building a connection pool configured for concurrent writes.
+    ///
+    /// - WAL journal mode: allows concurrent readers alongside a writer, eliminating
+    ///   the `SQLITE_BUSY` / "database is locked" errors that occurred in the default
+    ///   DELETE mode when multiple async tasks wrote simultaneously.
+    /// - `busy_timeout(5000 ms)`: instead of returning `SQLITE_BUSY` immediately,
+    ///   SQLite will retry for up to 5 s before giving up, covering brief contention.
+    /// - `max_connections(5)`: caps the pool so writers queue rather than race.
+    pub async fn connect(database_url: &str) -> Result<Self, FeeStoreError> {
+        let options = SqliteConnectOptions::from_str(database_url)?
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_millis(5000))
+            .create_if_missing(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await?;
+
+        Ok(Self { pool })
+    }
+
+    /// Create a fee store from an already-configured pool (used in tests).
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// Returns a reference to the inner connection pool, e.g. for running migrations.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     /// Insert or update a ledger fee sample (upsert)
@@ -235,6 +265,13 @@ impl FeeStore {
         Ok(count)
     }
 
+    /// Close the database connection pool
+    pub async fn close(&self) {
+        tracing::info!("Closing FeeStore database connections");
+        self.pool.close().await;
+        tracing::info!("FeeStore database connections closed");
+    }
+
     /// Batch insert multiple ledger samples
     pub async fn batch_insert_samples(
         &self,
@@ -300,6 +337,9 @@ impl TransactionFeeRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::str::FromStr;
+    use std::sync::Arc;
 
     #[test]
     fn test_transaction_fee_record_creation() {
@@ -309,5 +349,67 @@ mod tests {
         assert_eq!(record.tx_hash, "abc123");
         assert_eq!(record.fee_bid, 100);
         assert!(!record.id.is_empty());
+    }
+
+    /// Verify that concurrent writes to an in-memory SQLite database configured with
+    /// WAL mode and a busy timeout produce zero `DatabaseLocked` errors.
+    #[tokio::test]
+    async fn test_concurrent_writes_no_database_locked() {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_millis(5000));
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .expect("in-memory sqlite pool");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS ledger_fee_samples (
+                ledger_sequence BIGINT PRIMARY KEY,
+                collected_at TEXT NOT NULL,
+                base_reserve BIGINT NOT NULL,
+                base_fee BIGINT NOT NULL,
+                max_fee BIGINT NOT NULL,
+                fee_charged BIGINT NOT NULL,
+                transaction_count INTEGER NOT NULL,
+                ledger_close_time TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        let store = Arc::new(FeeStore::new(pool));
+        let mut handles = Vec::new();
+
+        for i in 0..20_u32 {
+            let store = Arc::clone(&store);
+            let sample = LedgerFeeSample {
+                ledger_sequence: i as i64,
+                collected_at: Utc::now(),
+                base_reserve: 100,
+                base_fee: 100,
+                max_fee: 1000,
+                fee_charged: 100,
+                transaction_count: 1,
+                ledger_close_time: Utc::now(),
+            };
+            handles.push(tokio::spawn(
+                async move { store.upsert_ledger_sample(&sample).await },
+            ));
+        }
+
+        let mut errors = 0u32;
+        for handle in handles {
+            if let Ok(Err(e)) = handle.await {
+                eprintln!("Write error: {e}");
+                errors += 1;
+            }
+        }
+
+        assert_eq!(errors, 0, "expected zero DatabaseLocked errors under concurrent writes");
     }
 }

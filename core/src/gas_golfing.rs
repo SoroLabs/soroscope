@@ -4,9 +4,17 @@ use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GasGolfingSuggestion {
+    /// Stable identifier, unique within a report. Derived from the rule and
+    /// location so clients can key rows on it across re-sorts and re-fetches
+    /// (#1285). Defaults to empty when deserializing older payloads.
+    #[serde(default)]
+    pub id: String,
     pub pattern_type: String,
     pub description: String,
-    pub location: Option<String>, // WASM offset or function name
+    /// `export_name#+instruction_offset`, or `func#<index>#+<offset>` when the
+    /// function is not exported. `None` only when there is no function to
+    /// attribute the finding to, i.e. a parse error (#1007).
+    pub location: Option<String>,
     pub severity: String,         // "low", "medium", "high"
     pub gas_saved_estimate: Option<u64>,
     pub suggested_fix: String,
@@ -24,6 +32,27 @@ pub struct GasGolfingReport {
 
 pub struct GasGolfingAnalyzer;
 
+/// Give every suggestion an id that is unique within the report and stable
+/// across runs on the same WASM: `<pattern_type>@<location>`, with a `#n`
+/// suffix when the same rule fires more than once at the same location.
+fn assign_suggestion_ids(suggestions: &mut [GasGolfingSuggestion]) {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for suggestion in suggestions.iter_mut() {
+        let base = format!(
+            "{}@{}",
+            suggestion.pattern_type,
+            suggestion.location.as_deref().unwrap_or("module")
+        );
+        let count = seen.entry(base.clone()).or_insert(0);
+        *count += 1;
+        suggestion.id = if *count == 1 {
+            base
+        } else {
+            format!("{base}#{count}")
+        };
+    }
+}
+
 impl Default for GasGolfingAnalyzer {
     fn default() -> Self {
         Self
@@ -39,12 +68,38 @@ impl GasGolfingAnalyzer {
         let mut suggestions = Vec::new();
         let mut summary = HashMap::new();
 
-        // Analyze WASM bytecode for common gas-heavy patterns
-        suggestions.extend(self.analyze_loop_patterns(wasm_bytes));
-        suggestions.extend(self.analyze_memory_patterns(wasm_bytes));
-        suggestions.extend(self.analyze_arithmetic_patterns(wasm_bytes));
-        suggestions.extend(self.analyze_storage_patterns(wasm_bytes));
-        suggestions.extend(self.analyze_branching_patterns(wasm_bytes));
+        // Issue #1007: decode the module once, then run every rule over the
+        // operator streams. Input that is not a valid module produces no
+        // suggestions rather than byte-pattern false positives, and a parse
+        // failure is recorded in the report instead of being silent.
+        match crate::parsed_module::parse_module(wasm_bytes) {
+            Ok(module) => {
+                suggestions.extend(self.analyze_loop_patterns(&module));
+                suggestions.extend(self.analyze_memory_patterns(&module));
+                suggestions.extend(self.analyze_arithmetic_patterns(&module));
+                suggestions.extend(self.analyze_storage_patterns(&module));
+                suggestions.extend(self.analyze_branching_patterns(&module));
+            }
+            Err(err) => {
+                suggestions.push(GasGolfingSuggestion {
+                    id: String::new(),
+pattern_type: "parse_error".to_string(),
+                    description: format!(
+                        "input is not a valid WASM module, so no pattern rules were run: {err}"
+                    ),
+                    location: None,
+                    severity: "high".to_string(),
+                    gas_saved_estimate: None,
+                    suggested_fix:
+                        "Supply a compiled contract WASM artifact; the byte-pattern scanner that \
+                         previously ran here would have reported suggestions for arbitrary input"
+                            .to_string(),
+                    code_example: None,
+                });
+            }
+        }
+
+        assign_suggestion_ids(&mut suggestions);
 
         // Build summary
         for suggestion in &suggestions {
@@ -55,7 +110,7 @@ impl GasGolfingAnalyzer {
             contract_name: contract_name.to_string(),
             analysis_timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             total_suggestions: suggestions.len(),
             suggestions,
@@ -63,164 +118,805 @@ impl GasGolfingAnalyzer {
         }
     }
 
-    fn analyze_loop_patterns(&self, wasm_bytes: &[u8]) -> Vec<GasGolfingSuggestion> {
-        let mut suggestions = Vec::new();
+    // ── Parsed-module rule pass (issue #1007) ─────────────────────────────────
+    //
+    // Every rule below runs on decoded instructions from
+    // `parsed_module::parse_module`, not on a byte window. The previous
+    // implementation scanned for opcode-shaped byte sequences, which cannot
+    // distinguish a real instruction from the same byte appearing inside a
+    // LEB128 immediate or a data segment, and could only report a byte offset
+    // as a location. A parser makes the false-positive guard the docs already
+    // claimed to provide actually true.
+    //
+    // `gas_saved_estimate` is intentionally `None` here. Pricing an import
+    // needs a cost-parameter table, which is issue #1008's job; emitting a
+    // hand-picked number per rule is what made the field untrustworthy.
 
-        // Look for inefficient loop patterns
-        // This is a simplified analysis - in practice, you'd use wasmparser crate
-        if wasm_bytes.windows(4).any(|w| w == [0x02, 0x40, 0x03, 0x40]) {
-            // Block + loop pattern that might be inefficient
-            suggestions.push(GasGolfingSuggestion {
-                pattern_type: "loop_optimization".to_string(),
-                description: "Detected potential loop optimization opportunity".to_string(),
-                location: Some("unknown".to_string()),
-                severity: "medium".to_string(),
-                gas_saved_estimate: Some(500),
-                suggested_fix: "Consider using bitwise operations or lookup tables for repetitive calculations".to_string(),
-                code_example: Some("Replace: for(i = 0; i < 256; i++) { if(i & mask) count++; }\nWith: count = bit_count(mask);".to_string()),
-            });
+    /// Imports whose host name denotes a ledger read or write.
+    fn is_storage_import(module: &crate::parsed_module::ParsedModule, op: &wasmparser::Operator) -> bool {
+        let wasmparser::Operator::Call { function_index } = op else { return false };
+        let Some(import) = module.host_import(*function_index) else { return false };
+        let name = import.name.as_str();
+        name.contains("contract_data") || name.contains("contract_code") || name == "extend_contract_data_ttl"
+    }
+
+    fn is_division(op: &wasmparser::Operator) -> bool {
+        matches!(
+            op,
+            wasmparser::Operator::I32DivS
+                | wasmparser::Operator::I32DivU
+                | wasmparser::Operator::I32RemS
+                | wasmparser::Operator::I32RemU
+                | wasmparser::Operator::I64DivS
+                | wasmparser::Operator::I64DivU
+                | wasmparser::Operator::I64RemS
+                | wasmparser::Operator::I64RemU
+        )
+    }
+
+    /// Detects loops that call a host import or grow memory inside the loop's
+    /// own structured block.
+    ///
+    /// The previous version looked 128 bytes past a `block`+`loop` byte
+    /// signature, which matched the same four bytes inside a data segment and
+    /// ran past the end of one function into the next. Here the control stack
+    /// gives the loop's real extent, and a loop is flagged only when the body
+    /// actually does per-iteration work: a call to a host import, an indirect
+    /// call, or a `memory.grow`. A counter loop does none of those and is
+    /// correctly left alone.
+    fn analyze_loop_patterns(&self, module: &crate::parsed_module::ParsedModule) -> Vec<GasGolfingSuggestion> {
+        let mut suggestions = Vec::new();
+        let mut _flagged = 0usize;
+
+        for function in &module.functions {
+            let spans = crate::parsed_module::loop_spans(&function.operators);
+
+            for span in &spans {
+                // A loop nested directly inside this one is analysed on its own
+                // span, so counting its body here as well would report the same
+                // host call twice — once for the outer loop, once for the
+                // inner — and inflate the suggestion count for one piece of
+                // code. Only the innermost loop owns a given call.
+                if spans
+                    .iter()
+                    .any(|other| other.depth > span.depth && other.op_index > span.op_index && other.end_index < span.end_index)
+                {
+                    continue;
+                }
+
+                let body = &function.operators[(span.op_index + 1)..=span.end_index.min(function.operators.len() - 1)];
+
+                let host_calls = body
+                    .iter()
+                    .filter(|op| matches!(op, wasmparser::Operator::Call { function_index } if module.is_host_import(*function_index)))
+                    .count();
+                let indirect_calls = body
+                    .iter()
+                    .filter(|op| matches!(op, wasmparser::Operator::CallIndirect { .. }))
+                    .count();
+                let memory_grows = body
+                    .iter()
+                    .filter(|op| matches!(op, wasmparser::Operator::MemoryGrow { .. }))
+                    .count();
+
+                if host_calls == 0 && indirect_calls == 0 && memory_grows == 0 {
+                    // Nothing per-iteration that could be hoisted.
+                    continue;
+                }
+
+                _flagged += 1;
+                let mut detail = format!(
+                    "loop at {} performs per-iteration work: {} host call(s), {} indirect call(s), \
+                     {} memory.grow — candidates for loop-invariant code motion",
+                    function.location(span.op_index),
+                    host_calls,
+                    indirect_calls,
+                    memory_grows
+                );
+                if span.depth > 0 {
+                    detail.push_str(&format!(" (nested at depth {})", span.depth));
+                }
+                suggestions.push(GasGolfingSuggestion {
+                    id: String::new(),
+pattern_type: "loop_optimization".to_string(),
+                    description: detail,
+                    location: Some(function.location(span.op_index)),
+                    severity: if host_calls + indirect_calls >= 2 { "high" } else { "medium" }.to_string(),
+                    gas_saved_estimate: None,
+                    suggested_fix:
+                        "Hoist invariant computations and host reads out of the loop body; the \
+                         call and memory.grow inside a loop are repeated every iteration"
+                            .to_string(),
+                    code_example: Some(
+                        "Read the value into a local before the loop, then compute inside it:\
+                         \n\n  for i in 0..n { let v = storage::get(k); total += v * f(i); }\
+                         \n  -> \n  let base = storage::get(k); for i in 0..n { total += base * f(i); }"
+                            .to_string(),
+                    ),
+                });
+            }
         }
 
         suggestions
     }
 
-    fn analyze_memory_patterns(&self, wasm_bytes: &[u8]) -> Vec<GasGolfingSuggestion> {
+    /// Detects repeated `memory.grow`, the allocation-pressure proxy.
+    ///
+    /// The previous version matched the two-byte sequence `[0x40, 0x00]`, which
+    /// is `memory.grow` with a zero memory index — but `0x40` is also the empty
+    /// block type, and `[0x40, 0x00]` occurs incidentally in encoded
+    /// immediates. Counting the decoded instruction removes both false hits.
+    fn analyze_memory_patterns(&self, module: &crate::parsed_module::ParsedModule) -> Vec<GasGolfingSuggestion> {
+        const GROW_THRESHOLD: usize = 8;
         let mut suggestions = Vec::new();
 
-        // Look for excessive memory allocations
-        let alloc_count = wasm_bytes.windows(2).filter(|w| w == &[0x20, 0x00]).count();
-        if alloc_count > 10 {
+        let mut grow_count = 0usize;
+        let mut first_site: Option<String> = None;
+        for function in &module.functions {
+            for (op_index, op) in function.operators.iter().enumerate() {
+                if matches!(op, wasmparser::Operator::MemoryGrow { .. }) {
+                    grow_count += 1;
+                    if first_site.is_none() {
+                        first_site = Some(function.location(op_index));
+                    }
+                }
+            }
+        }
+
+        if grow_count > GROW_THRESHOLD {
             suggestions.push(GasGolfingSuggestion {
-                pattern_type: "memory_allocation".to_string(),
-                description: format!("High memory allocation count: {}", alloc_count),
-                location: None,
-                severity: "high".to_string(),
-                gas_saved_estimate: Some(1000),
-                suggested_fix: "Reuse memory buffers and minimize allocations in hot paths"
-                    .to_string(),
-                code_example: Some(
-                    "Use a pre-allocated buffer instead of creating new vectors in loops"
-                        .to_string(),
+                id: String::new(),
+pattern_type: "memory_allocation".to_string(),
+                description: format!(
+                    "High memory.grow call count ({}) — repeated heap expansion is expensive",
+                    grow_count
                 ),
+                location: first_site,
+                severity: "high".to_string(),
+                gas_saved_estimate: None,
+                suggested_fix:
+                    "Pre-allocate with Vec::with_capacity(n) rather than growing the heap \
+                     repeatedly in a hot path"
+                        .to_string(),
+                code_example: Some("Vec::with_capacity(n) instead of pushing into Vec::new() in a loop".to_string()),
             });
         }
 
         suggestions
     }
 
-    fn analyze_arithmetic_patterns(&self, wasm_bytes: &[u8]) -> Vec<GasGolfingSuggestion> {
+    /// Detects expensive division/remainder and multiplication by a small
+    /// constant, both of which have cheaper bitwise forms.
+    ///
+    /// The previous version counted raw bytes `0x6D..0x70`, which are equally
+    /// likely to be LEB128 continuation bytes or immediate values, and matched
+    /// `[0x41, 0x02, 0x6C]` for `i32.const 2; i32.mul` anywhere in the file.
+    fn analyze_arithmetic_patterns(&self, module: &crate::parsed_module::ParsedModule) -> Vec<GasGolfingSuggestion> {
+        const DIV_THRESHOLD: usize = 10;
         let mut suggestions = Vec::new();
 
-        // Look for expensive division operations
-        let div_count = wasm_bytes
-            .iter()
-            .filter(|&&b| b == 0x6D || b == 0x6E)
-            .count();
-        if div_count > 5 {
+        let mut div_count = 0usize;
+        let mut div_site: Option<String> = None;
+        let mut mul_const_site: Option<String> = None;
+
+        for function in &module.functions {
+            for (op_index, op) in function.operators.iter().enumerate() {
+                if Self::is_division(op) {
+                    div_count += 1;
+                    if div_site.is_none() {
+                        div_site = Some(function.location(op_index));
+                    }
+                }
+                // i32.const <power of two>; i32.mul  ->  a shift.
+                if let wasmparser::Operator::I32Mul = op {
+                    if op_index > 0 {
+                        if let wasmparser::Operator::I32Const { value } =
+                            &function.operators[op_index - 1]
+                        {
+                            if *value > 1 && (*value as u32).is_power_of_two() {
+                                if mul_const_site.is_none() {
+                                    mul_const_site = Some(function.location(op_index - 1));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if div_count > DIV_THRESHOLD {
             suggestions.push(GasGolfingSuggestion {
-                pattern_type: "arithmetic_optimization".to_string(),
-                description: format!("Multiple division operations detected: {}", div_count),
-                location: None,
+                id: String::new(),
+pattern_type: "arithmetic_optimization".to_string(),
+                description: format!(
+                    "Frequent integer division/remainder operations ({}) — division is far more \
+                     expensive than bitwise operations",
+                    div_count
+                ),
+                location: div_site,
                 severity: "medium".to_string(),
-                gas_saved_estimate: Some(200),
+                gas_saved_estimate: None,
                 suggested_fix:
-                    "Replace divisions with multiplications by reciprocals or use bitwise shifts"
+                    "Replace division by powers of two with a right shift; use reciprocal \
+                     multiplication for known constant divisors"
                         .to_string(),
-                code_example: Some("Replace: x / 2\nWith: x >> 1".to_string()),
+                code_example: Some("x / 2 -> x >> 1;  x % 8 -> x & 7".to_string()),
             });
         }
 
-        // Look for multiplication by constants that could be shifts
-        if wasm_bytes.windows(3).any(|w| w == [0x41, 0x02, 0x6C]) {
+        if let Some(site) = mul_const_site {
             suggestions.push(GasGolfingSuggestion {
-                pattern_type: "multiplication_optimization".to_string(),
-                description: "Multiplication by small constant detected".to_string(),
-                location: None,
+                id: String::new(),
+pattern_type: "multiplication_optimization".to_string(),
+                description: format!("Multiplication by a power-of-two constant at {site}", site = site),
+                location: Some(site),
                 severity: "low".to_string(),
-                gas_saved_estimate: Some(50),
-                suggested_fix: "Use bitwise shifts for multiplication/division by powers of 2"
-                    .to_string(),
-                code_example: Some("Replace: x * 8\nWith: x << 3".to_string()),
+                gas_saved_estimate: None,
+                suggested_fix: "Use a shift for multiplication by a power of two".to_string(),
+                code_example: Some("x * 8 -> x << 3".to_string()),
             });
         }
 
         suggestions
     }
 
-    fn analyze_storage_patterns(&self, wasm_bytes: &[u8]) -> Vec<GasGolfingSuggestion> {
+    /// Detects unbatched ledger access, now by identifying the *actual* host
+    /// import rather than guessing from a low call index.
+    ///
+    /// The previous version treated `call <index 0..=15>` as a storage
+    /// operation. That conflated every low-indexed import with a ledger call and
+    /// missed any storage import the linker placed higher. Matching the import's
+    /// host name is exact, and it is the same import table issue #1008 prices.
+    fn analyze_storage_patterns(&self, module: &crate::parsed_module::ParsedModule) -> Vec<GasGolfingSuggestion> {
+        const STORAGE_THRESHOLD: usize = 20;
         let mut suggestions = Vec::new();
 
-        // Look for repeated storage operations that could be batched
-        let storage_ops = wasm_bytes
-            .iter()
-            .filter(|&&b| b == 0xFC || b == 0xFD)
-            .count();
-        if storage_ops > 15 {
+        let mut storage_calls = 0usize;
+        let mut first_site: Option<String> = None;
+        for function in &module.functions {
+            for (op_index, op) in function.operators.iter().enumerate() {
+                if Self::is_storage_import(module, op) {
+                    storage_calls += 1;
+                    if first_site.is_none() {
+                        first_site = Some(function.location(op_index));
+                    }
+                }
+            }
+        }
+
+        if storage_calls > STORAGE_THRESHOLD {
             suggestions.push(GasGolfingSuggestion {
-                pattern_type: "storage_batching".to_string(),
-                description: format!("High storage operation count: {}", storage_ops),
-                location: None,
+                id: String::new(),
+pattern_type: "storage_batching".to_string(),
+                description: format!(
+                    "High ledger access count ({}) — storage reads/writes could be batched",
+                    storage_calls
+                ),
+                location: first_site,
                 severity: "high".to_string(),
-                gas_saved_estimate: Some(2000),
-                suggested_fix: "Batch storage operations and minimize redundant reads/writes"
-                    .to_string(),
-                code_example: Some(
-                    "Use a single storage update instead of multiple separate calls".to_string(),
-                ),
+                gas_saved_estimate: None,
+                suggested_fix:
+                    "Read values into locals once, compute in memory, then write back once at \
+                     the end of the function"
+                        .to_string(),
+                code_example: Some("Replace per-iteration storage reads with one read outside the loop".to_string()),
             });
         }
 
         suggestions
     }
 
-    fn analyze_branching_patterns(&self, wasm_bytes: &[u8]) -> Vec<GasGolfingSuggestion> {
+    /// Detects deeply nested conditional logic.
+    ///
+    /// The previous version counted raw `0x04` bytes, so an `if` opcode in an
+    /// immediate was counted as a branch. Counting decoded `if` operators is
+    /// exact, and the threshold is on the count itself rather than on a doubled
+    /// `if`+`else` proxy.
+    fn analyze_branching_patterns(&self, module: &crate::parsed_module::ParsedModule) -> Vec<GasGolfingSuggestion> {
+        const IF_THRESHOLD: usize = 25;
         let mut suggestions = Vec::new();
 
-        // Look for deeply nested conditionals
-        let branch_count = wasm_bytes
-            .iter()
-            .filter(|&&b| b == 0x04 || b == 0x05)
-            .count();
-        if branch_count > 20 {
+        let mut if_count = 0usize;
+        let mut first_site: Option<String> = None;
+        for function in &module.functions {
+            for (op_index, op) in function.operators.iter().enumerate() {
+                if matches!(op, wasmparser::Operator::If { .. }) {
+                    if_count += 1;
+                    if first_site.is_none() {
+                        first_site = Some(function.location(op_index));
+                    }
+                }
+            }
+        }
+
+        if if_count > IF_THRESHOLD {
             suggestions.push(GasGolfingSuggestion {
-                pattern_type: "branch_optimization".to_string(),
-                description: format!("Complex branching detected: {} branches", branch_count),
-                location: None,
-                severity: "medium".to_string(),
-                gas_saved_estimate: Some(300),
-                suggested_fix:
-                    "Simplify conditional logic and consider lookup tables for complex decisions"
-                        .to_string(),
-                code_example: Some(
-                    "Replace nested if-else with a lookup table or early returns".to_string(),
+                id: String::new(),
+pattern_type: "branch_optimization".to_string(),
+                description: format!(
+                    "Complex conditional logic: {} `if` instructions — consider a lookup table or \
+                     early returns",
+                    if_count
                 ),
+                location: first_site,
+                severity: "medium".to_string(),
+                gas_saved_estimate: None,
+                suggested_fix: "Flatten nested if-else chains with early returns or a lookup table".to_string(),
+                code_example: Some("Flatten nested conditionals into early returns".to_string()),
             });
         }
 
         suggestions
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parsed_module::parse_module;
+
+    // -------------------------------------------------------------------------
+    // WASM fixture builder (issue #1007)
+    //
+    // The rules run on decoded instructions, so the fixtures have to be real
+    // modules. They are assembled byte by byte here rather than pulled from a
+    // compiled artifact so each test states exactly which instruction it is
+    // about, and so the "data segment containing the old byte signature" case
+    // can be constructed precisely — a real compiler would never emit that.
+    // -------------------------------------------------------------------------
+
+    struct Fixture {
+        /// `() -> ()`
+        body: Vec<u8>,
+        /// Number of function imports that precede the defined function.
+        import_count: u32,
+        /// `put_contract_data` host import, added to the module.
+        with_host_import: bool,
+        /// Bytes appended as an active data segment at memory offset 0.
+        data: Option<Vec<u8>>,
+        /// Export name for the defined function, or `None` to leave it internal.
+        export: Option<&'static str>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Fixture {
+                body: vec![0x0b], // end
+                import_count: 0,
+                with_host_import: false,
+                data: None,
+                export: Some("run"),
+            }
+        }
+
+        fn body(mut self, ops: &[u8]) -> Self {
+            let mut body = ops.to_vec();
+            body.push(0x0b); // end
+            self.body = body;
+            self
+        }
+
+        fn with_host_import(mut self) -> Self {
+            self.with_host_import = true;
+            self.import_count = 1;
+            self
+        }
+
+        fn with_data(mut self, data: Vec<u8>) -> Self {
+            self.data = Some(data);
+            self
+        }
+
+        fn internal(mut self) -> Self {
+            self.export = None;
+            self
+        }
+
+        fn build(&self) -> Vec<u8> {
+            let mut wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+
+            // Type section (1): one `() -> ()`.
+            wasm.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]);
+
+            // Import section (2), when the fixture calls a host function.
+            if self.with_host_import {
+                let mut import = vec![0x01, 0x03, b'e', b'n', b'v', 0x12];
+                import.extend_from_slice(b"put_contract_data");
+                import.extend_from_slice(&[0x00, 0x00]);
+                wasm.push(0x02);
+                wasm.push(import.len() as u8);
+                wasm.extend_from_slice(&import);
+            }
+
+            // Function section (3): one defined function of type 0.
+            wasm.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]);
+
+            // Export section (7).
+            if let Some(name) = self.export {
+                let mut section = vec![0x01, name.len() as u8];
+                section.extend_from_slice(name.as_bytes());
+                section.push(0x00);
+                section.push((self.import_count).to_le_bytes()[0]);
+                wasm.push(0x07);
+                wasm.push(section.len() as u8);
+                wasm.extend_from_slice(&section);
+            }
+
+            // Code section (10): one body, no locals.
+            let mut body = vec![0x00]; // zero local declarations
+            body.extend_from_slice(&self.body);
+            let mut section = vec![0x01, body.len() as u8];
+            section.extend_from_slice(&body);
+            wasm.push(0x0a);
+            wasm.push(section.len() as u8);
+            wasm.extend_from_slice(&section);
+
+            // Data section (11): one active segment at offset i32.const 0.
+            if let Some(data) = &self.data {
+                let mut payload = vec![0x00, 0x41, 0x00, 0x0b, data.len() as u8];
+                payload.extend_from_slice(data);
+                wasm.push(0x0b);
+                wasm.push(payload.len() as u8);
+                wasm.extend_from_slice(&payload);
+            }
+
+            wasm
+        }
+    }
+
+    // opcodes used by the fixtures
+    const NOP: u8 = 0x01;
+    const LOOP: u8 = 0x03; // followed by 0x40 (empty block type)
+    const BLOCK: u8 = 0x02; // followed by 0x40
+    const END: u8 = 0x0b;
+    const LOCAL_GET: u8 = 0x20;
+    const LOCAL_SET: u8 = 0x21;
+    const I32_ADD: u8 = 0x6a;
+    const I32_CONST: u8 = 0x41;
+    const I32_MUL: u8 = 0x6c;
+    const I32_DIV_S: u8 = 0x6d;
+    const MEMORY_GROW: u8 = 0x40; // followed by 0x00 memory index
+    const CALL: u8 = 0x10;
+
+    /// A data segment holding the old `block`+`loop` byte signature. This is
+    /// the false positive the issue names: a byte scanner cannot tell these
+    /// bytes from a real loop header, a parser can.
+    #[test]
+    fn a_data_segment_containing_the_old_byte_pattern_is_not_a_loop() {
+        let wasm = Fixture::new()
+            .with_data(vec![0x02, 0x40, 0x03, 0x40, 0x10, 0x10, 0x10, 0x10])
+            .build();
+
+        let module = parse_module(&wasm).expect("fixture parses");
+        assert!(
+            crate::parsed_module::loop_spans(&module.functions[0].operators).is_empty(),
+            "data-segment bytes must not be decoded as a loop"
+        );
+
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "data_segment_fixture");
+        assert_eq!(
+            report.summary.get("loop_optimization").copied().unwrap_or(0),
+            0,
+            "the data segment must produce zero loop suggestions"
+        );
+    }
+
+    /// A real `loop` whose body calls a host import, at nesting depth 1.
+    #[test]
+    fn a_loop_calling_a_host_import_is_flagged_and_located() {
+        let wasm = Fixture::new()
+            .with_host_import()
+            .internal()
+            .body(&[
+                BLOCK, 0x40, // block
+                LOOP, 0x40, // loop
+                CALL, 0x00, // call the host import (index 0)
+                LOCAL_GET, 0x00, // counter
+                I32_CONST, 0x01,
+                I32_ADD,
+                LOCAL_SET, 0x00,
+                END, END,
+            ])
+            .build();
+
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "host_call_loop");
+
+        assert_eq!(report.summary.get("loop_optimization").copied().unwrap_or(0), 1);
+
+        let suggestion = report
+            .suggestions
+            .iter()
+            .find(|s| s.pattern_type == "loop_optimization")
+            .expect("a loop suggestion");
+        // The function is internal, so the location names the function index.
+        let location = suggestion.location.as_deref().expect("a location is set");
+        assert!(
+            location.starts_with("func#"),
+            "expected a function-indexed location, got {location}"
+        );
+        assert!(suggestion.description.contains("1 host call(s)"), "got {}", suggestion.description);
+    }
+
+    /// An exported loop that calls a host import: the location names the export.
+    #[test]
+    fn an_exported_loop_location_names_the_function() {
+        let wasm = Fixture::new()
+            .with_host_import()
+            .body(&[LOOP, 0x40, CALL, 0x00, END])
+            .build();
+
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "exported_loop");
+        let suggestion = report
+            .suggestions
+            .iter()
+            .find(|s| s.pattern_type == "loop_optimization")
+            .expect("a loop suggestion");
+        let location = suggestion.location.as_deref().expect("a location is set");
+        assert!(location.starts_with("run#+"), "expected an export-named location, got {location}");
+    }
+
+    /// A counter loop does no per-iteration host work and must not be flagged.
+    #[test]
+    fn a_counter_loop_is_not_flagged() {
+        let wasm = Fixture::new()
+            .body(&[
+                LOOP, 0x40,
+                LOCAL_GET, 0x00,
+                I32_CONST, 0x01,
+                I32_ADD,
+                LOCAL_SET, 0x00,
+                END,
+            ])
+            .build();
+
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "counter_loop");
+
+        assert_eq!(
+            report.summary.get("loop_optimization").copied().unwrap_or(0),
+            0,
+            "a counter loop has nothing to hoist"
+        );
+    }
+
+    /// A call inside a nested loop is reported once, by the innermost loop.
+    ///
+    /// Both spans contain the call, so counting each span's body attributes one
+    /// host call to two loops and reports one piece of code twice.
+    #[test]
+    fn a_call_in_a_nested_loop_is_reported_once_by_the_innermost_loop() {
+        let wasm = Fixture::new()
+            .with_host_import()
+            .internal()
+            .body(&[
+                LOOP, 0x40, // outer loop
+                LOOP, 0x40, // inner loop
+                CALL, 0x00, // the one host call
+                END, // inner
+                END, // outer
+            ])
+            .build();
+
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "nested_loops");
+
+        assert_eq!(
+            report.summary.get("loop_optimization").copied().unwrap_or(0),
+            1,
+            "one call in a nested loop must produce one suggestion, not one per enclosing loop"
+        );
+        let suggestion = report
+            .suggestions
+            .iter()
+            .find(|s| s.pattern_type == "loop_optimization")
+            .expect("a loop suggestion");
+        assert!(suggestion.description.contains("1 host call(s)"), "got {}", suggestion.description);
+    }
+
+    /// Two sibling loops each with their own call are both reported: the
+    /// de-duplication must not swallow genuinely separate loops.
+    #[test]
+    fn sibling_loops_are_each_reported() {
+        let wasm = Fixture::new()
+            .with_host_import()
+            .internal()
+            .body(&[
+                LOOP, 0x40, CALL, 0x00, END,
+                LOOP, 0x40, CALL, 0x00, END,
+            ])
+            .build();
+
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "sibling_loops");
+        assert_eq!(report.summary.get("loop_optimization").copied().unwrap_or(0), 2);
+    }
+
+    /// A call in a block *after* a loop is not part of that loop's body.
+    #[test]
+    fn a_call_in_a_sibling_block_is_not_attributed_to_the_loop() {
+        let wasm = Fixture::new()
+            .with_host_import()
+            .internal()
+            .body(&[
+                LOOP, 0x40, LOCAL_GET, 0x00, I32_CONST, 0x01, I32_ADD, LOCAL_SET, 0x00, END,
+                BLOCK, 0x40, CALL, 0x00, END,
+            ])
+            .build();
+
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "loop_then_block");
+        assert_eq!(
+            report.summary.get("loop_optimization").copied().unwrap_or(0),
+            0,
+            "the call is in a sibling block, not in the loop body"
+        );
+    }
+
+    /// A loop whose only cost is `memory.grow` is still hoistable work.
+    #[test]
+    fn a_loop_that_grows_memory_is_flagged() {
+        let wasm = Fixture::new().body(&[LOOP, 0x40, MEMORY_GROW, 0x00, END]).build();
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "grow_loop");
+        assert_eq!(report.summary.get("loop_optimization").copied().unwrap_or(0), 1);
+    }
+
+    /// The old byte scanner reported suggestions for arbitrary input. A parser
+    /// must report the input as unparseable instead.
+    #[test]
+    fn non_wasm_input_reports_a_parse_error_instead_of_suggestions() {
+        let report = GasGolfingAnalyzer::new().analyze_wasm(b"definitely not wasm", "garbage");
+
+        assert_eq!(report.total_suggestions, 1);
+        assert_eq!(report.suggestions[0].pattern_type, "parse_error");
+        assert!(report.suggestions[0].description.contains("not a valid WASM module"));
+    }
+
+    /// A valid module with nothing notable produces no suggestions.
+    #[test]
+    fn a_clean_module_produces_no_suggestions() {
+        let wasm = Fixture::new().body(&[NOP, NOP, NOP]).build();
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "clean");
+
+        assert_eq!(report.contract_name, "clean");
+        assert_eq!(report.total_suggestions, 0);
+    }
+
+    /// Storage detection must key on the import's host name, not on a guessed
+    /// low call index.
+    #[test]
+    fn storage_detection_keys_on_the_import_name() {
+        // A loop calling a host import named put_contract_data.
+        let wasm = Fixture::new()
+            .with_host_import()
+            .body(&[LOOP, 0x40, CALL, 0x00, END])
+            .build();
+
+        let module = parse_module(&wasm).expect("fixture parses");
+        assert_eq!(module.host_imports[0].qualified(), "env.put_contract_data");
+
+        // One call is far below the batching threshold, so no suggestion — but
+        // the import is recognised, which is what the old index heuristic could
+        // not guarantee.
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "one_storage_call");
+        assert_eq!(report.summary.get("storage_batching").copied().unwrap_or(0), 0);
+    }
 
     #[test]
-    fn test_gas_golfing_analyzer() {
-        let analyzer = GasGolfingAnalyzer::new();
+    fn a_single_division_below_threshold_produces_no_suggestion() {
+        let wasm = Fixture::new().body(&[LOCAL_GET, 0x00, I32_CONST, 0x02, I32_DIV_S]).build();
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "one_division");
+        assert_eq!(report.summary.get("arithmetic_optimization").copied().unwrap_or(0), 0);
+    }
 
-        // Simple WASM-like bytecode for testing
-        let wasm_bytes = vec![
-            0x02, 0x40, 0x03, 0x40, // block/loop pattern
-            0x20, 0x00, 0x20, 0x00, // memory ops
-            0x6D, 0x6E, 0x6D, // divisions
-            0x41, 0x02, 0x6C, // multiply by 2
+    #[test]
+    fn multiplication_by_a_power_of_two_constant_is_flagged_with_a_location() {
+        let wasm = Fixture::new().body(&[LOCAL_GET, 0x00, I32_CONST, 0x08, I32_MUL]).build();
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "mul_by_eight");
+
+        assert_eq!(report.summary.get("multiplication_optimization").copied().unwrap_or(0), 1);
+        let suggestion = report
+            .suggestions
+            .iter()
+            .find(|s| s.pattern_type == "multiplication_optimization")
+            .expect("a multiplication suggestion");
+        assert!(suggestion.location.as_deref().unwrap_or_default().starts_with("run#+"));
+    }
+
+    /// Multiplication by 2 is not worth a shift, and 0/1 are not multipliers.
+    #[test]
+    fn multiplication_by_one_is_not_flagged() {
+        let wasm = Fixture::new().body(&[LOCAL_GET, 0x00, I32_CONST, 0x01, I32_MUL]).build();
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "mul_by_one");
+        assert_eq!(report.summary.get("multiplication_optimization").copied().unwrap_or(0), 0);
+    }
+
+    /// `gas_saved_estimate` is not emitted until it can be priced from a cost
+    /// table; an unpriced guess is worse than an absent number.
+    #[test]
+    fn no_suggestion_carries_an_unpriced_estimate() {
+        let wasm = Fixture::new()
+            .with_host_import()
+            .body(&[LOOP, 0x40, CALL, 0x00, END])
+            .build();
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "unpriced");
+
+        for suggestion in &report.suggestions {
+            assert_eq!(
+                suggestion.gas_saved_estimate, None,
+                "{} still carries an unpriced estimate",
+                suggestion.pattern_type
+            );
+        }
+    }
+
+    /// The report's JSON shape is part of the API contract.
+    #[test]
+    fn report_field_names_are_unchanged() {
+        let wasm = Fixture::new().body(&[NOP]).build();
+        let report = GasGolfingAnalyzer::new().analyze_wasm(&wasm, "shape");
+        let json = serde_json::to_string(&report).expect("report serialises");
+
+        for field in [
+            "contract_name",
+            "analysis_timestamp",
+            "total_suggestions",
+            "suggestions",
+            "summary",
+        ] {
+            assert!(json.contains(field), "missing {field} in {json}");
+        }
+    }
+
+    fn suggestion(pattern_type: &str, location: Option<&str>) -> GasGolfingSuggestion {
+        GasGolfingSuggestion {
+            id: String::new(),
+            pattern_type: pattern_type.to_string(),
+            description: String::new(),
+            location: location.map(str::to_string),
+            severity: "low".to_string(),
+            gas_saved_estimate: None,
+            suggested_fix: String::new(),
+            code_example: None,
+        }
+    }
+
+    /// #1285: clients key table rows on `id`, so it must be unique per report.
+    #[test]
+    fn suggestion_ids_are_unique_within_a_report() {
+        let mut suggestions = vec![
+            suggestion("loop_optimization", Some("run#+3")),
+            suggestion("loop_optimization", Some("run#+3")),
+            suggestion("loop_optimization", Some("run#+9")),
+            suggestion("parse_error", None),
         ];
+        assign_suggestion_ids(&mut suggestions);
 
-        let report = analyzer.analyze_wasm(&wasm_bytes, "test_contract");
+        let ids: Vec<&str> = suggestions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "loop_optimization@run#+3",
+                "loop_optimization@run#+3#2",
+                "loop_optimization@run#+9",
+                "parse_error@module",
+            ]
+        );
+    }
 
-        assert!(!report.suggestions.is_empty());
-        assert_eq!(report.contract_name, "test_contract");
-        assert!(report.total_suggestions > 0);
+    #[test]
+    fn analyzer_assigns_stable_ids_to_every_suggestion() {
+        let wasm = b"not wasm";
+        let first = GasGolfingAnalyzer::new().analyze_wasm(wasm, "ids");
+        let second = GasGolfingAnalyzer::new().analyze_wasm(wasm, "ids");
+
+        assert!(!first.suggestions.is_empty());
+        for (a, b) in first.suggestions.iter().zip(&second.suggestions) {
+            assert!(!a.id.is_empty(), "suggestion {} has no id", a.pattern_type);
+            assert_eq!(a.id, b.id, "ids must be stable across runs");
+        }
+        let json = serde_json::to_string(&first).expect("report serialises");
+        assert!(json.contains("\"id\""), "id missing from {json}");
+    }
+
+    #[test]
+    fn suggestion_without_id_still_deserialises() {
+        let json = r#"{"pattern_type":"x","description":"d","location":null,"severity":"low","gas_saved_estimate":null,"suggested_fix":"f","code_example":null}"#;
+        let parsed: GasGolfingSuggestion = serde_json::from_str(json).expect("legacy payload");
+        assert_eq!(parsed.id, "");
     }
 }

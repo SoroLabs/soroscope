@@ -78,8 +78,10 @@ mod tests {
             .prop_map(
                 |(key, live_until_ledger, remaining_ledgers)| TtlEntryReport {
                     key,
+                    key_kind: LedgerKeyKind::Other,
                     live_until_ledger,
                     remaining_ledgers,
+                    entry_xdr_size_bytes: None,
                 },
             )
     }

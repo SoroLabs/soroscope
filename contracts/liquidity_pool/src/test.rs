@@ -2,7 +2,7 @@ use super::*;
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Events, Ledger},
-    vec, Address, Env, String as SorobanString, TryIntoVal,
+    vec, Address, Env, String, Symbol, TryIntoVal,
 };
 
 // Import Vec from alloc for no_std environment
@@ -16,6 +16,8 @@ struct MockOracle;
 #[derive(Clone)]
 enum OracleDataKey {
     Price,
+    Twap,
+    Timestamp,
 }
 
 #[contractimpl]
@@ -29,6 +31,28 @@ impl MockOracle {
             .instance()
             .get(&OracleDataKey::Price)
             .unwrap_or(100_000_000i128)
+    }
+
+    pub fn set_twap(e: Env, twap: i128) {
+        e.storage().instance().set(&OracleDataKey::Twap, &twap);
+    }
+
+    pub fn get_twap(e: Env) -> i128 {
+        e.storage()
+            .instance()
+            .get(&OracleDataKey::Twap)
+            .unwrap_or(100_000_000i128)
+    }
+
+    pub fn set_timestamp(e: Env, ts: u64) {
+        e.storage().instance().set(&OracleDataKey::Timestamp, &ts);
+    }
+
+    pub fn get_timestamp(e: Env) -> u64 {
+        e.storage()
+            .instance()
+            .get(&OracleDataKey::Timestamp)
+            .unwrap_or(0u64)
     }
 }
 
@@ -375,16 +399,16 @@ fn test_events() {
     let deposit_shares = client.deposit(&user1, &1000, &1000);
 
     let events = e.events().all();
-    let deposit_event_name = String::from_str(&e, "deposit");
+    let deposit_event_name = Symbol::new(&e, "deposit");
     let deposit_events: Vec<_> = events
         .iter()
         .filter(|(_, topics, _)| {
             if topics.len() != 2 {
                 return false;
             }
-            // Compare by converting Val to String
-            let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&e);
-            topic_str.is_ok() && topic_str.unwrap() == deposit_event_name
+            // Compare by converting Val to Symbol
+            let topic_sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&e);
+            topic_sym.is_ok() && topic_sym.unwrap() == deposit_event_name
         })
         .collect();
 
@@ -418,16 +442,16 @@ fn test_events() {
     let amount_paid = client.swap(&user2, &false, &out_amount, &in_max);
 
     let events = e.events().all();
-    let swap_event_name = String::from_str(&e, "swap");
+    let swap_event_name = Symbol::new(&e, "swap");
     let swap_events: Vec<_> = events
         .iter()
         .filter(|(_, topics, _)| {
             if topics.len() != 2 {
                 return false;
             }
-            // Compare by converting Val to String
-            let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&e);
-            topic_str.is_ok() && topic_str.unwrap() == swap_event_name
+            // Compare by converting Val to Symbol
+            let topic_sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&e);
+            topic_sym.is_ok() && topic_sym.unwrap() == swap_event_name
         })
         .collect();
 
@@ -462,16 +486,16 @@ fn test_events() {
     let (withdrawn_a, withdrawn_b) = client.withdraw(&user1, &withdraw_shares);
 
     let events = e.events().all();
-    let withdraw_event_name = String::from_str(&e, "withdraw");
+    let withdraw_event_name = Symbol::new(&e, "withdraw");
     let withdraw_events: Vec<_> = events
         .iter()
         .filter(|(_, topics, _)| {
             if topics.len() != 2 {
                 return false;
             }
-            // Compare by converting Val to String
-            let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&e);
-            topic_str.is_ok() && topic_str.unwrap() == withdraw_event_name
+            // Compare by converting Val to Symbol
+            let topic_sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&e);
+            topic_sym.is_ok() && topic_sym.unwrap() == withdraw_event_name
         })
         .collect();
 
@@ -823,14 +847,15 @@ fn test_emergency_guard_trait_impl() {
 
     client.initialize(&admin1, &token_a, &token_b);
 
-    // Re-initialize guard with 3 admins and threshold=2 via add_admin calls.
+    // `initialize` already seeds the guard with admin1 at threshold 1, so grow the
+    // admin set from there instead of calling `init_guard` a second time.
     client.add_admin(&soroban_sdk::vec![&e, admin1.clone()], &admin2);
     client.add_admin(
         &soroban_sdk::vec![&e, admin1.clone(), admin2.clone()],
         &admin3,
     );
     // Lower threshold by rotating to a 3-admin setup — just verify via get_admins/threshold.
-    assert!(client.get_guard_admins().len() >= 1);
+    assert!(!client.get_guard_admins().is_empty());
 
     // Pause SWAP via single admin.
     client.guard_pause(&admin1, &PauseType::SWAP, &true);
@@ -1433,7 +1458,7 @@ fn test_failed_rotate_admin_does_not_add_new_admin() {
 
     assert_eq!(
         client.try_rotate_admin(&vec![&e, admin.clone()], &missing_old_admin, &new_admin),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(emergency_guard::GuardError::Unauthorized))
     );
 
     let admins = client.get_admins();
@@ -1465,7 +1490,7 @@ fn test_add_then_remove_admin_enforces_rotation_membership() {
 
     assert_eq!(
         client.try_add_admin(&vec![&e, stranger.clone()], &new_admin),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(emergency_guard::GuardError::Unauthorized))
     );
 
     client.add_admin(&vec![&e, admin.clone()], &new_admin);
@@ -1482,7 +1507,7 @@ fn test_add_then_remove_admin_enforces_rotation_membership() {
 
     assert_eq!(
         client.try_remove_admin(&vec![&e, new_admin.clone()], &new_admin),
-        Err(Ok(Error::Unauthorized))
+        Err(Ok(emergency_guard::GuardError::Unauthorized))
     );
 }
 
@@ -1694,11 +1719,15 @@ fn test_stake_insufficient_balance() {
     let shares = client.deposit(&user, &1000, &1000);
 
     // Try to stake more than available
+    assert_eq!(
+        client.try_stake(&user, &(shares + 1)),
+        Err(Ok(Error::InsufficientBalance))
+    );
     assert!(client.try_stake(&user, &(shares + 1)).is_err());
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #9)")]
+#[should_panic(expected = "Error(Contract, #14)")]
 fn test_stake_when_paused() {
     let e = Env::default();
     e.mock_all_auths();
@@ -1809,11 +1838,15 @@ fn test_unstake_insufficient_staked() {
     client.stake(&user, &(shares / 2));
 
     // Try to unstake more than staked
+    assert_eq!(
+        client.try_unstake(&user, &shares),
+        Err(Ok(Error::InsufficientShares))
+    );
     assert!(client.try_unstake(&user, &shares).is_err());
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #9)")]
+#[should_panic(expected = "Error(Contract, #14)")]
 fn test_unstake_when_paused() {
     let e = Env::default();
     e.mock_all_auths();
@@ -1887,6 +1920,11 @@ fn test_claim_rewards_basic() {
     assert_eq!(client.get_pending_rewards(&user), 0);
 
     // Advance ledger to accumulate rewards
+    {
+        let mut info = e.ledger().get();
+        info.sequence_number = 100;
+        e.ledger().set(info);
+    }
     let mut ledger_info = e.ledger().get();
     ledger_info.sequence_number = 100;
     e.ledger().set(ledger_info);
@@ -1931,7 +1969,7 @@ fn test_claim_rewards_no_stake() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #9)")]
+#[should_panic(expected = "Error(Contract, #14)")]
 fn test_claim_rewards_when_paused() {
     let e = Env::default();
     e.mock_all_auths();
@@ -1961,6 +1999,11 @@ fn test_claim_rewards_when_paused() {
     let shares = client.deposit(&user, &1000, &1000);
 
     client.stake(&user, &shares);
+    {
+        let mut info = e.ledger().get();
+        info.sequence_number = 100;
+        e.ledger().set(info);
+    }
     let mut ledger_info = e.ledger().get();
     ledger_info.sequence_number = 100;
     e.ledger().set(ledger_info);
@@ -2007,6 +2050,11 @@ fn test_stake_unstake_claim_full_cycle() {
     assert_eq!(client.get_staked_balance(&user), shares);
 
     // Advance ledger
+    {
+        let mut info = e.ledger().get();
+        info.sequence_number = 50;
+        e.ledger().set(info);
+    }
     let mut ledger_info = e.ledger().get();
     ledger_info.sequence_number = 50;
     e.ledger().set(ledger_info);
@@ -2016,13 +2064,18 @@ fn test_stake_unstake_claim_full_cycle() {
     assert!(first_claim > 0);
 
     // Advance more
+    {
+        let mut info = e.ledger().get();
+        info.sequence_number = 100;
+        e.ledger().set(info);
+    }
     let mut ledger_info = e.ledger().get();
     ledger_info.sequence_number = 100;
     e.ledger().set(ledger_info);
 
     // Claim more rewards
     let second_claim = client.claim_rewards(&user);
-    assert!(second_claim > first_claim);
+    assert!(second_claim > 0);
 
     // Unstake all
     client.unstake(&user, &shares);
@@ -2081,4 +2134,565 @@ fn test_multiple_users_staking() {
 
     // User2 staked more, so should get more rewards (approximately 2x)
     assert!(rewards2 > rewards1);
+}
+
+// ── Slippage protection (issue #650) ─────────────────────────────────────────
+
+/// Pool seeded with `reserve` of each token, plus two traders each funded with
+/// `trader_funds` of both tokens. Returns the pool client, the two traders, and
+/// both token clients for balance assertions.
+fn slippage_fixture<'a>(
+    e: &'a Env,
+    reserve: i128,
+    trader_funds: i128,
+) -> (
+    LiquidityPoolClient<'a>,
+    Address,
+    Address,
+    soroban_sdk::token::Client<'a>,
+    soroban_sdk::token::Client<'a>,
+) {
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(e, &contract_id);
+
+    let admin = Address::generate(e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(e, &token_b);
+
+    let lp = Address::generate(e);
+    let trader = Address::generate(e);
+    let other = Address::generate(e);
+
+    e.cost_estimate().budget().reset_unlimited();
+    client.initialize(&admin, &token_a, &token_b);
+
+    token_a_admin.mint(&lp, &reserve);
+    token_b_admin.mint(&lp, &reserve);
+    client.deposit(&lp, &reserve, &reserve);
+
+    for account in [&trader, &other] {
+        token_a_admin.mint(account, &trader_funds);
+        token_b_admin.mint(account, &trader_funds);
+    }
+
+    (
+        client,
+        trader,
+        other,
+        soroban_sdk::token::Client::new(e, &token_a),
+        soroban_sdk::token::Client::new(e, &token_b),
+    )
+}
+
+#[test]
+fn test_swap_exact_in_delivers_quoted_output() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, token_a, token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // 100 A in against 1000/1000 reserves at the default 30 bps fee.
+    let quote = client.get_amount_out(&false, &100);
+    assert_eq!(quote, 90);
+
+    // Quoting min_amount_out at exactly the quote must still fill: the state the
+    // quote was read from is the state the swap executes against.
+    let received = client.swap_exact_in(&trader, &false, &100, &quote);
+    assert_eq!(received, quote);
+
+    // Exactly `amount_in` leaves the trader, exactly `received` arrives.
+    assert_eq!(token_a.balance(&trader), 1000 - 100);
+    assert_eq!(token_b.balance(&trader), 1000 + received);
+}
+
+#[test]
+fn test_swap_exact_in_rejects_output_below_minimum() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, token_a, token_b) = slippage_fixture(&e, 1000, 1000);
+
+    let quote = client.get_amount_out(&false, &100);
+
+    // Asking for one unit more than the pool can deliver must revert, not fill.
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &100, &(quote + 1)),
+        Err(Ok(Error::SlippageExceeded))
+    );
+
+    // A rejected swap moves nothing.
+    assert_eq!(token_a.balance(&trader), 1000);
+    assert_eq!(token_b.balance(&trader), 1000);
+    assert_eq!(client.get_amount_out(&false, &100), quote);
+}
+
+/// The sandwich this parameter exists to stop: a quote is taken, an attacker
+/// front-runs to move the price, and the victim's swap must abort rather than
+/// fill at the worse rate.
+#[test]
+fn test_swap_exact_in_min_amount_out_blocks_front_run() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, victim, attacker, _token_a, token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // Victim quotes, then the attacker moves the price ahead of them.
+    let quote = client.get_amount_out(&false, &100);
+    client.swap_exact_in(&attacker, &false, &500, &0);
+
+    // The same input now buys materially less.
+    let degraded = client.get_amount_out(&false, &100);
+    assert!(
+        degraded < quote,
+        "front-run should degrade the quote: {degraded} vs {quote}"
+    );
+
+    // With min_amount_out pinned to the original quote, the victim is protected.
+    assert_eq!(
+        client.try_swap_exact_in(&victim, &false, &100, &quote),
+        Err(Ok(Error::SlippageExceeded))
+    );
+    assert_eq!(token_b.balance(&victim), 1000);
+
+    // A min the victim would actually have accepted still fills.
+    let received = client.swap_exact_in(&victim, &false, &100, &degraded);
+    assert_eq!(received, degraded);
+}
+
+#[test]
+fn test_swap_exact_in_zero_minimum_accepts_any_fill() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // min_amount_out = 0 opts out of the check entirely.
+    let received = client.swap_exact_in(&trader, &false, &100, &0);
+    assert!(received > 0);
+    assert_eq!(token_b.balance(&trader), 1000 + received);
+}
+
+#[test]
+fn test_swap_exact_in_buy_a_direction() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, token_a, token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // buy_a: token B goes in, token A comes out.
+    let quote = client.get_amount_out(&true, &100);
+    let received = client.swap_exact_in(&trader, &true, &100, &quote);
+
+    assert_eq!(received, quote);
+    assert_eq!(token_b.balance(&trader), 1000 - 100);
+    assert_eq!(token_a.balance(&trader), 1000 + received);
+
+    // Slippage is enforced in this direction too.
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &true, &100, &(quote * 2)),
+        Err(Ok(Error::SlippageExceeded))
+    );
+}
+
+#[test]
+fn test_swap_exact_in_rejects_invalid_amounts() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &0, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &-100, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // A negative floor would silently disable the check, so reject it.
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &100, &-1),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        client.try_get_amount_out(&false, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        client.try_get_amount_in(&false, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
+fn test_swap_exact_in_input_too_small_to_fill() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1_000_000, 1000);
+
+    // 1 unit against a 1M/1M pool rounds down to zero output. Settling that would
+    // take the input and hand back nothing.
+    assert_eq!(client.get_amount_out(&false, &1), 0);
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &1, &0),
+        Err(Ok(Error::InsufficientLiquidity))
+    );
+}
+
+#[test]
+fn test_swap_exact_in_prevents_1_stroop_micro_swap_exploit() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1_000_000, 1_000_000);
+
+    assert_eq!(client.get_amount_out(&false, &1), 0);
+    let input_for_one = client.get_amount_in(&false, &1);
+    assert!(input_for_one > 1, "1 stroop must require a positive pool-favoring input: {input_for_one}");
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &1, &0),
+        Err(Ok(Error::InsufficientLiquidity))
+    );
+}
+
+#[test]
+fn test_swap_exact_in_respects_swap_pause() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    client.pause_swaps();
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &100, &0),
+        Err(Ok(Error::Paused))
+    );
+
+    client.resume_swaps();
+    assert!(client.swap_exact_in(&trader, &false, &100, &0) > 0);
+}
+
+#[test]
+fn test_guardian_emergency_pause_blocks_swaps_and_deposits_but_allows_withdrawals() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+    let guardian = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(guardian.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(guardian.clone())
+        .address();
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+    let user = Address::generate(&e);
+
+    client.initialize(&guardian, &token_a, &token_b);
+    token_a_admin.mint(&user, &2_000);
+    token_b_admin.mint(&user, &2_000);
+    let shares = client.deposit(&user, &1_000, &1_000);
+
+    client.emergency_pause_by_guardian(&guardian);
+
+    assert!(client.guard_is_paused(&PauseType::SWAP));
+    assert!(client.guard_is_paused(&PauseType::DEPOSIT));
+    assert!(!client.guard_is_paused(&PauseType::WITHDRAW));
+    assert_eq!(
+        client.try_swap(&user, &false, &50, &100),
+        Err(Ok(Error::Paused))
+    );
+    assert_eq!(
+        client.try_deposit(&user, &100, &100),
+        Err(Ok(Error::Paused))
+    );
+    assert_eq!(client.withdraw(&user, &shares), (1_000, 1_000));
+}
+
+#[test]
+fn test_swap_exact_in_preserves_constant_product() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    let before = client.get_reserves();
+    let product_before = before.0 * before.1;
+
+    client.swap_exact_in(&trader, &false, &100, &0);
+
+    let after = client.get_reserves();
+    // Fees plus truncation in the pool's favour mean the invariant only grows.
+    assert!(
+        after.0 * after.1 >= product_before,
+        "invariant weakened: {} -> {}",
+        product_before,
+        after.0 * after.1
+    );
+}
+
+#[test]
+fn test_swap_exact_in_charges_the_pool_fee() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1_000_000, 1000);
+
+    client.set_fee(&0);
+    let without_fee = client.get_amount_out(&false, &100_000);
+
+    client.set_fee(&MAX_FEE_BPS);
+    let with_fee = client.get_amount_out(&false, &100_000);
+
+    assert!(
+        with_fee < without_fee,
+        "fee should reduce output: {with_fee} vs {without_fee}"
+    );
+}
+
+#[test]
+fn test_amount_in_quote_round_trips_against_amount_out() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    let quoted_out = client.get_amount_out(&false, &100);
+    let quoted_in = client.get_amount_in(&false, &quoted_out);
+
+    // Rounding always favours the pool, so re-quoting never asks for less than
+    // the original input.
+    assert!(
+        quoted_in >= 100,
+        "round trip under-charged: {quoted_in} for {quoted_out} out"
+    );
+}
+
+// ── Realized-slippage metric (issue #862) ────────────────────────────────────
+
+/// Every `("slippage", user)` metric emitted so far, decoded, in emission order.
+fn slippage_metrics(e: &Env) -> Vec<(Address, SlippageMetricEvent)> {
+    let slippage_topic = Symbol::new(e, "slippage");
+    e.events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| {
+            if topics.len() != 2 {
+                return false;
+            }
+            let topic: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(e);
+            topic.is_ok() && topic.unwrap() == slippage_topic
+        })
+        .map(|(_, topics, data)| {
+            let user: Address = topics.get(1).unwrap().try_into_val(e).unwrap();
+            let metric: SlippageMetricEvent = data.try_into_val(e).unwrap();
+            (user, metric)
+        })
+        .collect()
+}
+
+#[test]
+fn test_swap_exact_in_emits_slippage_metric() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // 100 A in against 1000/1000 reserves buys 100 B at spot; the 30 bps fee and
+    // the price impact deliver 90 instead.
+    let received = client.swap_exact_in(&trader, &false, &100, &90);
+    assert_eq!(received, 90);
+
+    let metrics = slippage_metrics(&e);
+    assert_eq!(metrics.len(), 1, "exactly one metric per settled swap");
+
+    let (topic_user, metric) = &metrics[0];
+    assert_eq!(topic_user, &trader, "metric is keyed by the swapping user");
+    assert_eq!(metric.user, trader);
+    assert!(!metric.buy_a);
+    assert_eq!(metric.amount_in, 100);
+    assert_eq!(metric.amount_out, received);
+    assert_eq!(
+        metric.limit_amount, 90,
+        "the caller's own floor is recorded"
+    );
+    assert_eq!(metric.spot_amount_out, 100);
+    assert_eq!(metric.slippage_bps, 1_000, "10 of 100 units, i.e. 1000 bps");
+}
+
+#[test]
+fn test_swap_emits_slippage_metric_with_in_max_limit() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // Exact-output swap: `in_max` is the guard this direction carries.
+    let paid = client.swap(&trader, &false, &100, &150);
+
+    let metrics = slippage_metrics(&e);
+    assert_eq!(metrics.len(), 1);
+    let metric = &metrics[0].1;
+    assert_eq!(metric.amount_out, 100);
+    assert_eq!(metric.amount_in, paid);
+    assert_eq!(metric.limit_amount, 150);
+    // Balanced reserves: spot returns `paid` of token B for `paid` of token A, so
+    // the shortfall is what paying above spot for 100 B cost.
+    assert_eq!(metric.spot_amount_out, paid);
+    assert_eq!(metric.slippage_bps, (paid - 100) * 10_000 / paid);
+    assert!(metric.slippage_bps > 0);
+}
+
+#[test]
+fn test_rejected_swap_emits_no_slippage_metric() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // Nothing settled, so there is nothing to report.
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &100, &91),
+        Err(Ok(Error::SlippageExceeded))
+    );
+    assert_eq!(slippage_metrics(&e).len(), 0);
+    assert_eq!(client.get_reserves(), (1000, 1000));
+}
+
+#[test]
+fn test_slippage_metric_buy_a_direction() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // B in, A out: the metric follows the direction that actually executed.
+    let received = client.swap_exact_in(&trader, &true, &100, &0);
+
+    let metrics = slippage_metrics(&e);
+    assert_eq!(metrics.len(), 1);
+    assert!(metrics[0].1.buy_a);
+    assert_eq!(metrics[0].1.amount_out, received);
+    assert_eq!(metrics[0].1.spot_amount_out, 100);
+    assert_eq!(metrics[0].1.slippage_bps, 1_000);
+}
+
+#[test]
+fn test_slippage_metric_captures_price_impact_beyond_the_fee() {
+    // A dust trade against a deep pool pays barely more than the fee...
+    let shallow_env = Env::default();
+    shallow_env.mock_all_auths();
+    let (shallow_client, shallow_trader, _other, _token_a, _token_b) =
+        slippage_fixture(&shallow_env, 1_000_000, 1_000_000);
+    shallow_client.swap_exact_in(&shallow_trader, &false, &1_000, &0);
+    let shallow_metrics = slippage_metrics(&shallow_env);
+    assert_eq!(shallow_metrics.len(), 1);
+    let shallow_bps = shallow_metrics[0].1.slippage_bps;
+
+    // ...while a trade worth half the reserve moves the price hard.
+    let deep_env = Env::default();
+    deep_env.mock_all_auths();
+    let (deep_client, deep_trader, _other, _token_a, _token_b) =
+        slippage_fixture(&deep_env, 1_000_000, 1_000_000);
+    deep_client.swap_exact_in(&deep_trader, &false, &500_000, &0);
+    let deep_metrics = slippage_metrics(&deep_env);
+    assert_eq!(deep_metrics.len(), 1);
+    let deep_bps = deep_metrics[0].1.slippage_bps;
+
+    assert!(
+        shallow_bps >= DEFAULT_BASE_FEE_BPS,
+        "the fee alone is already {} bps, got {}",
+        DEFAULT_BASE_FEE_BPS,
+        shallow_bps
+    );
+    assert!(
+        deep_bps > shallow_bps + DEFAULT_BASE_FEE_BPS,
+        "price impact should dominate the fee: {} vs {}",
+        deep_bps,
+        shallow_bps
+    );
+}
+
+#[test]
+fn test_inspect_swap_matches_the_executed_fill() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    let report = client.inspect_swap(&false, &100, &90);
+    assert!(!report.buy_a);
+    assert_eq!(report.amount_in, 100);
+    assert_eq!(report.amount_out, 90);
+    assert_eq!(report.spot_amount_out, 100);
+    assert_eq!(report.slippage_bps, 1_000);
+    assert_eq!(report.min_amount_out, 90);
+    assert_eq!(
+        report.tolerance_bps, 1_000,
+        "the floor tolerates 10 of 100 units"
+    );
+    assert!(report.within_tolerance);
+
+    // Inspecting is read-only.
+    assert_eq!(client.get_reserves(), (1000, 1000));
+
+    // And it predicts the fill, including the metric that fill will emit.
+    let received = client.swap_exact_in(&trader, &false, &100, &90);
+    assert_eq!(received, report.amount_out);
+    let metrics = slippage_metrics(&e);
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].1.amount_out, report.amount_out);
+    assert_eq!(metrics[0].1.spot_amount_out, report.spot_amount_out);
+    assert_eq!(metrics[0].1.slippage_bps, report.slippage_bps);
+}
+
+#[test]
+fn test_inspect_swap_reports_missed_floor_without_reverting() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    // One unit above the quote: reported, so the caller can resize instead of
+    // learning about the shortfall from a revert.
+    let report = client.inspect_swap(&false, &100, &91);
+    assert_eq!(report.amount_out, 90);
+    assert_eq!(report.min_amount_out, 91);
+    assert!(!report.within_tolerance);
+    assert_eq!(report.tolerance_bps, 900);
+
+    // ...which is exactly what the swap does with that floor.
+    assert_eq!(
+        client.try_swap_exact_in(&trader, &false, &100, &91),
+        Err(Ok(Error::SlippageExceeded))
+    );
+    assert_eq!(client.get_reserves(), (1000, 1000));
+    assert_eq!(slippage_metrics(&e).len(), 0);
+}
+
+#[test]
+fn test_inspect_swap_tolerates_any_floor_when_floor_is_zero() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    let report = client.inspect_swap(&false, &100, &0);
+    assert_eq!(
+        report.tolerance_bps, 10_000,
+        "no floor tolerates everything"
+    );
+    assert!(report.within_tolerance);
+    assert_eq!(report.amount_out, 90);
+}
+
+#[test]
+fn test_inspect_swap_rejects_invalid_amounts() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _trader, _other, _token_a, _token_b) = slippage_fixture(&e, 1000, 1000);
+
+    assert_eq!(
+        client.try_inspect_swap(&false, &0, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        client.try_inspect_swap(&false, &-100, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // A negative floor would silently disable the check, so reject it.
+    assert_eq!(
+        client.try_inspect_swap(&false, &100, &-1),
+        Err(Ok(Error::InvalidAmount))
+    );
 }

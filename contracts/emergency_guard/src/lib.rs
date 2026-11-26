@@ -2,12 +2,22 @@
 
 #[cfg(feature = "contract")]
 use soroban_sdk::{contract, contractimpl};
-use soroban_sdk::{contracterror, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contracterror, contracttype, log, Address, Env, String, Vec};
 
-/// Granular pause types using bitmask for efficient storage
+/// Overall state of the emergency circuit breaker.
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PauseType(u32);
+pub enum PauseType {
+    Unpaused,
+    PartialPause,
+    FullPause,
+}
+
+/// Bitmask of individually paused operations. Kept separate from `PauseType`
+/// so contracts can keep pausing only the operations they need.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PauseMask(u32);
 
 impl PauseType {
     pub const SWAP: u32 = 1 << 0;
@@ -19,15 +29,31 @@ impl PauseType {
     pub const CREATE_PAIR: u32 = 1 << 6;
     /// Pause staking operations
     pub const STAKE: u32 = 1 << 7;
+    /// Pause borrow / flash loan operations
+    pub const BORROW: u32 = 1 << 8;
+    /// Pause reward claims.
+    ///
+    /// Reward-bearing contracts (`liquidity_pool`, `staking_rewards`) gate
+    /// `claim_rewards` on this bit, so it belongs to the guard's operation set
+    /// instead of being re-invented per contract. The next free bit after
+    /// `BORROW`, so adding it leaves every existing bucket untouched.
+    pub const CLAIM_REWARDS: u32 = 1 << 9;
 
-    pub fn new(value: u32) -> Self {
-        PauseType(value)
+    pub fn new(value: u32) -> PauseMask {
+        PauseMask(value)
     }
+}
 
+impl PauseMask {
+    /// Returns true if `operation` bit is set in the pause bitmask.
+    /// `#[inline(always)]` ensures this reduces to a single AND + comparison
+    /// instruction at the call site, minimising gas on every guard check.
+    #[inline(always)]
     pub fn is_paused(&self, operation: u32) -> bool {
         (self.0 & operation) != 0
     }
 
+    #[inline(always)]
     pub fn set_paused(&mut self, operation: u32, paused: bool) {
         if paused {
             self.0 |= operation;
@@ -47,6 +73,16 @@ impl PauseType {
     pub fn as_u32(self) -> u32 {
         self.0
     }
+
+    pub fn pause_type(self) -> PauseType {
+        if self.0 == 0 {
+            PauseType::Unpaused
+        } else if self.0 == u32::MAX {
+            PauseType::FullPause
+        } else {
+            PauseType::PartialPause
+        }
+    }
 }
 
 /// Data keys for emergency guard storage
@@ -54,8 +90,15 @@ impl PauseType {
 pub enum GuardDataKey {
     PauseState,
     Admins,
+    Guardians,
     SignatureThreshold,
+    AutoUnpauseDelay,
+    AutoUnpauseAt,
+    PauseVotes,
+    UnpauseVotes,
 }
+
+const DEFAULT_AUTO_UNPAUSE_DELAY_SECONDS: u64 = 86_400;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -68,6 +111,8 @@ pub enum GuardError {
     InvalidThreshold = 4,
     AdminNotFound = 5,
     AlreadyInitialized = 6,
+    GuardianNotFound = 7,
+    TimelockNotElapsed = 8,
 }
 
 /// Standardized event actions emitted by every successful guard action.
@@ -225,7 +270,6 @@ pub fn emit_admin_removed(e: &Env, approvers: &Vec<Address>, admin: &Address) {
     );
 }
 
-#[contract]
 #[cfg_attr(feature = "contract", contract)]
 pub struct EmergencyGuard;
 
@@ -242,17 +286,280 @@ impl EmergencyGuard {
         env.storage().instance().set(&GuardDataKey::Admins, &admins);
         env.storage()
             .instance()
+            .set(&GuardDataKey::Guardians, &Vec::<Address>::new(&env));
+        env.storage()
+            .instance()
             .set(&GuardDataKey::SignatureThreshold, &threshold);
         env.storage()
             .instance()
             .set(&GuardDataKey::PauseState, &PauseType::new(0));
+        env.storage().instance().set(
+            &GuardDataKey::AutoUnpauseDelay,
+            &DEFAULT_AUTO_UNPAUSE_DELAY_SECONDS,
+        );
         emit_guard_initialized(&env, &admins, threshold);
+        Ok(())
+    }
+
+    /// Initialize the emergency guard with guardians and M-of-N voting threshold.
+    pub fn init(env: Env, guardians: Vec<Address>, threshold: u32) -> Result<(), GuardError> {
+        if threshold == 0 || threshold > guardians.len() {
+            return Err(GuardError::InvalidThreshold);
+        }
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Guardians, &guardians);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Admins, &guardians);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::SignatureThreshold, &threshold);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::PauseState, &PauseType::new(0));
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::PauseVotes, &Vec::<Address>::new(&env));
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::UnpauseVotes, &Vec::<Address>::new(&env));
+        env.storage().instance().set(
+            &GuardDataKey::AutoUnpauseDelay,
+            &DEFAULT_AUTO_UNPAUSE_DELAY_SECONDS,
+        );
+        emit_guard_initialized(&env, &guardians, threshold);
+        Ok(())
+    }
+
+    /// Accumulates guardian votes to pause. Auto-pauses when votes >= threshold.
+    pub fn vote_pause(env: Env, guardian: Address) -> Result<u32, GuardError> {
+        guardian.require_auth();
+        if !Self::is_guardian(env.clone(), guardian.clone()) {
+            return Err(GuardError::Unauthorized);
+        }
+        let threshold = Self::get_threshold(env.clone());
+        if threshold == 0 {
+            return Err(GuardError::NotInitialized);
+        }
+        let mut votes: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::PauseVotes)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !votes.iter().any(|v| v == guardian) {
+            votes.push_back(guardian);
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::PauseVotes, &votes);
+        }
+        let vote_count = votes.len();
+        if vote_count >= threshold {
+            let mut state = PauseType::new(0);
+            state.pause_all();
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::PauseState, &state);
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::UnpauseVotes, &Vec::<Address>::new(&env));
+            emit_emergency_paused_all(&env, &votes);
+        }
+        Ok(vote_count)
+    }
+
+    /// Accumulates guardian votes to unpause. Auto-unpauses when votes >= threshold.
+    pub fn vote_unpause(env: Env, guardian: Address) -> Result<u32, GuardError> {
+        guardian.require_auth();
+        if !Self::is_guardian(env.clone(), guardian.clone()) {
+            return Err(GuardError::Unauthorized);
+        }
+        let threshold = Self::get_threshold(env.clone());
+        if threshold == 0 {
+            return Err(GuardError::NotInitialized);
+        }
+        let mut votes: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::UnpauseVotes)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !votes.iter().any(|v| v == guardian) {
+            votes.push_back(guardian);
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::UnpauseVotes, &votes);
+        }
+        let vote_count = votes.len();
+        if vote_count >= threshold {
+            let state = PauseType::new(0);
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::PauseState, &state);
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::PauseVotes, &Vec::<Address>::new(&env));
+            emit_resumed_all(&env, &votes);
+        }
+        Ok(vote_count)
+    }
+
+    pub fn get_pause_votes(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&GuardDataKey::PauseVotes)
+            .map(|v: Vec<Address>| v.len())
+            .unwrap_or(0)
+    }
+
+    pub fn get_unpause_votes(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&GuardDataKey::UnpauseVotes)
+            .map(|v: Vec<Address>| v.len())
+            .unwrap_or(0)
+    }
+
+    /// Initialize admins and guardians separately. Guardian role changes are
+    /// protected by the admin signature threshold.
+    pub fn initialize_with_roles(
+        env: Env,
+        admins: Vec<Address>,
+        guardians: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), GuardError> {
+        Self::initialize(env.clone(), admins, threshold)?;
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Guardians, &guardians);
+        Ok(())
+    }
+
+    /// Initialize with a single guardian for simple deployments.
+    pub fn initialize_with_guardian(
+        env: Env,
+        admins: Vec<Address>,
+        threshold: u32,
+        guardian: Address,
+    ) -> Result<(), GuardError> {
+        let guardians = Vec::from_array(&env, [guardian]);
+        Self::initialize_with_roles(env, admins, guardians, threshold)
+    }
+
+    pub fn get_pause_type(env: Env) -> PauseType {
+        let mask = Self::get_pause_state(env);
+        if mask == 0 {
+            PauseType::Unpaused
+        } else if mask == u32::MAX {
+            PauseType::FullPause
+        } else {
+            PauseType::PartialPause
+        }
+    }
+
+    /// Set the number of seconds before a full emergency pause expires.
+    pub fn set_auto_unpause_delay(
+        env: Env,
+        approvers: Vec<Address>,
+        delay_seconds: u64,
+    ) -> Result<(), GuardError> {
+        Self::check_multi_sig(&env, &approvers)?;
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::AutoUnpauseDelay, &delay_seconds);
+        Ok(())
+    }
+
+    pub fn get_auto_unpause_delay(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&GuardDataKey::AutoUnpauseDelay)
+            .unwrap_or(0)
+    }
+
+    /// Clear a full pause after the configured delay has elapsed.
+    pub fn auto_unpause(env: Env) -> Result<(), GuardError> {
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::AutoUnpauseAt)
+            .unwrap_or(0);
+        if deadline == 0 || env.ledger().timestamp() < deadline {
+            return Err(GuardError::TimelockNotElapsed);
+        }
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::PauseState, &PauseType::new(0));
+        env.storage()
+            .instance()
+            .remove(&GuardDataKey::AutoUnpauseAt);
+        Ok(())
+    }
+
+    pub fn get_guardians(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&GuardDataKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    pub fn is_guardian(env: Env, guardian: Address) -> bool {
+        Self::get_guardians(env)
+            .iter()
+            .any(|candidate| candidate == guardian)
+    }
+
+    pub fn add_guardian(
+        env: Env,
+        approvers: Vec<Address>,
+        guardian: Address,
+    ) -> Result<(), GuardError> {
+        Self::check_multi_sig(&env, &approvers)?;
+        let mut guardians = Self::get_guardians(env.clone());
+        if !guardians.iter().any(|candidate| candidate == guardian) {
+            guardians.push_back(guardian);
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::Guardians, &guardians);
+        }
+        Ok(())
+    }
+
+    pub fn remove_guardian(
+        env: Env,
+        approvers: Vec<Address>,
+        guardian: Address,
+    ) -> Result<(), GuardError> {
+        Self::check_multi_sig(&env, &approvers)?;
+        let guardians = Self::get_guardians(env.clone());
+        let mut remaining = Vec::new(&env);
+        let mut found = false;
+        for candidate in guardians.iter() {
+            if candidate == guardian {
+                found = true;
+            } else {
+                remaining.push_back(candidate);
+            }
+        }
+        if !found {
+            return Err(GuardError::GuardianNotFound);
+        }
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Guardians, &remaining);
         Ok(())
     }
 
     /// Returns the raw pause-state bitmask.
     pub fn get_pause_state(env: Env) -> u32 {
-        let state: PauseType = env
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::AutoUnpauseAt)
+            .unwrap_or(0);
+        if deadline > 0 && env.ledger().timestamp() >= deadline {
+            return 0;
+        }
+        let state: PauseMask = env
             .storage()
             .instance()
             .get(&GuardDataKey::PauseState)
@@ -262,12 +569,35 @@ impl EmergencyGuard {
 
     /// Check if an operation is paused.
     pub fn is_paused(env: Env, operation: u32) -> bool {
-        let state: PauseType = env
+        Self::is_paused_ref(&env, operation)
+    }
+
+    /// Gas-optimized pause probe: single storage read + inline bitwise AND.
+    #[inline(always)]
+    pub fn is_paused_ref(env: &Env, operation: u32) -> bool {
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::AutoUnpauseAt)
+            .unwrap_or(0);
+        if deadline > 0 && env.ledger().timestamp() >= deadline {
+            return false;
+        }
+        let mask: u32 = env
             .storage()
             .instance()
             .get(&GuardDataKey::PauseState)
-            .unwrap_or(PauseType::new(0));
-        state.is_paused(operation)
+            .map(|state: PauseMask| state.as_u32())
+            .unwrap_or(0);
+        (mask & operation) != 0
+    }
+
+    /// Panics when the requested operation bit is set in the pause bitmask.
+    #[inline(always)]
+    pub fn ensure_not_paused(env: &Env, operation: u32) {
+        if Self::is_paused_ref(env, operation) {
+            panic!("operation paused");
+        }
     }
 
     /// Set pause state for a specific operation (any single admin can do this).
@@ -278,10 +608,24 @@ impl EmergencyGuard {
         paused: bool,
     ) -> Result<(), GuardError> {
         admin.require_auth();
-        if !Self::is_admin_internal(&env, &admin) {
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::AutoUnpauseAt)
+            .unwrap_or(0);
+        if deadline > 0 && env.ledger().timestamp() >= deadline {
+            env.storage()
+                .instance()
+                .remove(&GuardDataKey::AutoUnpauseAt);
+        }
+        let is_admin = Self::is_admin_internal(&env, &admin);
+        let is_guardian = Self::get_guardians(env.clone())
+            .iter()
+            .any(|candidate| candidate == admin);
+        if !is_admin && !(paused && is_guardian) {
             return Err(GuardError::Unauthorized);
         }
-        let mut state: PauseType = env
+        let mut state: PauseMask = env
             .storage()
             .instance()
             .get(&GuardDataKey::PauseState)
@@ -289,7 +633,7 @@ impl EmergencyGuard {
         state.set_paused(operation, paused);
         env.storage()
             .instance()
-            .set(&GuardDataKey::PauseState, &pause_state);
+            .set(&GuardDataKey::PauseState, &state);
 
         emit_guard_event(
             &env,
@@ -309,7 +653,6 @@ impl EmergencyGuard {
             operation,
             paused
         );
-            .set(&GuardDataKey::PauseState, &state);
         emit_pause_state_changed(&env, &admin, operation, paused);
         Ok(())
     }
@@ -321,7 +664,17 @@ impl EmergencyGuard {
         state.pause_all();
         env.storage()
             .instance()
-            .set(&GuardDataKey::PauseState, &pause_state);
+            .set(&GuardDataKey::PauseState, &state);
+        env.storage()
+            .instance()
+            .remove(&GuardDataKey::AutoUnpauseAt);
+        let delay = Self::get_auto_unpause_delay(env.clone());
+        if delay > 0 {
+            env.storage().instance().set(
+                &GuardDataKey::AutoUnpauseAt,
+                &(env.ledger().timestamp().saturating_add(delay)),
+            );
+        }
 
         emit_guard_event(
             &env,
@@ -335,17 +688,47 @@ impl EmergencyGuard {
                 approver_count: approvers.len(),
             },
         );
-            .set(&GuardDataKey::PauseState, &state);
         emit_emergency_paused_all(&env, &approvers);
+        Ok(())
+    }
+
+    /// A registered guardian may trigger an immediate circuit break.
+    pub fn guardian_emergency_pause(env: Env, guardian: Address) -> Result<(), GuardError> {
+        guardian.require_auth();
+        if !Self::get_guardians(env.clone())
+            .iter()
+            .any(|candidate| candidate == guardian)
+        {
+            return Err(GuardError::Unauthorized);
+        }
+        let mut state = PauseType::new(0);
+        state.pause_all();
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::PauseState, &state);
+        env.storage()
+            .instance()
+            .remove(&GuardDataKey::AutoUnpauseAt);
+        let delay = Self::get_auto_unpause_delay(env.clone());
+        if delay > 0 {
+            env.storage().instance().set(
+                &GuardDataKey::AutoUnpauseAt,
+                &(env.ledger().timestamp().saturating_add(delay)),
+            );
+        }
         Ok(())
     }
 
     /// Resume all operations (requires multi-sig approval).
     pub fn resume(env: Env, approvers: Vec<Address>) -> Result<(), GuardError> {
         Self::check_multi_sig(&env, &approvers)?;
+        let state = PauseType::new(0);
         env.storage()
             .instance()
-            .set(&GuardDataKey::PauseState, &pause_state);
+            .set(&GuardDataKey::PauseState, &state);
+        env.storage()
+            .instance()
+            .remove(&GuardDataKey::AutoUnpauseAt);
 
         emit_guard_event(
             &env,
@@ -359,7 +742,6 @@ impl EmergencyGuard {
                 approver_count: approvers.len(),
             },
         );
-            .set(&GuardDataKey::PauseState, &PauseType::new(0));
         emit_resumed_all(&env, &approvers);
         Ok(())
     }
@@ -387,8 +769,6 @@ impl EmergencyGuard {
                     approver_count: approvers.len(),
                 },
             );
-            emit_admin_added(&env, &approvers, &new_admin);
-            env.storage().instance().set(&GuardDataKey::Admins, &admins);
             emit_admin_added(&env, &approvers, &new_admin);
         }
         Ok(())
@@ -419,7 +799,9 @@ impl EmergencyGuard {
             return Err(GuardError::AdminNotFound);
         }
 
-        env.storage().instance().set(&GuardDataKey::Admins, &new_admins);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Admins, &new_admins);
         emit_guard_event(
             &env,
             EmergencyGuardEvent {
@@ -432,9 +814,6 @@ impl EmergencyGuard {
                 approver_count: approvers.len(),
             },
         );
-        env.storage()
-            .instance()
-            .set(&GuardDataKey::Admins, &new_admins);
         emit_admin_removed(&env, &approvers, &admin);
         Ok(())
     }
@@ -447,6 +826,7 @@ impl EmergencyGuard {
         new_admin: Address,
     ) -> Result<(), GuardError> {
         Self::check_multi_sig(&env, &approvers)?;
+        let threshold = Self::get_threshold(env.clone());
         let admins = Self::get_admins(env.clone());
         let mut new_admins = Vec::new(&env);
         let mut found = false;
@@ -464,13 +844,17 @@ impl EmergencyGuard {
             return Err(GuardError::AdminNotFound);
         }
 
-        new_admins.push_back(new_admin.clone());
+        if !new_admins.iter().any(|a| a == new_admin) {
+            new_admins.push_back(new_admin.clone());
+        }
 
         if (new_admins.len() as u32) < threshold {
             return Err(GuardError::InvalidThreshold);
         }
 
-        env.storage().instance().set(&GuardDataKey::Admins, &new_admins);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Admins, &new_admins);
         emit_guard_event(
             &env,
             EmergencyGuardEvent {
@@ -484,9 +868,6 @@ impl EmergencyGuard {
             },
         );
         log!(&env, "Admin rotated: {} to {}", old_admin, new_admin);
-        env.storage()
-            .instance()
-            .set(&GuardDataKey::Admins, &new_admins);
         Ok(())
     }
 
@@ -550,6 +931,8 @@ impl EmergencyGuard {
             if Self::is_admin_internal(env, &addr) {
                 addr.require_auth();
                 valid += 1;
+            } else {
+                return Err(GuardError::Unauthorized);
             }
         }
 
@@ -559,11 +942,6 @@ impl EmergencyGuard {
             Ok(())
         }
     }
-
-    /// Public method to check if an address is an admin
-    pub fn is_admin_public(env: Env, addr: Address) -> bool {
-        Self::is_admin_internal(&env, &addr)
-    }
 }
 
 /// Default implementation of EmergencyGuardTrait using static methods
@@ -572,7 +950,15 @@ pub struct DefaultEmergencyGuard;
 impl EmergencyGuardTrait for DefaultEmergencyGuard {
     /// Check if an operation is paused. Returns Err if paused.
     fn check_not_paused(env: &Env, operation: u32) -> Result<(), GuardError> {
-        let pause_state: PauseType = env
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::AutoUnpauseAt)
+            .unwrap_or(0);
+        if deadline > 0 && env.ledger().timestamp() >= deadline {
+            return Ok(());
+        }
+        let pause_state: PauseMask = env
             .storage()
             .instance()
             .get(&GuardDataKey::PauseState)
@@ -587,7 +973,15 @@ impl EmergencyGuardTrait for DefaultEmergencyGuard {
 
     /// Get current pause state
     fn get_pause_state(env: &Env) -> u32 {
-        let pause_state: PauseType = env
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::AutoUnpauseAt)
+            .unwrap_or(0);
+        if deadline > 0 && env.ledger().timestamp() >= deadline {
+            return 0;
+        }
+        let pause_state: PauseMask = env
             .storage()
             .instance()
             .get(&GuardDataKey::PauseState)
@@ -597,7 +991,7 @@ impl EmergencyGuardTrait for DefaultEmergencyGuard {
 
     /// Set pause state for a specific operation (any single admin can do this)
     fn set_pause_state(env: &Env, operation: u32, paused: bool) -> Result<(), GuardError> {
-        let mut pause_state: PauseType = env
+        let mut pause_state: PauseMask = env
             .storage()
             .instance()
             .get(&GuardDataKey::PauseState)
@@ -607,6 +1001,11 @@ impl EmergencyGuardTrait for DefaultEmergencyGuard {
         env.storage()
             .instance()
             .set(&GuardDataKey::PauseState, &pause_state);
+        if !paused && pause_state.as_u32() == 0 {
+            env.storage()
+                .instance()
+                .remove(&GuardDataKey::AutoUnpauseAt);
+        }
 
         log!(
             env,
@@ -618,12 +1017,14 @@ impl EmergencyGuardTrait for DefaultEmergencyGuard {
     }
 
     /// Unpause a specific operation (any single admin can do this)
-    fn unpause(env: &Env, operation: u32) -> Result<(), GuardError> {
+    fn unpause(env: &Env, admin: Address, operation: u32) -> Result<(), GuardError> {
+        admin.require_auth();
         Self::set_pause_state(env, operation, false)
     }
 
     /// Unpause all operations (any single admin can do this)
-    fn unpause_all(env: &Env) -> Result<(), GuardError> {
+    fn unpause_all(env: &Env, admin: Address) -> Result<(), GuardError> {
+        admin.require_auth();
         let pause_state = PauseType::new(0);
         env.storage()
             .instance()
@@ -727,7 +1128,9 @@ impl EmergencyGuardTrait for DefaultEmergencyGuard {
             return Err(GuardError::AdminNotFound);
         }
 
-        env.storage().instance().set(&GuardDataKey::Admins, &new_admins);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Admins, &new_admins);
         log!(env, "Admin removed: {}", admin);
         Ok(())
     }
@@ -749,21 +1152,26 @@ impl EmergencyGuardTrait for DefaultEmergencyGuard {
     }
 
     /// Check if address is an admin
-    fn is_admin(env: &Env, addr: &Address) -> bool {
+    fn is_admin(env: &Env, addr: Address) -> bool {
         let admins: Vec<Address> = env
             .storage()
             .instance()
             .get(&GuardDataKey::Admins)
             .unwrap_or_else(|| Vec::new(env));
 
-        admins.iter().any(|a| a == *addr)
+        admins.iter().any(|a| a == addr)
     }
 
     /// Rotate admin (multi-sig required)
-    fn rotate_admin(env: &Env, approvers: Vec<Address>, old_admin: Address, new_admin: Address) -> Result<(), GuardError> {
+    fn rotate_admin(
+        env: &Env,
+        approvers: Vec<Address>,
+        old_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), GuardError> {
         EmergencyGuard::check_multi_sig(env, &approvers)?;
 
-        let mut admins = Self::get_admins(env);
+        let admins = Self::get_admins(env);
         let threshold = Self::get_threshold(env);
 
         let mut found = false;
@@ -786,7 +1194,9 @@ impl EmergencyGuardTrait for DefaultEmergencyGuard {
             return Err(GuardError::InvalidThreshold);
         }
 
-        env.storage().instance().set(&GuardDataKey::Admins, &new_admins);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Admins, &new_admins);
         log!(env, "Admin rotated: {} to {}", old_admin, new_admin);
         Ok(())
     }
@@ -795,12 +1205,20 @@ impl EmergencyGuardTrait for DefaultEmergencyGuard {
 /// Extension methods for unpause operations
 impl DefaultEmergencyGuard {
     /// Unpause a specific operation (uses set_pause_state internally)
-    pub fn unpause(env: &Env, operation: u32) -> Result<(), GuardError> {
+    pub fn unpause(env: &Env, admin: Address, operation: u32) -> Result<(), GuardError> {
+        admin.require_auth();
+        if !EmergencyGuard::is_admin_internal(env, &admin) {
+            return Err(GuardError::Unauthorized);
+        }
         Self::set_pause_state(env, operation, false)
     }
 
     /// Unpause all operations (single-admin helper; same effect as `unpause_all`)
-    pub fn unpause_all_emergency(env: &Env) -> Result<(), GuardError> {
+    pub fn unpause_all_emergency(env: &Env, admin: Address) -> Result<(), GuardError> {
+        admin.require_auth();
+        if !EmergencyGuard::is_admin_internal(env, &admin) {
+            return Err(GuardError::Unauthorized);
+        }
         let pause_state = PauseType::new(0);
         env.storage()
             .instance()
@@ -812,7 +1230,7 @@ impl DefaultEmergencyGuard {
 
     /// Check if a specific operation is paused
     pub fn is_operation_paused(env: &Env, operation: u32) -> bool {
-        let pause_state: PauseType = env
+        let pause_state: PauseMask = env
             .storage()
             .instance()
             .get(&GuardDataKey::PauseState)
@@ -830,19 +1248,55 @@ impl DefaultEmergencyGuard {
     pub fn validate_multi_sig(env: Env, approvers: Vec<Address>) -> Result<(), GuardError> {
         EmergencyGuard::check_multi_sig(&env, &approvers)
     }
+
+    /// Guardian vote to pause helper
+    pub fn vote_pause(env: &Env, guardian: Address) -> Result<u32, GuardError> {
+        EmergencyGuard::vote_pause(env.clone(), guardian)
+    }
+
+    /// Guardian vote to unpause helper
+    pub fn vote_unpause(env: &Env, guardian: Address) -> Result<u32, GuardError> {
+        EmergencyGuard::vote_unpause(env.clone(), guardian)
+    }
+}
+
+/// Standard emergency-guard surface for host contracts embedding `EmergencyGuard` storage.
+pub trait TokenEmergencyGuardTrait {
+    fn guard_pause(e: Env, admin: Address, operation: u32, paused: bool) -> Result<(), GuardError>;
+    fn guard_unpause(e: Env, approvers: Vec<Address>) -> Result<(), GuardError>;
+    fn guard_is_paused(e: Env, operation: u32) -> bool;
+    fn emergency_pause_all(e: Env, approvers: Vec<Address>) -> Result<(), GuardError>;
+    fn resume_all(e: Env, approvers: Vec<Address>) -> Result<(), GuardError>;
+    fn guard_add_admin(
+        e: Env,
+        approvers: Vec<Address>,
+        new_admin: Address,
+    ) -> Result<(), GuardError>;
+    fn guard_remove_admin(
+        e: Env,
+        approvers: Vec<Address>,
+        admin: Address,
+    ) -> Result<(), GuardError>;
+    fn guard_rotate_admin(
+        e: Env,
+        approvers: Vec<Address>,
+        old_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), GuardError>;
+    fn guard_admins(e: Env) -> Vec<Address>;
+    fn guard_threshold(e: Env) -> u32;
+    fn guard_pause_state(e: Env) -> u32;
 }
 
 #[cfg(test)]
 mod test;
 
-
-
 pub trait EmergencyGuardTrait {
     fn check_not_paused(env: &Env, operation: u32) -> Result<(), GuardError>;
     fn get_pause_state(env: &Env) -> u32;
     fn set_pause_state(env: &Env, operation: u32, paused: bool) -> Result<(), GuardError>;
-    fn unpause(env: &Env, operation: u32) -> Result<(), GuardError>;
-    fn unpause_all(env: &Env) -> Result<(), GuardError>;
+    fn unpause(env: &Env, admin: Address, operation: u32) -> Result<(), GuardError>;
+    fn unpause_all(env: &Env, admin: Address) -> Result<(), GuardError>;
     fn emergency_pause_all(env: &Env, approvers: Vec<Address>) -> Result<(), GuardError>;
     fn resume_all(env: &Env, approvers: Vec<Address>) -> Result<(), GuardError>;
     fn init_guard(env: &Env, admins: Vec<Address>, threshold: u32) -> Result<(), GuardError>;
@@ -857,75 +1311,4 @@ pub trait EmergencyGuardTrait {
     fn get_admins(env: &Env) -> Vec<Address>;
     fn get_threshold(env: &Env) -> u32;
     fn is_admin(env: &Env, addr: Address) -> bool;
-}
-
-pub struct DefaultEmergencyGuard;
-
-impl DefaultEmergencyGuard {
-    pub fn check_not_paused(env: &Env, operation: u32) -> Result<(), GuardError> {
-        if EmergencyGuard::is_paused(env.clone(), operation) {
-            Err(GuardError::Paused)
-        } else {
-            Ok(())
-        }
-    }
-    pub fn get_pause_state(env: &Env) -> u32 {
-        EmergencyGuard::get_pause_state(env.clone())
-    }
-    pub fn set_pause_state(env: &Env, operation: u32, paused: bool) -> Result<(), GuardError> {
-        let admins = EmergencyGuard::get_admins(env.clone());
-        if let Some(admin) = admins.get(0) {
-            EmergencyGuard::set_pause(env.clone(), admin, operation, paused)
-        } else {
-            Err(GuardError::Unauthorized)
-        }
-    }
-    pub fn unpause(env: &Env, operation: u32) -> Result<(), GuardError> {
-        let admins = EmergencyGuard::get_admins(env.clone());
-        if let Some(admin) = admins.get(0) {
-            EmergencyGuard::set_pause(env.clone(), admin, operation, false)
-        } else {
-            Err(GuardError::Unauthorized)
-        }
-    }
-    pub fn unpause_all(env: &Env) -> Result<(), GuardError> {
-        let admins = EmergencyGuard::get_admins(env.clone());
-        if let Some(admin) = admins.get(0) {
-            EmergencyGuard::set_pause(env.clone(), admin, u32::MAX, false)
-        } else {
-            Err(GuardError::Unauthorized)
-        }
-    }
-    pub fn emergency_pause_all(env: &Env, approvers: Vec<Address>) -> Result<(), GuardError> {
-        EmergencyGuard::emergency_pause(env.clone(), approvers)
-    }
-    pub fn resume_all(env: &Env, approvers: Vec<Address>) -> Result<(), GuardError> {
-        EmergencyGuard::resume(env.clone(), approvers)
-    }
-    pub fn init_guard(env: &Env, admins: Vec<Address>, threshold: u32) -> Result<(), GuardError> {
-        EmergencyGuard::initialize(env.clone(), admins, threshold)
-    }
-    pub fn add_admin(env: &Env, approvers: Vec<Address>, new_admin: Address) -> Result<(), GuardError> {
-        EmergencyGuard::add_admin(env.clone(), approvers, new_admin)
-    }
-    pub fn remove_admin(env: &Env, approvers: Vec<Address>, admin: Address) -> Result<(), GuardError> {
-        EmergencyGuard::remove_admin(env.clone(), approvers, admin)
-    }
-    pub fn rotate_admin(
-        env: &Env,
-        approvers: Vec<Address>,
-        old_admin: Address,
-        new_admin: Address,
-    ) -> Result<(), GuardError> {
-        EmergencyGuard::rotate_admin(env.clone(), approvers, old_admin, new_admin)
-    }
-    pub fn get_admins(env: &Env) -> Vec<Address> {
-        EmergencyGuard::get_admins(env.clone())
-    }
-    pub fn get_threshold(env: &Env) -> u32 {
-        EmergencyGuard::get_threshold(env.clone())
-    }
-    pub fn is_admin(env: &Env, addr: Address) -> bool {
-        EmergencyGuard::is_admin_public(env.clone(), addr)
-    }
 }

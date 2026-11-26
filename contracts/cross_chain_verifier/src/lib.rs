@@ -1,6 +1,9 @@
+// Issue #863: Contract optimization metrics
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, Vec,
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,9 +33,19 @@ pub struct SignedMessage {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Payload {
+    pub chain_id: u32,
+    pub destination_contract: Address,
+    pub nonce: u64,
+    pub data: Bytes,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
     StateRoot(u32),
+    AuthorizedSigners,
     SignerAlgorithm(Bytes),
     SignerCount,
     ProcessedMessages(BytesN<32>),
@@ -51,7 +64,7 @@ impl CrossChainVerifier {
             panic!("already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().persistent().set(&DataKey::SignerCount, &0u32);
+        env.storage().instance().set(&DataKey::SignerCount, &0u32);
     }
 
     /// Admin-only: pause or unpause all verification operations.
@@ -85,6 +98,25 @@ impl CrossChainVerifier {
             .get(&DataKey::StateRoot(block_height))
     }
 
+    /// Add an authorized signer for cross-chain message verification.
+    /// Only the admin can add signers.
+    ///
+    /// This function allows the admin to register new signers that are authorized to sign
+    /// cross-chain messages. Each signer is associated with a specific signature algorithm
+    /// (Ed25519 or Secp256k1).
+    ///
+    /// **Performance:** O(1) - Constant time indexed storage lookup
+    ///
+    /// # Parameters
+    /// * `public_key`: The public key of the signer (32 bytes for Ed25519, 33-65 bytes for Secp256k1)
+    /// * `algorithm`: The signature algorithm used by this signer (Ed25519 or Secp256k1)
+    ///
+    /// # Panics
+    /// - If the caller is not the admin
+    /// - If the signer is already authorized
+    ///
+    /// # Events
+    /// Emits a "signer_added" event on successful addition
     pub fn add_authorized_signer(env: Env, public_key: Bytes, algorithm: SignatureAlgorithm) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -103,11 +135,11 @@ impl CrossChainVerifier {
 
         let count: u32 = env
             .storage()
-            .persistent()
+            .instance()
             .get(&DataKey::SignerCount)
             .unwrap_or(0);
         env.storage()
-            .persistent()
+            .instance()
             .set(&DataKey::SignerCount, &(count + 1));
     }
 
@@ -129,12 +161,12 @@ impl CrossChainVerifier {
 
         let count: u32 = env
             .storage()
-            .persistent()
+            .instance()
             .get(&DataKey::SignerCount)
             .unwrap_or(0);
         if count > 0 {
             env.storage()
-                .persistent()
+                .instance()
                 .set(&DataKey::SignerCount, &(count - 1));
         }
     }
@@ -145,7 +177,7 @@ impl CrossChainVerifier {
 
     pub fn get_signer_count(env: Env) -> u32 {
         env.storage()
-            .persistent()
+            .instance()
             .get(&DataKey::SignerCount)
             .unwrap_or(0)
     }
@@ -155,7 +187,6 @@ impl CrossChainVerifier {
         signed_message: SignedMessage,
         block_height: u32,
         proof: Vec<BytesN<32>>,
-        proof_flags: Vec<bool>,
     ) -> bool {
         if Self::is_paused(env.clone()) {
             panic!("verification paused");
@@ -171,7 +202,16 @@ impl CrossChainVerifier {
             return false;
         }
 
-        if !Self::verify_merkle_proof(&env, &message_hash, &block_height, &proof, &proof_flags) {
+        let expected_root: BytesN<32> = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::StateRoot(block_height))
+        {
+            Some(root) => root,
+            None => return false,
+        };
+        let leaf = Self::hash_leaf_hash(&env, &message_hash);
+        if !Self::verify_merkle_root(&env, &leaf, &expected_root, &proof) {
             return false;
         }
 
@@ -182,40 +222,48 @@ impl CrossChainVerifier {
     pub fn verify_message(
         env: Env,
         block_height: u32,
-        leaf: BytesN<32>,
+        payload: Payload,
         proof: Vec<BytesN<32>>,
-        proof_flags: Vec<bool>,
     ) -> bool {
         if Self::is_paused(env.clone()) {
             return false;
         }
-        Self::verify_merkle_proof(&env, &leaf, &block_height, &proof, &proof_flags)
+
+        if Self::is_nonce_processed(env.clone(), payload.nonce) {
+            panic!("Nonce already used");
+        }
+
+        let valid = Self::verify_merkle_proof(&env, &payload, &block_height, &proof);
+        if valid {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ProcessedNonce(payload.nonce), &true);
+        }
+        valid
     }
 
     pub fn verify_message_and_consume(
         env: Env,
         block_height: u32,
-        nonce: u64,
-        leaf: BytesN<32>,
+        payload: Payload,
         proof: Vec<BytesN<32>>,
-        proof_flags: Vec<bool>,
     ) -> bool {
         if Self::is_paused(env.clone()) {
             panic!("verification paused");
         }
 
-        if Self::is_nonce_processed(env.clone(), nonce) {
+        if Self::is_nonce_processed(env.clone(), payload.nonce) {
             panic!("nonce already processed");
         }
 
-        let valid = Self::verify_message(env.clone(), block_height, leaf, proof, proof_flags);
+        let valid = Self::verify_merkle_proof(&env, &payload, &block_height, &proof);
         if !valid {
             return false;
         }
 
         env.storage()
             .persistent()
-            .set(&DataKey::ProcessedNonce(nonce), &true);
+            .set(&DataKey::ProcessedNonce(payload.nonce), &true);
         true
     }
 
@@ -273,12 +321,44 @@ impl CrossChainVerifier {
         BytesN::from_array(env, &digest)
     }
 
+    /// Domain-separated leaf hash: SHA-256(0x00 || data).
+    fn hash_leaf(env: &Env, data: &Bytes) -> BytesN<32> {
+        let mut buf = Bytes::new(env);
+        buf.append(&Bytes::from_slice(env, &[0x00]));
+        buf.append(data);
+        env.crypto().sha256(&buf).into()
+    }
+
+    /// Domain-separated leaf hash for a 32-byte hash value.
+    fn hash_leaf_hash(env: &Env, hash: &BytesN<32>) -> BytesN<32> {
+        let data = Bytes::from_slice(env, &hash.to_array());
+        Self::hash_leaf(env, &data)
+    }
+
+    /// Domain-separated internal node hash: SHA-256(0x01 || min || max).
+    fn hash_internal(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut combined = [0u8; 65];
+        combined[0] = 0x01;
+        if left <= right {
+            combined[1..33].copy_from_slice(left);
+            combined[33..65].copy_from_slice(right);
+        } else {
+            combined[1..33].copy_from_slice(right);
+            combined[33..65].copy_from_slice(left);
+        }
+        env.crypto()
+            .sha256(&Bytes::from_slice(env, &combined))
+            .to_array()
+    }
+
+    /// Verify a Merkle proof for a payload. Uses domain-separated hashing:
+    /// leaf = SHA-256(0x00 || payload_hash), internal = SHA-256(0x01 || min || max).
+    /// Odd trailing nodes are promoted unchanged (no sibling duplication).
     fn verify_merkle_proof(
         env: &Env,
-        leaf: &BytesN<32>,
+        payload: &Payload,
         block_height: &u32,
         proof: &Vec<BytesN<32>>,
-        proof_flags: &Vec<bool>,
     ) -> bool {
         let expected_root: BytesN<32> = match env
             .storage()
@@ -289,32 +369,42 @@ impl CrossChainVerifier {
             None => return false,
         };
 
-        if proof.len() != proof_flags.len() {
-            return false;
-        }
+        let payload_hash = Self::compute_payload_hash(env, payload);
+        let leaf = Self::hash_leaf_hash(env, &payload_hash);
+        Self::verify_merkle_root(env, &leaf, &expected_root, proof)
+    }
 
-        let mut current_hash = leaf.to_array();
+    /// Verify a pre-hashed leaf against a known root using domain-separated internal hashing.
+    fn verify_merkle_root(
+        env: &Env,
+        leaf_hash: &BytesN<32>,
+        expected_root: &BytesN<32>,
+        proof: &Vec<BytesN<32>>,
+    ) -> bool {
+        let mut current = leaf_hash.to_array();
         let mut i = 0;
         while i < proof.len() {
             let sibling = proof.get(i).unwrap().to_array();
-            let is_left_sibling = proof_flags.get(i).unwrap();
-
-            let mut combined = [0u8; 64];
-            if is_left_sibling {
-                combined[0..32].copy_from_slice(&sibling);
-                combined[32..64].copy_from_slice(&current_hash);
-            } else {
-                combined[0..32].copy_from_slice(&current_hash);
-                combined[32..64].copy_from_slice(&sibling);
-            }
-
-            let combined_bytes = Bytes::from_slice(env, &combined);
-            current_hash = env.crypto().sha256(&combined_bytes).to_array();
+            current = Self::hash_internal(env, &current, &sibling);
             i += 1;
         }
+        BytesN::from_array(env, &current) == *expected_root
+    }
+}
 
-        let computed_root = BytesN::from_array(env, &current_hash);
-        computed_root == expected_root
+/// Helper methods outside #[contractimpl] so they can accept reference parameters.
+impl CrossChainVerifier {
+    /// Computes a domain-separated payload hash:
+    ///   sha256(chain_id || destination_contract || nonce || data)
+    /// This binds every message to a specific source chain, destination contract,
+    /// and unique nonce, preventing cross-chain replay attacks.
+    pub fn compute_payload_hash(env: &Env, payload: &Payload) -> BytesN<32> {
+        let mut buf = Bytes::new(env);
+        buf.append(&Bytes::from_slice(env, &payload.chain_id.to_be_bytes()));
+        buf.append(&payload.destination_contract.clone().to_xdr(env));
+        buf.append(&Bytes::from_slice(env, &payload.nonce.to_be_bytes()));
+        buf.append(&payload.data.clone());
+        env.crypto().sha256(&buf).into()
     }
 }
 

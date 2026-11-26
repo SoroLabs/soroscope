@@ -10,7 +10,8 @@ use soroban_sdk::{testutils::Address as _, vec, Address, Env};
 fn setup_guard<'a>(env: &'a Env, admin: &'a Address) -> EmergencyGuardClient<'a> {
     let contract_id = env.register(EmergencyGuard, ());
     let client = EmergencyGuardClient::new(env, &contract_id);
-    client.initialize(&vec![env, admin.clone()], &1);
+    let guardian = Address::generate(env);
+    client.initialize(&vec![env, admin.clone()], &1, &guardian);
     client
 }
 

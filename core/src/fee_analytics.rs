@@ -401,6 +401,191 @@ impl Default for FeeAnalyticsEngine {
     }
 }
 
+/// One stored observation of network base fee and inclusion fee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeeDataPoint {
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
+    /// Protocol base fee, in stroops.
+    pub base_fee: u64,
+    /// Fee paid to be included, in stroops.
+    pub inclusion_fee: u64,
+}
+
+/// Windows used for fee moving averages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeAverageWindow {
+    OneHour,
+    TwentyFourHours,
+    SevenDays,
+}
+
+impl FeeAverageWindow {
+    pub fn duration(self) -> chrono::Duration {
+        match self {
+            FeeAverageWindow::OneHour => chrono::Duration::hours(1),
+            FeeAverageWindow::TwentyFourHours => chrono::Duration::hours(24),
+            FeeAverageWindow::SevenDays => chrono::Duration::days(7),
+        }
+    }
+
+    pub fn all() -> [FeeAverageWindow; 3] {
+        [
+            FeeAverageWindow::OneHour,
+            FeeAverageWindow::TwentyFourHours,
+            FeeAverageWindow::SevenDays,
+        ]
+    }
+}
+
+/// Mean base fee and inclusion fee inside one window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowMovingAverage {
+    pub window: FeeAverageWindow,
+    pub base_fee: f64,
+    pub inclusion_fee: f64,
+    pub sample_count: usize,
+}
+
+/// Recommended fee for a transaction that should confirm quickly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FastFeePrediction {
+    /// Bid that should clear in the current market, in stroops.
+    pub optimal_fee: u64,
+    pub base_fee_1h: f64,
+    pub inclusion_fee_1h: f64,
+    pub inclusion_fee_24h: f64,
+    /// `true` when the 1h inclusion average is materially above the 24h average.
+    pub rising: bool,
+    /// 0.0 when no samples exist, otherwise scales with 1h sample count.
+    pub confidence: f64,
+}
+
+/// In-memory history of fee data points and the trend aggregator on top of it.
+#[derive(Debug, Clone, Default)]
+pub struct FeeTrendAggregator {
+    points: Vec<FeeDataPoint>,
+}
+
+impl FeeTrendAggregator {
+    pub fn new() -> Self {
+        Self { points: Vec::new() }
+    }
+
+    /// Append a historical fee observation. Points are kept in insertion order.
+    pub fn record(&mut self, point: FeeDataPoint) {
+        self.points.push(point);
+    }
+
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+
+    pub fn points(&self) -> &[FeeDataPoint] {
+        &self.points
+    }
+
+    /// Arithmetic mean of base fee and inclusion fee for samples inside `window`
+    /// ending at `now`. Samples recorded after `now` are ignored.
+    pub fn moving_average(
+        &self,
+        window: FeeAverageWindow,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> WindowMovingAverage {
+        let start = now - window.duration();
+        let mut base_sum: u128 = 0;
+        let mut inclusion_sum: u128 = 0;
+        let mut sample_count: usize = 0;
+
+        for point in &self.points {
+            if point.recorded_at > now || point.recorded_at < start {
+                continue;
+            }
+            base_sum += point.base_fee as u128;
+            inclusion_sum += point.inclusion_fee as u128;
+            sample_count += 1;
+        }
+
+        let (base_fee, inclusion_fee) = if sample_count == 0 {
+            (0.0, 0.0)
+        } else {
+            (
+                base_sum as f64 / sample_count as f64,
+                inclusion_sum as f64 / sample_count as f64,
+            )
+        };
+
+        WindowMovingAverage {
+            window,
+            base_fee,
+            inclusion_fee,
+            sample_count,
+        }
+    }
+
+    /// Moving averages for 1h, 24h, and 7d.
+    pub fn moving_averages(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> [WindowMovingAverage; 3] {
+        let windows = FeeAverageWindow::all();
+        [
+            self.moving_average(windows[0], now),
+            self.moving_average(windows[1], now),
+            self.moving_average(windows[2], now),
+        ]
+    }
+
+    /// Predict the fee that should confirm quickly.
+    ///
+    /// The bid is the 1-hour inclusion-fee average (falling back to 24h, then 7d),
+    /// and at least the 1-hour base-fee average. When the 1h inclusion average is
+    /// more than 5% above the 24h average, a 25% surge premium is applied;
+    /// otherwise the premium is 10%.
+    pub fn predict_fast_fee(&self, now: chrono::DateTime<chrono::Utc>) -> FastFeePrediction {
+        let [hour, day, week] = self.moving_averages(now);
+
+        if hour.sample_count == 0 && day.sample_count == 0 && week.sample_count == 0 {
+            return FastFeePrediction {
+                optimal_fee: 100,
+                base_fee_1h: 0.0,
+                inclusion_fee_1h: 0.0,
+                inclusion_fee_24h: 0.0,
+                rising: false,
+                confidence: 0.0,
+            };
+        }
+
+        let inclusion_anchor = if hour.sample_count > 0 {
+            hour.inclusion_fee
+        } else if day.sample_count > 0 {
+            day.inclusion_fee
+        } else {
+            week.inclusion_fee
+        };
+
+        let rising = day.sample_count > 0 && hour.inclusion_fee > day.inclusion_fee * 1.05;
+        // 125% when the short window is rising, otherwise 110%. Integer basis
+        // points avoid `ceil` turning an exact multiple (200 * 1.10) into 221.
+        let premium_bps: u64 = if rising { 12_500 } else { 11_000 };
+        let floor = hour.base_fee.max(inclusion_anchor).round().max(0.0) as u64;
+        let optimal_fee = (floor * premium_bps).div_ceil(10_000).max(1);
+        let confidence = (hour.sample_count as f64 / 12.0).min(1.0);
+
+        FastFeePrediction {
+            optimal_fee,
+            base_fee_1h: hour.base_fee,
+            inclusion_fee_1h: hour.inclusion_fee,
+            inclusion_fee_24h: day.inclusion_fee,
+            rising,
+            confidence,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,5 +728,86 @@ mod tests {
         assert_eq!(conditions.avg_fee_10_ledgers, 100);
         assert!(conditions.transaction_pressure >= 0.0);
         assert!(conditions.transaction_pressure <= 1.0);
+    }
+
+    fn point(at: chrono::DateTime<chrono::Utc>, base_fee: u64, inclusion_fee: u64) -> FeeDataPoint {
+        FeeDataPoint {
+            recorded_at: at,
+            base_fee,
+            inclusion_fee,
+        }
+    }
+
+    #[test]
+    fn fee_history_stores_data_points() {
+        let mut agg = FeeTrendAggregator::new();
+        let now = Utc::now();
+        agg.record(point(now, 100, 180));
+        agg.record(point(now, 120, 200));
+        assert_eq!(agg.len(), 2);
+        assert_eq!(agg.points()[1].inclusion_fee, 200);
+    }
+
+    #[test]
+    fn moving_averages_respect_1h_24h_and_7d_windows() {
+        let now = Utc::now();
+        let mut agg = FeeTrendAggregator::new();
+        agg.record(point(now - chrono::Duration::minutes(30), 100, 200));
+        agg.record(point(now - chrono::Duration::minutes(10), 140, 300));
+        agg.record(point(now - chrono::Duration::hours(2), 50, 80));
+        agg.record(point(now - chrono::Duration::days(8), 999, 999));
+
+        let [hour, day, week] = agg.moving_averages(now);
+
+        assert_eq!(hour.sample_count, 2);
+        assert!((hour.base_fee - 120.0).abs() < 1e-9);
+        assert!((hour.inclusion_fee - 250.0).abs() < 1e-9);
+
+        assert_eq!(day.sample_count, 3);
+        assert!((day.base_fee - (290.0 / 3.0)).abs() < 1e-9);
+        assert!((day.inclusion_fee - (580.0 / 3.0)).abs() < 1e-9);
+
+        assert_eq!(week.sample_count, 3);
+        assert_eq!(week.base_fee, day.base_fee);
+        assert_eq!(week.inclusion_fee, day.inclusion_fee);
+    }
+
+    #[test]
+    fn empty_window_average_is_zero() {
+        let agg = FeeTrendAggregator::new();
+        let avg = agg.moving_average(FeeAverageWindow::OneHour, Utc::now());
+        assert_eq!(avg.sample_count, 0);
+        assert_eq!(avg.base_fee, 0.0);
+        assert_eq!(avg.inclusion_fee, 0.0);
+    }
+
+    #[test]
+    fn predict_fast_fee_uses_inclusion_average_with_premium() {
+        let now = Utc::now();
+        let mut stable = FeeTrendAggregator::new();
+        for _ in 0..12 {
+            stable.record(point(now - chrono::Duration::minutes(20), 100, 200));
+            stable.record(point(now - chrono::Duration::hours(6), 100, 200));
+        }
+        let stable_pred = stable.predict_fast_fee(now);
+        assert!(!stable_pred.rising);
+        assert_eq!(stable_pred.optimal_fee, 220);
+        assert_eq!(stable_pred.confidence, 1.0);
+
+        let mut rising = FeeTrendAggregator::new();
+        rising.record(point(now - chrono::Duration::minutes(15), 100, 400));
+        rising.record(point(now - chrono::Duration::hours(5), 100, 100));
+        let rising_pred = rising.predict_fast_fee(now);
+        assert!(rising_pred.rising);
+        assert_eq!(rising_pred.optimal_fee, 500);
+        assert!(rising_pred.optimal_fee > stable_pred.optimal_fee);
+    }
+
+    #[test]
+    fn predict_fast_fee_without_history_is_base_fee_default() {
+        let pred = FeeTrendAggregator::new().predict_fast_fee(Utc::now());
+        assert_eq!(pred.optimal_fee, 100);
+        assert_eq!(pred.confidence, 0.0);
+        assert!(!pred.rising);
     }
 }

@@ -1,0 +1,8 @@
+{
+  "protocol_snapshots": {
+    "22": {
+      "cpu_relative_error_bps": 1000,
+      "memory_relative_error_bps": 1000
+    }
+  }
+}

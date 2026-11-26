@@ -1,19 +1,43 @@
 use crate::admin::{has_administrator, read_administrator, write_administrator};
 use crate::balance::{read_balance, receive_balance, spend_balance};
 use crate::metadata::{
-    read_decimal, read_name, read_symbol, write_decimal, write_name, write_symbol,
+    read_decimal, read_identity_metadata, read_name, read_symbol, remove_identity_metadata,
+    write_decimal, write_identity_metadata, write_name, write_symbol,
 };
-use soroban_sdk::{contract, contractimpl, Address, Env, String};
+use soroban_sdk::{contract, contracterror, contractimpl, Address, Env, String, Symbol};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    AlreadyMinted = 4,
+    TokenNotFound = 5,
+    AlreadyRevoked = 6,
+}
 
 pub trait SoulboundTokenTrait {
     fn initialize(e: Env, admin: Address, decimal: u32, name: String, symbol: String);
     fn mint(e: Env, to: Address);
+    fn mint_identity(e: Env, to: Address, metadata: String);
     fn set_admin(e: Env, new_admin: Address);
     fn balance(e: Env, id: Address) -> i128;
-    fn transfer(e: Env, from: Address, to: Address, amount: i128);
-    fn transfer_from(e: Env, spender: Address, from: Address, to: Address, amount: i128);
+    fn transfer(e: Env, from: Address, to: Address, amount: i128) -> Result<(), Error>;
+    fn transfer_from(
+        e: Env,
+        spender: Address,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), Error>;
     fn burn(e: Env, from: Address);
     fn admin_transfer(e: Env, from: Address, to: Address);
+    fn revoke(e: Env, token_id: u64) -> Result<(), Error>;
+    fn token_id(e: Env, owner: Address) -> Result<u64, Error>;
+    fn update_metadata(e: Env, to: Address, metadata: String);
+    fn identity_metadata(e: Env, id: Address) -> String;
     fn decimals(e: Env) -> u32;
     fn name(e: Env) -> String;
     fn symbol(e: Env) -> String;
@@ -21,6 +45,33 @@ pub trait SoulboundTokenTrait {
 
 #[contract]
 pub struct SoulboundToken;
+
+fn record_minted_token(e: &Env, owner: &Address, issuer: &Address) -> u64 {
+    let next: u64 = e
+        .storage()
+        .persistent()
+        .get(&crate::storage_types::DataKey::NextTokenId)
+        .unwrap_or(1);
+    let following = next.checked_add(1).expect("token id overflow");
+    e.storage().persistent().set(
+        &crate::storage_types::DataKey::NextTokenId,
+        &following,
+    );
+    e.storage().persistent().set(
+        &crate::storage_types::DataKey::OwnerToken(owner.clone()),
+        &next,
+    );
+    e.storage()
+        .persistent()
+        .set(&crate::storage_types::DataKey::TokenOwner(next), owner);
+    e.storage()
+        .persistent()
+        .set(&crate::storage_types::DataKey::TokenIssuer(next), issuer);
+    e.storage()
+        .persistent()
+        .set(&crate::storage_types::DataKey::TokenRevoked(next), &false);
+    next
+}
 
 #[contractimpl]
 impl SoulboundTokenTrait for SoulboundToken {
@@ -34,12 +85,26 @@ impl SoulboundTokenTrait for SoulboundToken {
         write_symbol(&e, &symbol);
     }
 
+    /// Mint a soulbound identity badge bound to `to`. Holders may own at most one.
     fn mint(e: Env, to: Address) {
         let admin = read_administrator(&e);
         admin.require_auth();
         e.storage().instance().extend_ttl(100, 100);
 
-        receive_balance(&e, to, 1);
+        receive_balance(&e, to.clone(), 1);
+        record_minted_token(&e, &to, &admin);
+        write_identity_metadata(&e, to, &String::from_str(&e, ""));
+    }
+
+    /// Mint a soulbound identity badge with issuer-provided metadata (URI or claims).
+    fn mint_identity(e: Env, to: Address, metadata: String) {
+        let admin = read_administrator(&e);
+        admin.require_auth();
+        e.storage().instance().extend_ttl(100, 100);
+
+        receive_balance(&e, to.clone(), 1);
+        record_minted_token(&e, &to, &admin);
+        write_identity_metadata(&e, to, &metadata);
     }
 
     fn set_admin(e: Env, new_admin: Address) {
@@ -55,19 +120,31 @@ impl SoulboundTokenTrait for SoulboundToken {
         read_balance(&e, id)
     }
 
-    fn transfer(e: Env, _from: Address, _to: Address, _amount: i128) {
-        panic!("soulbound tokens cannot be transferred");
+    /// Soulbound badges are non-transferable.
+    fn transfer(_e: Env, _from: Address, _to: Address, _amount: i128) -> Result<(), Error> {
+        Err(Error::Unauthorized)
     }
 
-    fn transfer_from(e: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {
-        panic!("soulbound tokens cannot be transferred");
+    /// Soulbound badges cannot be moved via allowance either.
+    fn transfer_from(
+        _e: Env,
+        _spender: Address,
+        _from: Address,
+        _to: Address,
+        _amount: i128,
+    ) -> Result<(), Error> {
+        Err(Error::Unauthorized)
     }
 
     fn burn(e: Env, from: Address) {
         from.require_auth();
         e.storage().instance().extend_ttl(100, 100);
 
-        spend_balance(&e, from, 1);
+        spend_balance(&e, from.clone(), 1);
+        e.storage()
+            .persistent()
+            .remove(&crate::storage_types::DataKey::OwnerToken(from.clone()));
+        remove_identity_metadata(&e, from);
     }
 
     fn admin_transfer(e: Env, from: Address, to: Address) {
@@ -75,8 +152,87 @@ impl SoulboundTokenTrait for SoulboundToken {
         admin.require_auth();
         e.storage().instance().extend_ttl(100, 100);
 
-        spend_balance(&e, from, 1);
-        receive_balance(&e, to, 1);
+        let metadata = read_identity_metadata(&e, from.clone());
+        spend_balance(&e, from.clone(), 1);
+        let token_id: u64 = e
+            .storage()
+            .persistent()
+            .get(&crate::storage_types::DataKey::OwnerToken(from.clone()))
+            .unwrap();
+        e.storage()
+            .persistent()
+            .remove(&crate::storage_types::DataKey::OwnerToken(from.clone()));
+        remove_identity_metadata(&e, from);
+        receive_balance(&e, to.clone(), 1);
+        e.storage().persistent().set(
+            &crate::storage_types::DataKey::OwnerToken(to.clone()),
+            &token_id,
+        );
+        e.storage()
+            .persistent()
+            .set(&crate::storage_types::DataKey::TokenOwner(token_id), &to);
+        write_identity_metadata(&e, to, &metadata);
+    }
+
+    /// Revoke a token. Only the issuer recorded when it was minted may revoke it.
+    fn revoke(e: Env, token_id: u64) -> Result<(), Error> {
+        e.storage().instance().extend_ttl(100, 100);
+
+        let key = crate::storage_types::DataKey::TokenIssuer(token_id);
+        let issuer: Address = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::TokenNotFound)?;
+        issuer.require_auth();
+        let revoked_key = crate::storage_types::DataKey::TokenRevoked(token_id);
+        if e.storage()
+            .persistent()
+            .get::<_, bool>(&revoked_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyRevoked);
+        }
+        let owner: Address = e
+            .storage()
+            .persistent()
+            .get(&crate::storage_types::DataKey::TokenOwner(token_id))
+            .ok_or(Error::TokenNotFound)?;
+        e.storage().persistent().set(&revoked_key, &true);
+        let current_token = e
+            .storage()
+            .persistent()
+            .get::<_, u64>(&crate::storage_types::DataKey::OwnerToken(owner.clone()));
+        if current_token == Some(token_id) {
+            remove_identity_metadata(&e, owner);
+        }
+        e.events()
+            .publish((Symbol::new(&e, "revoked"), token_id), issuer);
+        Ok(())
+    }
+
+    fn token_id(e: Env, owner: Address) -> Result<u64, Error> {
+        e.storage()
+            .persistent()
+            .get(&crate::storage_types::DataKey::OwnerToken(owner))
+            .ok_or(Error::TokenNotFound)
+    }
+
+    /// Issuer updates metadata for an existing identity badge.
+    fn update_metadata(e: Env, to: Address, metadata: String) {
+        let admin = read_administrator(&e);
+        admin.require_auth();
+        e.storage().instance().extend_ttl(100, 100);
+
+        if read_balance(&e, to.clone()) == 0 {
+            panic!("no token to update");
+        }
+        write_identity_metadata(&e, to, &metadata);
+    }
+
+    fn identity_metadata(e: Env, id: Address) -> String {
+        e.storage().instance().extend_ttl(100, 100);
+        read_identity_metadata(&e, id)
     }
 
     fn decimals(e: Env) -> u32 {

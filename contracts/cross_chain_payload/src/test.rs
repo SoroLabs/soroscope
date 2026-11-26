@@ -4,8 +4,10 @@ use crate::chain_info::BridgeEndpoint;
 use crate::payload::{EncodedPayload, PayloadBatch, PayloadRoute};
 use crate::signatures::{RecoveryKey, SignatureScheme};
 use crate::verification::{VerificationResult, VerificationStatus};
+use crate::*;
 use crate::{ChainInfo, CrossChainError, CrossChainPayload, PayloadMetadata};
 use soroban_sdk::{Bytes, BytesN, Env, String, Symbol, Vec};
+use std::vec;
 
 #[test]
 fn test_chain_info_creation() {
@@ -225,3 +227,117 @@ fn test_recovery_key_creation() {
     assert!(key.is_active);
     assert_eq!(key.chain_id, 1);
 }
+
+fn canonical_payload(nonce: u64) -> std::vec::Vec<u8> {
+    let mut encoded = std::vec![1];
+    encoded.extend_from_slice(&1u32.to_be_bytes());
+    encoded.extend_from_slice(&2u32.to_be_bytes());
+    encoded.extend_from_slice(&nonce.to_be_bytes());
+    encoded.extend_from_slice(&1_700_000_000u64.to_be_bytes());
+    encoded.extend_from_slice(&3u32.to_be_bytes());
+    encoded.extend_from_slice(b"src");
+    encoded.extend_from_slice(&3u32.to_be_bytes());
+    encoded.extend_from_slice(b"dst");
+    encoded.extend_from_slice(&2u32.to_be_bytes());
+    encoded.extend_from_slice(b"ok");
+    encoded
+}
+
+#[test]
+fn test_parse_payload_reads_origin_sender_and_payload_fields() {
+    let env = Env::default();
+    let encoded = Bytes::from_slice(&env, &canonical_payload(42));
+
+    let parsed = parse_payload(&encoded).unwrap();
+
+    assert_eq!(parsed.version, 1);
+    assert_eq!(parsed.source_chain_id, 1);
+    assert_eq!(parsed.destination_chain_id, 2);
+    assert_eq!(parsed.nonce, 42);
+    assert_eq!(parsed.timestamp, 1_700_000_000);
+    assert_eq!(parsed.sender, Bytes::from_slice(&env, b"src"));
+    assert_eq!(parsed.recipient, Bytes::from_slice(&env, b"dst"));
+    assert_eq!(parsed.data, Bytes::from_slice(&env, b"ok"));
+}
+
+#[test]
+fn test_parse_payload_rejects_zero_nonce() {
+    let env = Env::default();
+    let encoded = Bytes::from_slice(&env, &canonical_payload(0));
+
+    assert_eq!(parse_payload(&encoded), Err(CrossChainError::InvalidNonce));
+}
+
+#[test]
+fn test_parse_payload_rejects_malformed_and_oversized_input() {
+    let env = Env::default();
+    let truncated = Bytes::from_slice(&env, &[1, 0, 0]);
+    let oversized = Bytes::from_slice(&env, &vec![0; MAX_PAYLOAD_SIZE as usize + 1]);
+
+    assert_eq!(
+        parse_payload(&truncated),
+        Err(CrossChainError::MalformedPayload)
+    );
+    assert_eq!(
+        parse_payload(&oversized),
+        Err(CrossChainError::MalformedPayload)
+    );
+}
+
+#[test]
+fn test_replay_protection_records_and_extends_ttl_to_17280_ledgers() {
+    let env = Env::default();
+    let contract_id = env.register(CrossChainPayloadContract, ());
+    let client = CrossChainPayloadContractClient::new(&env, &contract_id);
+
+    let payload_id = BytesN::from_array(&env, &[77u8; 32]);
+    assert_eq!(client.get_replay_ttl(), 17_280);
+    assert!(!client.is_payload_replayed(&payload_id));
+
+    // First recording succeeds
+    let res = client.try_record_payload(&payload_id);
+    assert!(res.is_ok());
+    assert!(client.is_payload_replayed(&payload_id));
+
+    // Second recording of the same payload_id within the window fails with ReplayAttack
+    let duplicate_res = client.try_record_payload(&payload_id);
+    assert_eq!(duplicate_res, Err(Ok(CrossChainError::ReplayAttack)));
+}
+
+#[test]
+fn test_cross_chain_payload_contract_process_payload() {
+    let env = Env::default();
+    let contract_id = env.register(CrossChainPayloadContract, ());
+    let client = CrossChainPayloadContractClient::new(&env, &contract_id);
+
+    let payload_id = BytesN::from_array(&env, &[88u8; 32]);
+    let nonce = BytesN::from_array(&env, &[89u8; 32]);
+    let payload_hash = BytesN::from_array(&env, &[90u8; 32]);
+
+    let payload = CrossChainPayload {
+        payload_id: payload_id.clone(),
+        source_chain_id: 1,
+        destination_chain_id: 2,
+        sender: Bytes::from_slice(&env, b"sender"),
+        recipient: Bytes::from_slice(&env, b"recipient"),
+        data: Bytes::from_slice(&env, b"data"),
+        operation: Symbol::new(&env, "transfer"),
+        metadata: PayloadMetadata {
+            version: 1,
+            timestamp: 1_700_000_000,
+            sequence: 1,
+            expiration_height: 100_000,
+            nonce,
+        },
+        payload_hash,
+        gas_limit: 500_000,
+    };
+
+    assert!(client.process_payload(&payload));
+    assert!(client.is_payload_replayed(&payload_id));
+
+    // Replay attack rejected
+    let replay_res = client.try_process_payload(&payload);
+    assert_eq!(replay_res, Err(Ok(CrossChainError::ReplayAttack)));
+}
+

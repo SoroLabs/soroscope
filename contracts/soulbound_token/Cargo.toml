@@ -1,5 +1,5 @@
 [package]
-name = "soroban-soulbound-token-contract"
+name = "soulbound_token"
 description = "Soroban Soulbound Token Contract"
 version = "0.0.0"
 edition = "2021"
@@ -9,7 +9,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-soroban-sdk = "22.0.0"
+soroban-sdk.workspace = true
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }

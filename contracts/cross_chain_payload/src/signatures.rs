@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Bytes, BytesN, String, Vec};
+use soroban_sdk::{contracttype, Bytes, BytesN, Vec};
 
 /// Supported signature schemes for cross-chain verification
 #[contracttype]

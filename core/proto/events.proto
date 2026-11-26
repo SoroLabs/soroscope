@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package soroscope.events.v1;
+
+// ContractEvent represents a single Soroban contract event.
+message ContractEvent {
+  // Ledger sequence number where the event was emitted.
+  uint64 ledger_sequence = 1;
+  // Unix timestamp (seconds) when the ledger closed.
+  int64 ledger_close_time = 2;
+  // Contract address that emitted the event.
+  string contract_id = 3;
+  // Type of the event (e.g. "transfer", "approve").
+  string event_type = 4;
+  // JSON-encoded event topics.
+  string topics_json = 5;
+  // JSON-encoded event value payload.
+  string value_json = 6;
+  // Transaction hash that produced this event.
+  string tx_hash = 7;
+}
+
+// StreamContractEventsRequest contains the parameters for subscribing to
+// a stream of contract events.
+message StreamContractEventsRequest {
+  // Optional contract ID filter. When empty, events from all contracts
+  // are streamed.
+  string contract_id = 1;
+  // Ledger sequence to start streaming from.  0 means "live" (current
+  // ledger onward).
+  uint64 start_ledger = 2;
+  // Optional comma-separated list of event type filters.
+  // When empty, all event types are streamed.
+  string event_types_filter = 3;
+}
+
+// EventStreamService exposes a server-side streaming RPC for Soroban
+// contract events, enabling high-throughput enterprise indexing consumers
+// to subscribe over HTTP/2 with Protobuf framing instead of HTTP/1.1 JSON.
+service EventStreamService {
+  // StreamContractEvents opens a long-lived server-side stream.  The
+  // server pushes ContractEvent messages as they are indexed from the
+  // Soroban RPC and terminates the stream only on error or client
+  // cancellation.
+  rpc StreamContractEvents(StreamContractEventsRequest)
+      returns (stream ContractEvent);
+}

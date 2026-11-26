@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "Checked-in Soroban fee parameters used to price a simulation and to estimate",
+    "the refundable component of a resource fee. Values are the Stellar pubnet",
+    "snapshot published by soroban-sdk 22.0.11 (src/testutils/cost_estimate.rs),",
+    "captured 2024-12-11. `soroscope` does not read these off the ledger: a quote",
+    "must be reproducible and reviewable, and the numbers only ever feed an",
+    "ESTIMATE. Never use a quote to set a transaction fee -- use `simulateTransaction`",
+    "on the target RPC for that.",
+    "",
+    "Renew when: the RPC's `feeConfig`/`stateArchivalSettings` endpoints are bumped,",
+    "or protocol 23 changes the rent model. Bump `captured_at` when you do."
+  ],
+  "network": "pubnet",
+  "captured_at": "2024-12-11",
+  "protocol": 22,
+  "source": "soroban-sdk 22.0.11 src/testutils/cost_estimate.rs::fee()",
+
+  "fee_per_instruction_increment": 25,
+  "instructions_increment": 10000,
+  "fee_per_read_entry": 6250,
+  "fee_per_write_entry": 10000,
+  "fee_per_read_1kb": 1786,
+  "fee_per_write_1kb": 12000,
+  "fee_per_historical_1kb": 16235,
+  "fee_per_contract_event_1kb": 10000,
+  "fee_per_transaction_size_1kb": 1624,
+
+  "data_size_1kb_increment": 1024,
+  "tx_base_result_size": 300,
+  "ttl_entry_size": 48,
+
+  "persistent_rent_rate_denominator": 2103,
+  "temporary_rent_rate_denominator": 4206
+}

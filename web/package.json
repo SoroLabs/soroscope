@@ -3,26 +3,36 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "next dev --webpack",
+    "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint . --ext .ts,.tsx,.js,.jsx",
-    "test": "node --test ./lib/**/*.test.cjs"
+    "e2e": "playwright test --grep-invert \"accessibility violations\"",
+    "test:a11y": "playwright test e2e/accessibility.spec.ts",
+    "test": "node --test lib/__tests__/*.test.js components/**/*.test.cjs"
   },
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "^1.9.5",
     "clsx": "^2.1.1",
     "framer-motion": "^12.26.2",
+    "html2canvas": "^1.4.1",
+    "jspdf": "^4.2.1",
     "lucide-react": "^0.562.0",
     "mermaid": "^11.14.0",
     "next": "^16.1.6",
+    "next-themes": "^0.4.6",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-dropzone": "^15.0.0",
-    "tailwind-merge": "^3.4.0"
+    "reactflow": "^11.11.4",
+    "recharts": "^2.15.1",
+    "tailwind-merge": "^3.4.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.3",
+    "axe-core": "^4.13.0",
+    "@playwright/test": "^1.49.0",
     "@types/node": "25.0.10",
     "@types/react": "19.2.9",
     "autoprefixer": "^10.4.0",
@@ -32,5 +42,5 @@
     "tailwindcss": "^3.4.0",
     "typescript": "^5.0.0"
   },
-  "packageManager": "yarn@4.9.1+sha512.f95ce356460e05be48d66401c1ae64ef84d163dd689964962c6888a9810865e39097a5e9de748876c2e0bf89b232d583c33982773e9903ae7a76257270986538"
+  "packageManager": "yarn@4.9.1+sha512.f95ce356460e05be48d66401c1ae64ef84d163dd689964962c688a08153865e39097a5e9de74876c2e0bf89b232d583c3398273e9903ae7a76257270986538"
 }

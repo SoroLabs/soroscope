@@ -3,7 +3,7 @@ use soroban_sdk::{contracttype, BytesN, String};
 
 /// Status of a cross-chain payload verification
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum VerificationStatus {
     /// Payload not yet verified
     Pending,
@@ -61,7 +61,7 @@ pub struct VerificationContext {
 
 /// Record of a single validation attempt
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub struct ValidationRecord {
     /// Payload ID that was validated
     pub payload_id: BytesN<32>,

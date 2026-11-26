@@ -105,8 +105,8 @@ export const GasUsageChart: React.FC<GasUsageChartProps> = ({
   );
 
   return (
-    <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-6 font-mono">
-      <div className="border-b-2 border-[#30363d] pb-2 mb-4 flex justify-between items-end">
+    <div className="bg-[var(--bg-card)] border border-[var(--border-default)] rounded-lg p-6 font-mono">
+      <div className="border-b-2 border-[var(--border-default)] pb-2 mb-4 flex justify-between items-end">
         <div className="flex items-center gap-2">
           <BarChart3 size={18} className="text-[#8b949e]" />
           <h2 className="text-2xl font-black text-[#c9d1d9] uppercase tracking-wider">
@@ -154,7 +154,7 @@ export const GasUsageChart: React.FC<GasUsageChartProps> = ({
               </div>
 
               {/* Simulated bar */}
-              <div className="h-3 w-full bg-[#0d1117] rounded-sm overflow-hidden border border-[#30363d] mb-0.5">
+              <div className="h-3 w-full bg-[var(--bg-elevated)] rounded-sm overflow-hidden border border-[var(--border-default)] mb-0.5">
                 <div
                   className="h-full rounded-sm transition-all duration-500 ease-out"
                   style={{
@@ -166,7 +166,7 @@ export const GasUsageChart: React.FC<GasUsageChartProps> = ({
               </div>
 
               {/* Testnet average bar */}
-              <div className="h-2 w-full bg-[#0d1117] rounded-sm overflow-hidden border border-[#30363d]">
+              <div className="h-2 w-full bg-[var(--bg-elevated)] rounded-sm overflow-hidden border border-[var(--border-default)]">
                 <div
                   className="h-full rounded-sm transition-all duration-500 ease-out"
                   style={{
@@ -185,7 +185,7 @@ export const GasUsageChart: React.FC<GasUsageChartProps> = ({
 
       {/* Cost Summary */}
       {cost_stroops !== undefined && (
-        <div className="mt-6 pt-4 border-t-[4px] border-[#30363d]">
+        <div className="mt-6 pt-4 border-t-[4px] border-[var(--border-default)]">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 text-[#c9d1d9]">
               <DollarSign size={16} className="text-[#00d9ff]" />
@@ -203,7 +203,7 @@ export const GasUsageChart: React.FC<GasUsageChartProps> = ({
         </div>
       )}
 
-      <div className="mt-4 pt-4 border-t border-[#30363d]">
+      <div className="mt-4 pt-4 border-t border-[var(--border-default)]">
         <p className="text-[10px] text-[#8b949e] leading-tight">
           * Testnet averages are approximate and based on typical Soroban contract executions. Actual values may vary by contract complexity and network conditions.
         </p>

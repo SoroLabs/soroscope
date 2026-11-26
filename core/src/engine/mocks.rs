@@ -30,18 +30,20 @@ impl SimulationProvider for MockProvider {
         &self,
         _transaction_xdr: &str,
     ) -> Result<SimulationRpcResult, ProviderError> {
-        self.simulate_result.clone().unwrap_or_else(|| {
-            Err(ProviderError::RpcRequestFailed("No mock result set".to_string()))
-        })
+        match &self.simulate_result {
+            Some(res) => res.clone(),
+            None => Err(ProviderError::RpcRequestFailed("No mock result set".to_string())),
+        }
     }
     
     async fn get_ledger_entries(
         &self,
         _keys: &[String],
     ) -> Result<Vec<LedgerEntryInfo>, ProviderError> {
-        self.ledger_entries_result.clone().unwrap_or_else(|| {
-            Ok(vec![])
-        })
+        match &self.ledger_entries_result {
+            Some(res) => res.clone(),
+            None => Ok(vec![]),
+        }
     }
 }
 
@@ -66,13 +68,13 @@ impl StateCache for MockCache {
         self.stored.get(key).cloned()
     }
     
-    async fn set(&self, key: &str, value: Vec<u8>) -> Result<(), CacheError> {
+    async fn set(&self, _key: &str, _value: Vec<u8>) -> Result<(), CacheError> {
         // In a real mock, we'd need mutability, but for tests we can use Arc<Mutex>
         // This is a simplified version
         Ok(())
     }
     
-    async fn invalidate(&self, key: &str) -> Result<(), CacheError> {
+    async fn invalidate(&self, _key: &str) -> Result<(), CacheError> {
         Ok(())
     }
 }

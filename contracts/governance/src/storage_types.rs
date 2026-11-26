@@ -8,6 +8,7 @@ pub enum ProposalState {
     Queued,
     Executed,
     Cancelled,
+    Vetoed,
 }
 
 #[derive(Clone)]
@@ -55,4 +56,8 @@ pub enum DataKey {
     Delegate(Address), // delegate -> total delegated power
     Config,
     HasVoted(u32, Address), // proposal_id, voter -> has_voted
+    SecurityCouncil, // Security Council address for veto power
+    Voters,
+    VotingPowerSnapshot(u32, Address),
+    TotalVotingPowerSnapshot(u32),
 }

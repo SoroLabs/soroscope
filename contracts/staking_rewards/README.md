@@ -1,12 +1,23 @@
 # Staking Rewards Contract
 
-The staking rewards contract lets users stake a principal token, accrue reward-token payouts using a fixed-point compounding schedule, and recover principal through normal or emergency withdrawal paths.
+The staking rewards contract lets users stake a principal token, accrue reward-token payouts using an epoch-based compounding schedule with decay, and recover principal through normal or emergency withdrawal paths.
+
+## Epoch Snapshot System
+
+Rewards accrue at a rate that is constant within each epoch and decays at epoch boundaries.
+
+- **epoch_length**: blocks per epoch (configurable at initialization)
+- **epoch_decay_percent**: percentage reduction in emission rate at each epoch boundary
+- Within an epoch: `rate = initial_rate * (1 - epoch_decay_percent)^epoch`
+- Snapshots are created lazily on first access and stored on-chain for transparency
+
+This replaces the previous continuous per-block decay model, providing predictable per-epoch rates and reduced computational overhead.
 
 ## Initialization
 
-`initialize(owner, staking_token, reward_token, initial_rate, decay_rate, start_block) -> Result<(), ContractError>`
+`initialize(owner, staking_token, reward_token, initial_rate, epoch_decay_percent, epoch_length, start_block) -> Result<(), ContractError>`
 
-Creates the contract configuration once. `initial_rate` and `decay_rate` use the contract's 18-decimal fixed-point scale. `decay_rate` must be between `0` and `SCALE`, and `initial_rate` must be non-negative.
+Creates the contract configuration once. `initial_rate` and `epoch_decay_percent` use the contract's 18-decimal fixed-point scale. `epoch_decay_percent` must be between `0` and `SCALE`, `epoch_length` must be non-zero, and `initial_rate` must be non-negative. The epoch 0 snapshot is created during initialization.
 
 ## Mutating API
 
@@ -42,7 +53,7 @@ Returns rewards persisted during the user's last state update, or `0` when no st
 
 `get_pending_rewards(user) -> i128`
 
-Returns accrued rewards plus rewards accumulated since the last update, using the current ledger sequence.
+Returns accrued rewards plus rewards accumulated since the last update, using the current ledger sequence and epoch-based decay.
 
 `get_config() -> Result<StakingConfig, ContractError>`
 

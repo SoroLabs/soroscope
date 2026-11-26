@@ -1,5 +1,5 @@
 [package]
-name = "soroscope-private-transfer-contract"
+name = "private_transfer"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -8,7 +8,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = "22.0.0"
+soroban-sdk.workspace = true
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }

@@ -38,20 +38,29 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, State,
     },
+    http::HeaderMap,
     response::IntoResponse,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tracing::Instrument;
 
 use crate::jobs::JobId;
+use crate::trace_propagation::TracedMessage;
 
 // ── Channel capacity ─────────────────────────────────────────────────────────
 
-/// Number of events that can be buffered per broadcast channel slot before
-/// slow consumers are forced to drop events via `RecvError::Lagged`.
-const BUS_CAPACITY: usize = 256;
+/// Maximum number of events retained for each subscriber before the oldest
+/// unconsumed telemetry events are dropped.
+const BUS_CAPACITY: usize = 100;
+
+/// Minimum allowed channel capacity (prevents degenerate single-slot configs).
+const BUS_CAPACITY_MIN: usize = 16;
+
+/// Maximum allowed channel capacity (guards against OOM from untrusted config).
+const BUS_CAPACITY_MAX: usize = 65_536;
 
 // ── Event types ──────────────────────────────────────────────────────────────
 
@@ -161,25 +170,36 @@ impl SimulationEvent {
 /// async context and [`SimulationBus::subscribe`] to get a receiver.
 #[derive(Clone)]
 pub struct SimulationBus {
-    sender: broadcast::Sender<SimulationEvent>,
+    sender: broadcast::Sender<TracedMessage<SimulationEvent>>,
 }
 
 impl SimulationBus {
-    /// Create a new bus with the default channel capacity.
+    /// Create a new bus with the default channel capacity (`BUS_CAPACITY`).
     pub fn new() -> Arc<Self> {
-        let (sender, _) = broadcast::channel(BUS_CAPACITY);
+        Self::with_capacity(BUS_CAPACITY)
+    }
+
+    /// Create a new bus with an explicit channel capacity.
+    ///
+    /// `capacity` is clamped to `[BUS_CAPACITY_MIN, BUS_CAPACITY_MAX]`.
+    /// Slow subscribers that fall more than `capacity` events behind receive
+    /// [`RecvError::Lagged`] on the next receive call. Tokio's broadcast channel
+    /// drops the oldest unconsumed events, keeping memory bounded per subscriber.
+    pub fn with_capacity(capacity: usize) -> Arc<Self> {
+        let clamped = capacity.clamp(BUS_CAPACITY_MIN, BUS_CAPACITY_MAX);
+        let (sender, _) = broadcast::channel(clamped);
         Arc::new(Self { sender })
     }
 
     /// Publish an event.  Returns the number of active subscribers that
     /// received it (0 if nobody is listening, which is perfectly fine).
     pub fn publish(&self, event: SimulationEvent) -> usize {
-        self.sender.send(event).unwrap_or(0)
+        self.sender.send(TracedMessage::capture(event)).unwrap_or(0)
     }
 
     /// Subscribe to the bus.  The returned receiver will lag (and skip events)
     /// if it cannot keep up with the publication rate.
-    pub fn subscribe(&self) -> broadcast::Receiver<SimulationEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<TracedMessage<SimulationEvent>> {
         self.sender.subscribe()
     }
 
@@ -289,10 +309,17 @@ pub struct WsState {
 /// or the client disconnects.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     Path(job_id): Path<String>,
     State(state): State<Arc<crate::AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, job_id, state))
+    let parent = crate::trace_propagation::extract_http(&headers);
+    ws.on_upgrade(move |socket| {
+        let span = tracing::info_span!("websocket.session", job_id = %job_id);
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        span.set_parent(parent);
+        handle_socket(socket, job_id, state).instrument(span)
+    })
 }
 
 async fn handle_socket(mut socket: WebSocket, job_id: String, state: Arc<crate::AppState>) {
@@ -300,12 +327,32 @@ async fn handle_socket(mut socket: WebSocket, job_id: String, state: Arc<crate::
 
     let mut rx = state.simulation_bus.subscribe();
 
+    // Observe the shutdown coordinator so we can send a Close frame and stop
+    // subscribing to new events as soon as a drain begins.
+    let mut shutdown_rx = state.shutdown_coordinator.subscribe();
+
     loop {
         tokio::select! {
+            // Shutdown signalled: stop consuming events and close gracefully.
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    tracing::info!(
+                        job_id = %job_id,
+                        "Server shutting down — sending WebSocket Close frame"
+                    );
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+
             // Receive next event from the bus
             result = rx.recv() => {
                 match result {
-                    Ok(event) => {
+                    Ok(message) => {
+                        let dispatch_span = tracing::info_span!("simulation_event_dispatch");
+                        message.set_parent(&dispatch_span);
+                        let _dispatch_guard = dispatch_span.enter();
+                        let event = message.payload;
                         // Only forward events belonging to the requested job
                         if event.job_id() != job_id {
                             continue;
@@ -367,6 +414,96 @@ async fn handle_socket(mut socket: WebSocket, job_id: String, state: Arc<crate::
     tracing::info!(job_id = %job_id, "WebSocket client disconnected");
 }
 
+// ── Issue #13: WebSocket Connection & Reconnect Manager ──────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsConfig {
+    pub heartbeat_interval_secs: u64,
+    pub client_timeout_secs: u64,
+    pub buffer_capacity: usize,
+}
+
+impl Default for WsConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_secs: 15,
+            client_timeout_secs: 30,
+            buffer_capacity: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsConnectionStats {
+    pub active_connections: usize,
+    pub total_connections: u64,
+    pub total_reconnects: u64,
+    pub total_messages_buffered: u64,
+}
+
+#[derive(Clone)]
+pub struct WsConnectionManager {
+    config: WsConfig,
+    active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    total_connections: Arc<std::sync::atomic::AtomicU64>,
+    total_reconnects: Arc<std::sync::atomic::AtomicU64>,
+    total_messages_buffered: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl WsConnectionManager {
+    pub fn new(config: WsConfig) -> Self {
+        Self {
+            config,
+            active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            total_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total_reconnects: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total_messages_buffered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    pub fn register_connection(&self, is_reconnect: bool) {
+        self.active_connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.total_connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if is_reconnect {
+            self.total_reconnects
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn unregister_connection(&self) {
+        self.active_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_buffered_messages(&self, count: u64) {
+        self.total_messages_buffered
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn stats(&self) -> WsConnectionStats {
+        WsConnectionStats {
+            active_connections: self
+                .active_connections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_connections: self
+                .total_connections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_reconnects: self
+                .total_reconnects
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_messages_buffered: self
+                .total_messages_buffered
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    pub fn config(&self) -> &WsConfig {
+        &self.config
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -383,8 +520,8 @@ mod tests {
         bus.publish(event);
 
         let received = rx.recv().await.expect("should receive event");
-        assert_eq!(received.job_id(), fake_id.to_string());
-        assert!(!received.is_terminal());
+        assert_eq!(received.payload.job_id(), fake_id.to_string());
+        assert!(!received.payload.is_terminal());
     }
 
     #[tokio::test]
@@ -439,11 +576,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_subscribers_drop_oldest_events_at_capacity() {
+        let bus = SimulationBus::with_capacity(BUS_CAPACITY_MIN);
+        let mut rx = bus.subscribe();
+        let fake_id = JobId::new();
+
+        for percent in 0..=BUS_CAPACITY_MIN {
+            bus.publish(SimulationBus::progress(
+                &fake_id,
+                percent as i32,
+                "progress",
+            ));
+        }
+
+        let received = rx.recv().await;
+        assert!(matches!(
+            received,
+            Err(broadcast::error::RecvError::Lagged(skipped)) if skipped == 1
+        ));
+
+        let newest = rx.recv().await.expect("newest event should remain");
+        assert_eq!(newest.payload.job_id(), fake_id.to_string());
+        if let SimulationEvent::Progress { data, .. } = newest.payload {
+            assert_eq!(data.percent, 1);
+        } else {
+            panic!("expected progress event");
+        }
+    }
+
+    #[tokio::test]
+    async fn requested_capacity_is_clamped() {
+        let bus = SimulationBus::with_capacity(1);
+        let mut rx = bus.subscribe();
+        let fake_id = JobId::new();
+
+        for percent in 0..=BUS_CAPACITY_MIN {
+            bus.publish(SimulationBus::progress(
+                &fake_id,
+                percent as i32,
+                "progress",
+            ));
+        }
+
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn no_subscribers_does_not_panic() {
         let bus = SimulationBus::new();
         let fake_id = JobId::new();
         // publish with zero subscribers — should silently return 0
         let n = bus.publish(SimulationBus::progress(&fake_id, 10, "start"));
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn slow_client_lagged_events_dropped() {
+        let bus = SimulationBus::with_capacity(16);
+        let mut rx = bus.subscribe();
+        let fake_id = JobId::new();
+
+        // Publish more events than capacity without consuming
+        for i in 0..30 {
+            bus.publish(SimulationBus::progress(&fake_id, i, format!("tick {}", i)));
+        }
+
+        // Slow consumer receives Lagged error when buffer capacity is exceeded
+        let res = rx.recv().await;
+        assert!(matches!(res, Err(broadcast::error::RecvError::Lagged(_))));
+    }
+
+    #[test]
+    fn test_ws_connection_manager_lifecycle() {
+        let manager = WsConnectionManager::new(WsConfig::default());
+        assert_eq!(manager.stats().active_connections, 0);
+
+        manager.register_connection(false);
+        assert_eq!(manager.stats().active_connections, 1);
+        assert_eq!(manager.stats().total_connections, 1);
+        assert_eq!(manager.stats().total_reconnects, 0);
+
+        manager.register_connection(true);
+        assert_eq!(manager.stats().active_connections, 2);
+        assert_eq!(manager.stats().total_connections, 2);
+        assert_eq!(manager.stats().total_reconnects, 1);
+
+        manager.record_buffered_messages(5);
+        assert_eq!(manager.stats().total_messages_buffered, 5);
+
+        manager.unregister_connection();
+        assert_eq!(manager.stats().active_connections, 1);
     }
 }

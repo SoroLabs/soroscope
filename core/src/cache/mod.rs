@@ -1,9 +1,27 @@
-pub mod disk;
+//! Two-tier simulation cache: in-memory L1 + disk-persistent L2.
+//!
+//! The in-memory side (Moka) lives on [`crate::simulation::SimulationCache`]
+//! for backward compatibility; this module only ships the L2 layer plus the
+//! shared error type that spans both tiers. `SimulationCache` exposes
+//! `with_disk_cache` to attach an L2 store — when it is set, reads walk
+//! L1 → L2 → miss (and promote L2 hits into L1), and writes populate both
+//! layers so state survives restarts.
+//!
+//! `ContractCache` follows the same L1/L2 shape for active ledger entries:
+//! a thread-safe in-memory LRU cache (`ledger_memory`, configurable TTL)
+//! sits in front of the Sled-backed `ledger_tree`, so repeated reads for
+//! hot ledger entries avoid hitting disk.
+//!
+//! [`tiered::TieredProfileCache`] applies the same L1/L2 read-through shape
+//! to contract profiles, with Redis as the L2 shared across instances.
+#![allow(unused_imports)]
 
-pub use disk::{DiskCache, DiskCacheConfig};
+pub mod disk;
+pub mod tiered;
 
 use crate::simulation::SimulationResult;
 use moka::future::Cache;
+use moka::sync::Cache as SyncCache;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sled::{Db, Tree};
@@ -15,7 +33,21 @@ use thiserror::Error;
 const CACHE_TTL_SECS: u64 = 3_600;
 const CACHE_MAX_CAPACITY: u64 = 1_000;
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Default TTL for the in-memory ledger entry cache. Overridable via the
+/// `LEDGER_CACHE_TTL_SECS` env var so deployments can tune freshness vs.
+/// hit rate without a rebuild.
+const LEDGER_CACHE_TTL_SECS_DEFAULT: u64 = 300;
+const LEDGER_CACHE_MAX_CAPACITY: u64 = 5_000;
+
+fn ledger_cache_ttl() -> Duration {
+    std::env::var("LEDGER_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(LEDGER_CACHE_TTL_SECS_DEFAULT))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEntry<T> {
     data: T,
     ledger_sequence: u64,
@@ -121,6 +153,9 @@ impl SimulationCache {
 pub struct ContractCache {
     wasm_tree: Tree,
     ledger_tree: Tree,
+    /// In-memory L1 for active ledger entries: thread-safe, bounded (LRU-evicted)
+    /// and TTL-expiring, backed by `ledger_tree` on miss.
+    ledger_memory: SyncCache<String, CacheEntry<Vec<u8>>>,
 }
 
 impl ContractCache {
@@ -131,9 +166,14 @@ impl ContractCache {
         let ledger_tree = db
             .open_tree("ledger_entries")
             .expect("Failed to open ledger_entries tree");
+        let ledger_memory = SyncCache::builder()
+            .max_capacity(LEDGER_CACHE_MAX_CAPACITY)
+            .time_to_live(ledger_cache_ttl())
+            .build();
         Self {
             wasm_tree,
             ledger_tree,
+            ledger_memory,
         }
     }
 
@@ -150,9 +190,16 @@ impl ContractCache {
     }
 
     pub fn get_ledger_entry(&self, key_64: &str, current_ledger: u64) -> Option<Vec<u8>> {
+        if let Some(entry) = self.ledger_memory.get(key_64) {
+            if entry.ledger_sequence >= current_ledger {
+                return Some(entry.data);
+            }
+        }
+
         if let Ok(Some(bytes)) = self.ledger_tree.get(key_64) {
             if let Ok(entry) = serde_json::from_slice::<CacheEntry<Vec<u8>>>(&bytes) {
                 if entry.ledger_sequence >= current_ledger {
+                    self.ledger_memory.insert(key_64.to_string(), entry.clone());
                     return Some(entry.data);
                 }
             }
@@ -170,8 +217,9 @@ impl ContractCache {
                 .as_secs(),
         };
         if let Ok(bytes) = serde_json::to_vec(&entry) {
-            let _ = self.ledger_tree.insert(key_64, bytes);
+            let _ = self.ledger_tree.insert(key_64.clone(), bytes);
         }
+        self.ledger_memory.insert(key_64, entry);
     }
 }
 
@@ -192,4 +240,7 @@ pub enum CacheError {
 
     #[error("cache payload (de)serialisation error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("redis cache error: {0}")]
+    Redis(#[from] redis::RedisError),
 }

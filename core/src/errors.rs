@@ -1,5 +1,5 @@
 use axum::{
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -23,14 +23,34 @@ pub enum AppError {
 
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+
+    #[error("Payload too large: {0}")]
+    PayloadTooLarge(String),
+
+    #[error("Unprocessable entity: {0}")]
+    UnprocessableEntity(String),
+
+    #[error("Too many requests: {0}")]
+    TooManyRequests(String),
 }
 
+/// RFC 7807 "Problem Details for HTTP APIs" response body.
 #[derive(Serialize, ToSchema)]
 pub struct ErrorResponse {
-    /// Error type identifier (e.g., "NOT_FOUND", "BAD_REQUEST")
-    error: String,
-    /// Human-readable error message
-    message: String,
+    /// A URI reference that identifies the problem type
+    #[schema(example = "https://soroscope.dev/errors/not-found")]
+    r#type: String,
+    /// A short, human-readable summary of the problem type
+    #[schema(example = "Not Found")]
+    title: String,
+    /// The HTTP status code for this occurrence of the problem
+    #[schema(example = 404)]
+    status: u16,
+    /// A human-readable explanation specific to this occurrence of the problem
+    detail: String,
+    /// A URI reference identifying this specific occurrence of the problem
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance: Option<String>,
 }
 
 impl AppError {
@@ -40,15 +60,33 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
     fn error_type(&self) -> &str {
         match self {
-            Self::Internal(_) => "INTERNAL_SERVER_ERROR",
-            Self::NotFound(_) => "NOT_FOUND",
-            Self::BadRequest(_) => "BAD_REQUEST",
-            Self::Unauthorized(_) => "UNAUTHORIZED",
+            Self::Internal(_) => "internal-server-error",
+            Self::NotFound(_) => "not-found",
+            Self::BadRequest(_) => "bad-request",
+            Self::Unauthorized(_) => "unauthorized",
+            Self::PayloadTooLarge(_) => "payload-too-large",
+            Self::UnprocessableEntity(_) => "unprocessable-entity",
+            Self::TooManyRequests(_) => "too-many-requests",
+        }
+    }
+
+    fn title(&self) -> &str {
+        match self {
+            Self::Internal(_) => "Internal Server Error",
+            Self::NotFound(_) => "Not Found",
+            Self::BadRequest(_) => "Bad Request",
+            Self::Unauthorized(_) => "Unauthorized",
+            Self::PayloadTooLarge(_) => "Payload Too Large",
+            Self::UnprocessableEntity(_) => "Unprocessable Entity",
+            Self::TooManyRequests(_) => "Too Many Requests",
         }
     }
 }
@@ -57,11 +95,19 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let body = Json(ErrorResponse {
-            error: self.error_type().to_string(),
-            message: self.to_string(),
+            r#type: format!("https://soroscope.dev/errors/{}", self.error_type()),
+            title: self.title().to_string(),
+            status: status.as_u16(),
+            detail: self.to_string(),
+            instance: None,
         });
 
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/problem+json"),
+        );
+        response
     }
 }
 
@@ -85,6 +131,12 @@ impl From<SimulationError> for AppError {
             SimulationError::XdrError(msg) => {
                 AppError::BadRequest(format!("XDR encoding error: {}", msg))
             }
+            SimulationError::NotSorobanTransaction => {
+                AppError::BadRequest("Transaction is not Soroban-enabled".to_string())
+            }
+            SimulationError::HistoricalTransactionNotFound(hash) => {
+                AppError::NotFound(format!("Historical transaction {hash}"))
+            }
             SimulationError::Base64Error(e) => {
                 AppError::BadRequest(format!("Base64 decode error: {}", e))
             }
@@ -106,8 +158,11 @@ impl From<SimulationError> for AppError {
             SimulationError::LocalUnavailable => AppError::Internal(
                 "Local WASM execution unavailable and no RPC fallback succeeded".to_string(),
             ),
-            SimulationError::ExecutionFailed(msg) => {
-                AppError::BadRequest(format!("Contract execution failed: {}", msg))
+            // Issue #1006: the failure is classified, so the message names the
+            // kind and, when the trap carried a `contracterror` discriminant,
+            // the resolved variant rather than a bare integer.
+            SimulationError::ExecutionFailed(failure) => {
+                AppError::BadRequest(format!("Contract execution failed: {}", failure.describe()))
             }
             SimulationError::InsufficientConsensusProviders(msg) => {
                 AppError::Internal(format!("Insufficient consensus providers: {}", msg))
@@ -115,6 +170,47 @@ impl From<SimulationError> for AppError {
             SimulationError::ConsensusMismatch(msg) => {
                 AppError::Internal(format!("Consensus mismatch: {}", msg))
             }
+            SimulationError::TimeoutExceeded {
+                timeout_ms,
+                partial,
+            } => AppError::Internal(format!(
+                "Simulation exceeded the {timeout_ms}ms timeout \
+                 (partial budget: {} cpu instructions, {} memory bytes)",
+                partial.cpu_instructions, partial.memory_bytes
+            )),
+        }
+    }
+}
+
+/// Map upload validation failures to 413 (too large) or 422 (not a valid
+/// Soroban WASM module).
+impl From<crate::parser::UploadValidationError> for AppError {
+    fn from(err: crate::parser::UploadValidationError) -> Self {
+        use crate::parser::UploadValidationError;
+        match err {
+            UploadValidationError::TooLarge { .. } => AppError::PayloadTooLarge(err.to_string()),
+            UploadValidationError::InvalidHeader
+            | UploadValidationError::CustomSectionTooLarge { .. }
+            | UploadValidationError::Malformed(_) => AppError::UnprocessableEntity(err.to_string()),
+            UploadValidationError::ReadFailed(_) => AppError::BadRequest(err.to_string()),
+        }
+    }
+}
+
+/// Convert a SAC transfer error, keeping the account name in the response so a
+/// caller can tell *which* balance is missing without re-reading the request.
+impl From<crate::sac_transfer::SacError> for AppError {
+    fn from(err: crate::sac_transfer::SacError) -> Self {
+        use crate::sac_transfer::SacError;
+        match err {
+            // Malformed input on the caller's side.
+            SacError::InvalidAccount { .. }
+            | SacError::InvalidAsset(_)
+            | SacError::InvalidNetwork(_)
+            | SacError::Xdr(_)
+            | SacError::BalanceEntryMissing { .. } => AppError::BadRequest(err.to_string()),
+            // Anything that came back from the node is a server-side problem.
+            SacError::Simulation(inner) => AppError::from(inner),
         }
     }
 }
