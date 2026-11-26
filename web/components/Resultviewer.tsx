@@ -1,14 +1,48 @@
-'use client';
-
+import { Suspense, useState } from 'react';
 import type { InvocationResult } from '../lib/sorobantypes';
+import { exportReport } from '../lib/exportReport';
+import { formatAmount, stringifyResult } from '../lib/bigIntFormat';
+
+import { buildShareUrl, isValidSimulationId } from '../lib/shareLinks';
 
 import { CallGraphVisualizer } from './CallGraphVisualizer';
+import { CallGraphVisualizerSkeleton } from './CallGraphVisualizerSkeleton';
+import { CopyButton } from './CopyButton';
+import { NetworkComparisonView } from './NetworkComparisonView';
 
 interface ResultViewerProps {
   result: InvocationResult | null;
+  contractId?: string;
 }
 
-export function ResultViewer({ result }: ResultViewerProps) {
+export function ResultViewer({ result, contractId }: ResultViewerProps) {
+  const [exportFormat, setExportFormat] = useState<'pdf' | 'csv' | 'both'>('pdf');
+  const [exporting, setExporting] = useState(false);
+  const [compareNetworks, setCompareNetworks] = useState(false);
+
+  // Share links need a server-persisted simulation id (#1286).
+  const shareUrl =
+    result?.simulationId && isValidSimulationId(result.simulationId)
+      ? buildShareUrl(result.simulationId, process.env.NEXT_PUBLIC_SHARE_BASE_URL)
+      : null;
+  // Comparing re-runs the call by contract id, so it needs one (#1282).
+  const canCompare = Boolean(result?.success && contractId);
+
+  const handleExport = (format: 'pdf' | 'csv' | 'both' = exportFormat) => {
+    if (!result) return;
+    setExporting(true);
+    try {
+      exportReport(result, format, {
+        contractId,
+        functionName: result.functionName,
+      });
+    } catch (err) {
+      console.error('Failed to export report:', err);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const downloadSnapshot = () => {
     if (!result?.stateSnapshot) return;
     const blob = new Blob([JSON.stringify(result.stateSnapshot, null, 2)], { type: 'application/json' });
@@ -27,10 +61,10 @@ export function ResultViewer({ result }: ResultViewerProps) {
       <div
         style={{
           padding: '24px',
-          backgroundColor: '#0d1117',
+          backgroundColor: 'var(--bg-elevated)',
           borderRadius: '8px',
           textAlign: 'center',
-          color: '#8b949e',
+          color: 'var(--text-secondary)',
           border: '1px solid #30363d',
         }}
       >
@@ -43,7 +77,7 @@ export function ResultViewer({ result }: ResultViewerProps) {
     <div
       style={{
         padding: '24px',
-        backgroundColor: '#0d1117',
+        backgroundColor: 'var(--bg-elevated)',
         borderRadius: '8px',
         borderLeft: `4px solid ${result.success ? '#00d9ff' : '#fb8500'}`,
         border: `1px solid #30363d`,
@@ -61,36 +95,119 @@ export function ResultViewer({ result }: ResultViewerProps) {
           >
             {result.success ? '✓ Success' : '✗ Error'}
           </h3>
-          <p style={{ margin: '0', color: '#8b949e', fontSize: '12px' }}>
+          <p style={{ margin: '0', color: 'var(--text-secondary)', fontSize: '12px' }}>
             {new Date(result.timestamp).toLocaleString()}
           </p>
         </div>
         
-        {result.stateSnapshot && (
-          <button
-            onClick={downloadSnapshot}
-            style={{
-              padding: '6px 12px',
-              backgroundColor: '#1f2937',
-              color: '#f3f4f6',
-              borderRadius: '6px',
-              border: '1px solid #374151',
-              fontSize: '12px',
-              cursor: 'pointer',
-              transition: 'background-color 0.2s',
-            }}
-            onMouseOver={(e) => (e.currentTarget.style.backgroundColor = '#374151')}
-            onMouseOut={(e) => (e.currentTarget.style.backgroundColor = '#1f2937')}
-          >
-            Download State Snapshot
-          </button>
-        )}
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+          {/* Export Report Group */}
+          <div style={{ display: 'inline-flex', borderRadius: '6px', overflow: 'hidden', border: '1px solid #374151' }}>
+            <button
+              id="export-report-button"
+              onClick={() => handleExport(exportFormat)}
+              disabled={exporting}
+              style={{
+                padding: '6px 12px',
+                backgroundColor: '#0284c7',
+                color: '#ffffff',
+                border: 'none',
+                fontSize: '12px',
+                fontWeight: '500',
+                cursor: exporting ? 'wait' : 'pointer',
+                transition: 'background-color 0.2s',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+              }}
+              onMouseOver={(e) => (e.currentTarget.style.backgroundColor = '#0369a1')}
+              onMouseOut={(e) => (e.currentTarget.style.backgroundColor = '#0284c7')}
+              title={`Export profiling summary report as ${exportFormat.toUpperCase()}`}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              {exporting ? 'Exporting...' : 'Export Report'}
+            </button>
+            <select
+              value={exportFormat}
+              onChange={(e) => setExportFormat(e.target.value as 'pdf' | 'csv' | 'both')}
+              aria-label="Export format"
+              style={{
+                backgroundColor: '#1f2937',
+                color: '#f3f4f6',
+                border: 'none',
+                borderLeft: '1px solid #374151',
+                padding: '6px 8px',
+                fontSize: '11px',
+                cursor: 'pointer',
+                outline: 'none',
+              }}
+            >
+              <option value="pdf">PDF</option>
+              <option value="csv">CSV</option>
+              <option value="both">Both (PDF & CSV)</option>
+            </select>
+          </div>
+
+          {canCompare && (
+            <button
+              type="button"
+              onClick={() => setCompareNetworks((on) => !on)}
+              aria-pressed={compareNetworks}
+              title="Run this simulation on Testnet and Futurenet side by side"
+              style={{
+                padding: '6px 12px',
+                backgroundColor: compareNetworks ? 'rgba(0, 217, 255, 0.12)' : '#1f2937',
+                color: compareNetworks ? '#00d9ff' : '#f3f4f6',
+                borderRadius: '6px',
+                border: `1px solid ${compareNetworks ? '#00d9ff' : '#374151'}`,
+                fontSize: '12px',
+                cursor: 'pointer',
+              }}
+            >
+              {compareNetworks ? 'Comparing networks' : 'Compare networks'}
+            </button>
+          )}
+
+          {shareUrl && (
+            <CopyButton
+              text={shareUrl}
+              label="Share"
+              copiedLabel="Link copied!"
+              variant="outline"
+              tooltipPosition="bottom"
+            />
+          )}
+
+          {result.stateSnapshot && (
+            <button
+              onClick={downloadSnapshot}
+              style={{
+                padding: '6px 12px',
+                backgroundColor: '#1f2937',
+                color: '#f3f4f6',
+                borderRadius: '6px',
+                border: '1px solid #374151',
+                fontSize: '12px',
+                cursor: 'pointer',
+                transition: 'background-color 0.2s',
+              }}
+              onMouseOver={(e) => (e.currentTarget.style.backgroundColor = '#374151')}
+              onMouseOut={(e) => (e.currentTarget.style.backgroundColor = '#1f2937')}
+            >
+              Snapshot JSON
+            </button>
+          )}
+        </div>
       </div>
 
       {result.error ? (
         <div
           style={{
-            backgroundColor: '#0d1117',
+            backgroundColor: 'var(--bg-elevated)',
             padding: '16px',
             borderRadius: '6px',
             marginBottom: '12px',
@@ -133,7 +250,7 @@ export function ResultViewer({ result }: ResultViewerProps) {
               {result.error}
             </div>
           </div>
-          <div style={{ fontSize: '12px', color: '#8b949e', lineHeight: 1.6 }}>
+          <div style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
             {result.errorType === 'NETWORK_ERROR' ? (
               <>
                 ⚠️ The analyzer backend isn’t responding — it may have crashed or isn’t running.
@@ -157,7 +274,7 @@ export function ResultViewer({ result }: ResultViewerProps) {
         result.result && (
           <div
             style={{
-              backgroundColor: '#0d1117',
+              backgroundColor: 'var(--bg-elevated)',
               padding: '12px',
               borderRadius: '6px',
               marginBottom: '12px',
@@ -171,15 +288,31 @@ export function ResultViewer({ result }: ResultViewerProps) {
               overflow: 'auto',
             }}
           >
-            <strong style={{ color: '#8b949e' }}>Result:</strong>
-            <br />
-            {JSON.stringify(result.result, null, 2)}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+              <strong style={{ color: 'var(--text-secondary)' }}>Result:</strong>
+              <CopyButton text={stringifyResult(result.result)} label="Copy Result" tooltipPosition="left" />
+            </div>
+            {stringifyResult(result.result)}
           </div>
         )
       )}
 
-      {result.callGraphMermaid && (
-        <CallGraphVisualizer mermaidDefinition={result.callGraphMermaid} />
+      {canCompare && compareNetworks && contractId && (
+        <NetworkComparisonView
+          contractId={contractId}
+          functionName={result.functionName}
+          args={Object.values(result.inputs ?? {}).map((value) => formatAmount(value))}
+          runKey={result.id}
+        />
+      )}
+
+      {(result.callGraph || result.callGraphMermaid) && (
+        <Suspense fallback={<CallGraphVisualizerSkeleton />}>
+          <CallGraphVisualizer
+            callGraph={result.callGraph}
+            mermaidDefinition={result.callGraphMermaid}
+          />
+        </Suspense>
       )}
     </div>
   );

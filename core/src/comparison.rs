@@ -1,5 +1,6 @@
 use crate::simulation::{SimulationEngine, SimulationError, SorobanResources};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use utoipa::ToSchema;
 
@@ -7,6 +8,44 @@ use utoipa::ToSchema;
 
 /// Any resource that increases by more than this percentage is flagged.
 const REGRESSION_THRESHOLD: f64 = 10.0;
+
+// ── Protocol snapshot ────────────────────────────────────────────────────────
+
+/// Identifies where the ledger limits used for a simulation came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LimitsSource {
+    /// Limits were fetched from the RPC node.
+    Rpc,
+    /// Limits fell back to the built-in defaults.
+    Builtin,
+}
+
+impl Default for LimitsSource {
+    fn default() -> Self {
+        LimitsSource::Builtin
+    }
+}
+
+/// Immutable snapshot of the protocol settings that were in effect for a
+/// simulation run.
+///
+/// Two runs are only comparable when their `cost_params_hash` matches.
+/// `protocol_version`, `network_passphrase`, `ledger_sequence` and
+/// `limits_source` are recorded for diagnostics and audit purposes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ProtocolSnapshot {
+    /// Stellar protocol version active during the run.
+    pub protocol_version: u32,
+    /// Network passphrase of the target network.
+    pub network_passphrase: String,
+    /// Stable hash of the cost parameters (fee schedule) in effect.
+    pub cost_params_hash: String,
+    /// Ledger sequence the simulation was pinned to.
+    pub ledger_sequence: u32,
+    /// Where the ledger limits were sourced from.
+    pub limits_source: LimitsSource,
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -58,6 +97,37 @@ pub struct RegressionFlag {
     pub severity: String,
 }
 
+/// Reason string used when two runs cannot be compared because their protocol
+/// snapshots disagree.
+pub const INCOMPARABLE_COST_PARAMS: &str = "incomparable: cost_params_hash differs";
+
+use soroban_sdk::xdr::{Limits, ReadXdr, ScSpecEntry, ScSpecTypeDef};
+
+/// Event schema specification extracted from contractspecv0 section.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct EventSchemaSpec {
+    pub name: String,
+    pub topic_types: Vec<String>,
+    pub data_type: String,
+}
+
+/// Description of an event schema change between versions.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct EventChange {
+    pub name: String,
+    pub change_type: String,
+    pub detail: String,
+}
+
+/// Comparison result of contract event schemas.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct EventSchemaDiff {
+    pub schema_status: String, // "available" or "unavailable"
+    pub added_events: Vec<EventSchemaSpec>,
+    pub removed_events: Vec<EventSchemaSpec>,
+    pub changed_events: Vec<EventChange>,
+}
+
 /// Full comparison report returned by the API and CLI.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RegressionReport {
@@ -67,10 +137,19 @@ pub struct RegressionReport {
     pub base: SorobanResources,
     /// Percentage change per resource metric
     pub deltas: ResourceDelta,
-    /// Alerts for any resource that increased by more than the threshold
+    /// Diff of contract event schemas
+    pub event_schema_diff: EventSchemaDiff,
+    /// Alerts for any resource that increased by more than the threshold or schema regressions
     pub regression_flags: Vec<RegressionFlag>,
     /// Human-readable summary of the comparison
     pub summary: String,
+    /// `true` when the two runs used different cost parameters and the deltas
+    /// must not be interpreted as a percentage regression.
+    #[serde(default)]
+    pub incomparable: bool,
+    /// Human-readable reason when `incomparable` is `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomparable_reason: Option<String>,
 }
 
 // ── Core logic ───────────────────────────────────────────────────────────────
@@ -80,6 +159,9 @@ pub struct RegressionReport {
 /// Both simulations are executed concurrently via `tokio::join!` using the same
 /// `SimulationEngine` (and therefore the same ledger state / RPC node) for
 /// consistency.
+///
+/// If the two runs report different `cost_params_hash` values the report is
+/// marked `incomparable` and no percentage deltas are produced.
 pub async fn run_comparison(
     engine: &SimulationEngine,
     mode: CompareMode,
@@ -101,7 +183,9 @@ pub async fn run_comparison(
                 engine.simulate_from_contract_id(&base_id, "compare", vec![], None, None, None)
             );
 
-            (current_result?.resources, base_result?.resources)
+            let current = current_result?;
+            let base = base_result?;
+            (current.resources, base.resources, current.protocol_version, base.protocol_version)
         }
         CompareMode::LocalVsDeployed {
             current_wasm,
@@ -130,23 +214,210 @@ pub async fn run_comparison(
                 )
             );
 
-            (current_result?.resources, base_result?.resources)
+            let current = current_result?;
+            let base = base_result?;
+            (current.resources, base.resources, current.protocol_version, base.protocol_version)
         }
     };
 
-    Ok(build_report(current_resources, base_resources))
+    Ok(build_report_with_snapshots(
+        current_resources,
+        base_resources,
+        current_snapshot,
+        base_snapshot,
+    ))
 }
 
-/// Build a `RegressionReport` from two sets of resource metrics.
-/// This is also useful for testing and for cases where metrics are already
-/// available (e.g. from cached simulation results).
-pub fn build_report(current: SorobanResources, base: SorobanResources) -> RegressionReport {
+pub fn extract_event_specs(wasm_bytes: &[u8]) -> Option<Vec<EventSchemaSpec>> {
+    let mut spec_data = None;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
+        if let Ok(wasmparser::Payload::CustomSection(custom)) = payload {
+            if custom.name() == "contractspecv0" {
+                spec_data = Some(custom.data().to_vec());
+                break;
+            }
+        }
+    }
+
+    let data = spec_data?;
+    let mut cursor = std::io::Cursor::new(&data);
+    let mut event_specs = Vec::new();
+
+    while (cursor.position() as usize) < data.len() {
+        if let Ok(entry) = ScSpecEntry::read_xdr(&mut cursor, Limits::none()) {
+            if let ScSpecEntry::Event(ev) = entry {
+                let name = ev.name.to_string_lossy();
+                let topic_types = ev.topics.iter().map(spec_type_to_string).collect();
+                let data_type = spec_type_to_string(&ev.type_);
+                event_specs.push(EventSchemaSpec {
+                    name,
+                    topic_types,
+                    data_type,
+                });
+            }
+        } else {
+            break;
+        }
+    }
+
+    Some(event_specs)
+}
+
+fn spec_type_to_string(type_def: &ScSpecTypeDef) -> String {
+    match type_def {
+        ScSpecTypeDef::U32 => "u32".to_string(),
+        ScSpecTypeDef::I32 => "i32".to_string(),
+        ScSpecTypeDef::U64 => "u64".to_string(),
+        ScSpecTypeDef::I64 => "i64".to_string(),
+        ScSpecTypeDef::U128 => "u128".to_string(),
+        ScSpecTypeDef::I128 => "i128".to_string(),
+        ScSpecTypeDef::U256 => "u256".to_string(),
+        ScSpecTypeDef::I256 => "i256".to_string(),
+        ScSpecTypeDef::Bool => "bool".to_string(),
+        ScSpecTypeDef::Void => "void".to_string(),
+        ScSpecTypeDef::String => "string".to_string(),
+        ScSpecTypeDef::Symbol => "symbol".to_string(),
+        ScSpecTypeDef::Bytes => "bytes".to_string(),
+        ScSpecTypeDef::Address => "address".to_string(),
+        ScSpecTypeDef::Option(opt) => format!("Option<{}>", spec_type_to_string(&opt.value_type)),
+        ScSpecTypeDef::Vec(vec) => format!("Vec<{}>", spec_type_to_string(&vec.element_type)),
+        ScSpecTypeDef::Map(map) => format!(
+            "Map<{}, {}>",
+            spec_type_to_string(&map.key_type),
+            spec_type_to_string(&map.value_type)
+        ),
+        _ => "custom".to_string(),
+    }
+}
+
+pub fn diff_event_schemas(
+    current_wasm: Option<&[u8]>,
+    base_wasm: Option<&[u8]>,
+) -> EventSchemaDiff {
+    let current_specs = current_wasm.and_then(extract_event_specs);
+    let base_specs = base_wasm.and_then(extract_event_specs);
+
+    if current_specs.is_none() || base_specs.is_none() {
+        return EventSchemaDiff {
+            schema_status: "unavailable".to_string(),
+            added_events: vec![],
+            removed_events: vec![],
+            changed_events: vec![],
+        };
+    }
+
+    let current = current_specs.unwrap();
+    let base = base_specs.unwrap();
+
+    let mut added_events = Vec::new();
+    let mut removed_events = Vec::new();
+    let mut changed_events = Vec::new();
+
+    let current_map: std::collections::HashMap<_, _> = current.iter().map(|e| (&e.name, e)).collect();
+    let base_map: std::collections::HashMap<_, _> = base.iter().map(|e| (&e.name, e)).collect();
+
+    for (name, curr) in &current_map {
+        if let Some(b) = base_map.get(name) {
+            if curr.topic_types != b.topic_types {
+                changed_events.push(EventChange {
+                    name: (*name).clone(),
+                    change_type: "topic_type_changed".to_string(),
+                    detail: format!("Topic types changed from {:?} to {:?}", b.topic_types, curr.topic_types),
+                });
+            } else if curr.data_type != b.data_type {
+                changed_events.push(EventChange {
+                    name: (*name).clone(),
+                    change_type: "data_type_changed".to_string(),
+                    detail: format!("Data type changed from {} to {}", b.data_type, curr.data_type),
+                });
+            }
+        } else {
+            added_events.push((*curr).clone());
+        }
+    }
+
+    for (name, b) in &base_map {
+        if !current_map.contains_key(name) {
+            removed_events.push((*b).clone());
+        }
+    }
+
+    EventSchemaDiff {
+        schema_status: "available".to_string(),
+        added_events,
+        removed_events,
+        changed_events,
+    }
+}
+
+pub fn build_report_with_event_diff(
+    current: SorobanResources,
+    base: SorobanResources,
+    event_schema_diff: EventSchemaDiff,
+) -> RegressionReport {
+    build_report_with_event_diff_and_snapshots(current, base, event_schema_diff, None, None)
+}
+
+/// Build a `RegressionReport` from two sets of resource metrics and their
+/// protocol snapshots.
+///
+/// When both snapshots are present and their `cost_params_hash` values differ,
+/// the report is marked `incomparable` and the deltas are zeroed out so they
+/// cannot be mistaken for a regression.
+pub fn build_report_with_event_diff_and_snapshots(
+    current: SorobanResources,
+    base: SorobanResources,
+    event_schema_diff: EventSchemaDiff,
+    current_snapshot: Option<ProtocolSnapshot>,
+    base_snapshot: Option<ProtocolSnapshot>,
+) -> RegressionReport {
+    let incomparable_reason = match (&current_snapshot, &base_snapshot) {
+        (Some(c), Some(b)) if c.cost_params_hash != b.cost_params_hash => {
+            Some(INCOMPARABLE_COST_PARAMS.to_string())
+        }
+        _ => None,
+    };
+
+    if let Some(reason) = &incomparable_reason {
+        return RegressionReport {
+            current,
+            base,
+            deltas: ResourceDelta {
+                cpu_instructions: 0.0,
+                ram_bytes: 0.0,
+                ledger_read_bytes: 0.0,
+                ledger_write_bytes: 0.0,
+                transaction_size_bytes: 0.0,
+            },
+            event_schema_diff,
+            regression_flags: vec![],
+            summary: format!("Comparison skipped: {reason}"),
+            incomparable: true,
+            incomparable_reason: Some(reason.clone()),
+        };
+    }
+
     let deltas = calculate_deltas(&current, &base);
-    let regression_flags = detect_regressions(&deltas, REGRESSION_THRESHOLD);
+    let mut regression_flags = detect_regressions(&deltas, REGRESSION_THRESHOLD);
+
+    for removed in &event_schema_diff.removed_events {
+        regression_flags.push(RegressionFlag {
+            resource: format!("event_removed_{}", removed.name),
+            change_percent: 0.0,
+            severity: "critical".to_string(),
+        });
+    }
+
+    for changed in &event_schema_diff.changed_events {
+        regression_flags.push(RegressionFlag {
+            resource: format!("event_changed_{}", changed.name),
+            change_percent: 0.0,
+            severity: "critical".to_string(),
+        });
+    }
 
     let summary = if regression_flags.is_empty() {
-        "No significant regressions detected. All resource changes are within acceptable limits."
-            .to_string()
+        "No significant regressions detected. All resource changes are within acceptable limits.".to_string()
     } else {
         format!(
             "⚠ {} regression(s) detected: {}",
@@ -163,9 +434,46 @@ pub fn build_report(current: SorobanResources, base: SorobanResources) -> Regres
         current,
         base,
         deltas,
+        event_schema_diff,
         regression_flags,
         summary,
+        incomparable: false,
+        incomparable_reason: None,
     }
+}
+
+/// Build a `RegressionReport` from two sets of resource metrics.
+pub fn build_report(current: SorobanResources, base: SorobanResources) -> RegressionReport {
+    let empty_diff = EventSchemaDiff {
+        schema_status: "unavailable".to_string(),
+        added_events: vec![],
+        removed_events: vec![],
+        changed_events: vec![],
+    };
+    build_report_with_event_diff(current, base, empty_diff)
+}
+
+/// Build a `RegressionReport` from two sets of resource metrics and their
+/// protocol snapshots.
+pub fn build_report_with_snapshots(
+    current: SorobanResources,
+    base: SorobanResources,
+    current_snapshot: Option<ProtocolSnapshot>,
+    base_snapshot: Option<ProtocolSnapshot>,
+) -> RegressionReport {
+    let empty_diff = EventSchemaDiff {
+        schema_status: "unavailable".to_string(),
+        added_events: vec![],
+        removed_events: vec![],
+        changed_events: vec![],
+    };
+    build_report_with_event_diff_and_snapshots(
+        current,
+        base,
+        empty_diff,
+        current_snapshot,
+        base_snapshot,
+    )
 }
 
 /// Compute percentage change for each resource metric.
@@ -498,5 +806,102 @@ mod tests {
         assert_eq!(report.regression_flags.len(), 1);
         assert_eq!(report.regression_flags[0].resource, "cpu_instructions");
         assert!(report.summary.contains("regression(s) detected"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Event Schema Diff tests (Issue #1014)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_event_schema_diff_unavailable_when_no_spec() {
+        let diff = diff_event_schemas(None, None);
+        assert_eq!(diff.schema_status, "unavailable");
+        assert!(diff.added_events.is_empty());
+        assert!(diff.removed_events.is_empty());
+        assert!(diff.changed_events.is_empty());
+    }
+
+    #[test]
+    fn test_event_schema_diff_topic_type_change_causes_regression() {
+        use soroban_sdk::xdr::{
+            Limits, ScSpecEntry, ScSpecEventV0, ScSpecTypeDef, StringM, VecM, WriteXdr,
+        };
+
+        let event_v1 = ScSpecEntry::Event(ScSpecEventV0 {
+            doc: StringM::default(),
+            name: "transfer".try_into().unwrap(),
+            type_: ScSpecTypeDef::U128,
+            topics: vec![ScSpecTypeDef::Address].try_into().unwrap(),
+        });
+
+        let event_v2 = ScSpecEntry::Event(ScSpecEventV0 {
+            doc: StringM::default(),
+            name: "transfer".try_into().unwrap(),
+            type_: ScSpecTypeDef::U128,
+            topics: vec![ScSpecTypeDef::Symbol].try_into().unwrap(), // Changed topic type!
+        });
+
+        fn make_spec_wasm(entry: &ScSpecEntry) -> Vec<u8> {
+            let bytes = entry.to_xdr(Limits::none()).unwrap();
+            let mut body = vec!["contractspecv0".len() as u8];
+            body.extend_from_slice("contractspecv0".as_bytes());
+            body.extend_from_slice(&bytes);
+            let custom_section = (0u8, body);
+            crate::parser::tests::clean_module_with_custom(custom_section)
+        }
+
+        let diff = diff_event_schemas(
+            Some(&make_spec_wasm(&event_v2)),
+            Some(&make_spec_wasm(&event_v1)),
+        );
+
+        assert_eq!(diff.schema_status, "available");
+        assert_eq!(diff.changed_events.len(), 1);
+        assert_eq!(diff.changed_events[0].name, "transfer");
+
+        let report = build_report_with_event_diff(
+            make_resources(1000, 2000, 300, 400, 500),
+            make_resources(1000, 2000, 300, 400, 500), // Zero resource delta!
+            diff,
+        );
+
+        assert_eq!(report.regression_flags.len(), 1);
+        assert!(report.regression_flags[0].resource.contains("event_changed_transfer"));
+    }
+
+    #[test]
+    fn test_event_schema_diff_added_event_is_informational_only() {
+        use soroban_sdk::xdr::{
+            Limits, ScSpecEntry, ScSpecEventV0, ScSpecTypeDef, StringM, VecM, WriteXdr,
+        };
+
+        let event = ScSpecEntry::Event(ScSpecEventV0 {
+            doc: StringM::default(),
+            name: "mint".try_into().unwrap(),
+            type_: ScSpecTypeDef::U128,
+            topics: vec![ScSpecTypeDef::Address].try_into().unwrap(),
+        });
+
+        let bytes = event.to_xdr(Limits::none()).unwrap();
+        let mut body = vec!["contractspecv0".len() as u8];
+        body.extend_from_slice("contractspecv0".as_bytes());
+        body.extend_from_slice(&bytes);
+        let spec_wasm = crate::parser::tests::clean_module_with_custom((0u8, body));
+        let empty_wasm = crate::parser::tests::clean_module_with_custom((0u8, vec!["contractspecv0".len() as u8, b'c', b'o', b'n', b't', b'r', b'a', b'c', b't', b's', b'p', b'e', b'c', b'v', b'0']));
+
+        let diff = diff_event_schemas(Some(&spec_wasm), Some(&empty_wasm));
+
+        assert_eq!(diff.schema_status, "available");
+        assert_eq!(diff.added_events.len(), 1);
+        assert!(diff.removed_events.is_empty());
+        assert!(diff.changed_events.is_empty());
+
+        let report = build_report_with_event_diff(
+            make_resources(1000, 2000, 300, 400, 500),
+            make_resources(1000, 2000, 300, 400, 500),
+            diff,
+        );
+
+        assert!(report.regression_flags.is_empty());
     }
 }

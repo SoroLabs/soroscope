@@ -1,11 +1,8 @@
-use crate::contract::{Token, TokenClient};
-use emergency_guard::PauseType;
-use soroban_sdk::{testutils::Address as _, vec, Address, Env, String};
+use crate::contract::{Token, TokenClient, BurnEvent};
+use emergency_guard::{GuardError, PauseType};
+use soroban_sdk::{testutils::Address as _, Address, Env, String, Symbol, vec, Vec, IntoVal, TryIntoVal};
 
 // ── Existing Tests ─────────────────────────────────────────────────────────────
-use emergency_guard::{GuardError, PauseType};
-use soroban_sdk::{testutils::Address as _, vec, Address, Env, String};
-use soroban_sdk::{testutils::Address as _, Address, Env, String, vec, Vec};
 
 #[test]
 fn test_mint_and_transfer() {
@@ -442,4 +439,105 @@ fn test_initialize_storage_efficiency() {
     // Pause MINT and assert it is now set.
     client.guard_pause(&admin, &PauseType::MINT, &true);
     assert!(client.is_operation_paused(&PauseType::MINT));
+}
+
+#[test]
+fn test_burn_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(Token, ());
+    let client = TokenClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    client.initialize(
+        &admin,
+        &7,
+        &String::from_str(&env, "Test Token"),
+        &String::from_str(&env, "TEST"),
+    );
+
+    client.mint(&user, &1000);
+
+    // Record events before burn
+    let initial_events_count = env.events().all().len();
+
+    client.burn(&user, &400);
+    assert_eq!(client.balance(&user), 600);
+
+    let events = env.events().all();
+    assert!(events.len() > initial_events_count);
+
+    // Find the burn event
+    let burn_event_name = Symbol::new(&env, "burn");
+    let burn_events: Vec<_> = events
+        .iter()
+        .filter(|(c_id, topics, _)| {
+            c_id == &contract_id
+                && topics.len() == 2
+                && topics.get(0).unwrap() == burn_event_name.clone().into_val(&env)
+                && topics.get(1).unwrap() == user.clone().into_val(&env)
+        })
+        .collect();
+
+    assert_eq!(burn_events.len(), 1);
+    let (_, _, data) = &burn_events[0];
+    let burn_event: BurnEvent = data.try_into_val(&env).unwrap();
+    assert_eq!(burn_event.burner, user);
+    assert_eq!(burn_event.target_account, user);
+    assert_eq!(burn_event.amount, 400);
+}
+
+#[test]
+fn test_burn_from_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(Token, ());
+    let client = TokenClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let spender = Address::generate(&env);
+
+    client.initialize(
+        &admin,
+        &7,
+        &String::from_str(&env, "Test Token"),
+        &String::from_str(&env, "TEST"),
+    );
+
+    client.mint(&user, &1000);
+    client.approve(&user, &spender, &500, &200);
+
+    // Record events before burn_from
+    let initial_events_count = env.events().all().len();
+
+    client.burn_from(&spender, &user, &300);
+    assert_eq!(client.balance(&user), 700);
+    assert_eq!(client.allowance(&user, &spender), 200);
+
+    let events = env.events().all();
+    assert!(events.len() > initial_events_count);
+
+    // Find the burn event
+    let burn_event_name = Symbol::new(&env, "burn");
+    let burn_events: Vec<_> = events
+        .iter()
+        .filter(|(c_id, topics, _)| {
+            c_id == &contract_id
+                && topics.len() == 2
+                && topics.get(0).unwrap() == burn_event_name.clone().into_val(&env)
+                && topics.get(1).unwrap() == user.clone().into_val(&env)
+        })
+        .collect();
+
+    assert_eq!(burn_events.len(), 1);
+    let (_, _, data) = &burn_events[0];
+    let burn_event: BurnEvent = data.try_into_val(&env).unwrap();
+    assert_eq!(burn_event.burner, spender);
+    assert_eq!(burn_event.target_account, user);
+    assert_eq!(burn_event.amount, 300);
 }

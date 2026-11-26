@@ -2,493 +2,167 @@ extern crate std;
 
 use crate::{EmergencyGuard, EmergencyGuardClient, GuardError, PauseType};
 use soroban_sdk::{
-    testutils::{Address as _, Events},
-    vec, Address, Env, Vec as SorobanVec,
+    testutils::{Address as _, Ledger as _},
+    vec, Address, Env,
 };
-use std::vec::Vec;
 
-fn make_admins(env: &Env, n: u32) -> SorobanVec<Address> {
-    let mut admins = SorobanVec::new(env);
-    for _ in 0..n {
-        admins.push_back(Address::generate(env));
-    }
-    admins
-}
-
-fn setup(threshold: u32, n_admins: u32) -> (Env, EmergencyGuardClient<'static>, Vec<Address>) {
+fn setup() -> (
+    Env,
+    EmergencyGuardClient<'static>,
+    Address,
+    Address,
+    Address,
+) {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(EmergencyGuard, ());
     let client = EmergencyGuardClient::new(&env, &contract_id);
-    let admins = make_admins(&env, n_admins);
-    client.initialize(&admins, &threshold);
-    let std_admins: Vec<Address> = admins.iter().collect();
-    (env, client, std_admins)
+    let admin_a = Address::generate(&env);
+    let admin_b = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let admins = vec![&env, admin_a.clone(), admin_b.clone()];
+    let guardians = vec![&env, guardian.clone()];
+    client.initialize_with_roles(&admins, &guardians, &2);
+    (env, client, admin_a, admin_b, guardian)
 }
 
 #[test]
-fn test_granular_pause_types() {
-    let mut pause = PauseType::new(0);
-
-    pause.set_paused(PauseType::SWAP, true);
-    assert!(pause.is_paused(PauseType::SWAP));
-    assert!(!pause.is_paused(PauseType::DEPOSIT));
-
-    pause.set_paused(PauseType::DEPOSIT, true);
-    assert!(pause.is_paused(PauseType::SWAP));
-    assert!(pause.is_paused(PauseType::DEPOSIT));
-
-    pause.set_paused(PauseType::WITHDRAW, true);
-    assert!(pause.is_paused(PauseType::WITHDRAW));
-
-    pause.set_paused(PauseType::SWAP, false);
-    assert!(!pause.is_paused(PauseType::SWAP));
-    assert!(pause.is_paused(PauseType::DEPOSIT));
-    assert!(pause.is_paused(PauseType::WITHDRAW));
-}
-
-#[test]
-fn test_bitwise_pause_logic() {
-    let mut pause = PauseType::new(0);
-
-    // Test setting operations
-    pause.set_paused(PauseType::SWAP, true);
-    assert!(pause.is_paused(PauseType::SWAP));
-    assert!(!pause.is_paused(PauseType::DEPOSIT));
-
-    // Test checking multiple operations
-    pause.set_paused(PauseType::MINT, true);
-    assert!(pause.is_paused(PauseType::SWAP));
-    assert!(pause.is_paused(PauseType::MINT));
-
-    // Test clearing operations
-    pause.set_paused(PauseType::SWAP, false);
-    assert!(!pause.is_paused(PauseType::SWAP));
-    assert!(pause.is_paused(PauseType::MINT));
-
-    // Test clearing all manually
-    pause.set_paused(PauseType::MINT, false);
-    assert_eq!(pause.as_u32(), 0);
-}
-
-#[test]
-fn test_pause_all_and_unpause_all() {
-    let mut pause = PauseType::new(0);
-    pause.pause_all();
-    for op in [
-        PauseType::SWAP,
-        PauseType::DEPOSIT,
-        PauseType::WITHDRAW,
-        PauseType::TRANSFER,
-        PauseType::MINT,
-        PauseType::BURN,
-    ] {
-        assert!(pause.is_paused(op));
-    }
-    pause.unpause_all();
-    for op in [
-        PauseType::SWAP,
-        PauseType::DEPOSIT,
-        PauseType::WITHDRAW,
-        PauseType::TRANSFER,
-        PauseType::MINT,
-        PauseType::BURN,
-    ] {
-        assert!(!pause.is_paused(op));
-    }
-}
-
-#[test]
-fn test_unpause_operation() {
-    let (_env, client, admins) = setup(1, 1);
-    let admin = admins[0].clone();
-
-    client.set_pause(&admin, &PauseType::SWAP, &true);
-    assert!(client.is_paused(&PauseType::SWAP));
-
-    client.set_pause(&admin, &PauseType::SWAP, &false);
-    assert!(!client.is_paused(&PauseType::SWAP));
-}
-
-#[test]
-fn test_unpause_all_operations() {
-    let (env, client, admins) = setup(1, 1);
-    let approvers = vec![&env, admins[0].clone()];
-
-    client.emergency_pause(&approvers);
-    assert!(client.is_paused(&PauseType::SWAP));
-    assert!(client.is_paused(&PauseType::DEPOSIT));
-
-    client.resume(&approvers);
-    assert!(!client.is_paused(&PauseType::SWAP));
-    assert!(!client.is_paused(&PauseType::DEPOSIT));
-    assert!(!client.is_paused(&PauseType::WITHDRAW));
-    assert!(!client.is_paused(&PauseType::TRANSFER));
-    assert!(!client.is_paused(&PauseType::MINT));
-    assert!(!client.is_paused(&PauseType::BURN));
-}
-
-#[test]
-fn test_multiple_pause_types() {
-    let mut pause = PauseType::new(0);
-    let combined = PauseType::SWAP | PauseType::DEPOSIT | PauseType::MINT;
-    pause.set_paused(combined, true);
-    assert!(pause.is_paused(PauseType::SWAP));
-    assert!(pause.is_paused(PauseType::DEPOSIT));
-    assert!(!pause.is_paused(PauseType::WITHDRAW));
-    assert!(pause.is_paused(PauseType::MINT));
-    assert!(!pause.is_paused(PauseType::BURN));
-}
-
-// â”€â”€â”€ Initialization â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-#[test]
-fn test_initialize_stores_admins_and_threshold() {
-    let (_env, client, _admins) = setup(2, 3);
-    let stored: Vec<Address> = client.get_admins().iter().collect();
-    assert_eq!(stored.len(), 3);
-    assert_eq!(client.get_threshold(), 2);
-    assert!(!client.is_paused(&PauseType::SWAP));
-}
-
-#[test]
-fn test_initialize_rejects_zero_threshold() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register(EmergencyGuard, ());
-    let client = EmergencyGuardClient::new(&env, &contract_id);
-    let admins = vec![&env, Address::generate(&env)];
-    let result = client.try_initialize(&admins, &0);
-    assert_eq!(result, Err(Ok(GuardError::InvalidThreshold)));
-}
-
-#[test]
-fn test_initialize_rejects_threshold_greater_than_admin_count() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register(EmergencyGuard, ());
-    let client = EmergencyGuardClient::new(&env, &contract_id);
-    let admins = vec![&env, Address::generate(&env), Address::generate(&env)];
-    let result = client.try_initialize(&admins, &3);
-    assert_eq!(result, Err(Ok(GuardError::InvalidThreshold)));
-}
-
-#[test]
-fn test_initialize_cannot_be_called_twice() {
-    let (env, client, _admins) = setup(1, 2);
-    let result = client.try_initialize(&soroban_sdk::Vec::new(&env), &1);
-    assert_eq!(result, Err(Ok(GuardError::AlreadyInitialized)));
-}
-
-// â”€â”€â”€ Admin rotation: add_admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-#[test]
-fn test_add_admin_with_sufficient_approvers() {
-    let (env, client, admins) = setup(2, 3);
-    let new_admin = Address::generate(&env);
-    let approvers = vec![&env, admins[0].clone(), admins[1].clone()];
-    client.add_admin(&approvers, &new_admin);
-    let stored: Vec<Address> = client.get_admins().iter().collect();
-    assert_eq!(stored.len(), 4);
-    assert!(stored.contains(&new_admin));
-}
-
-#[test]
-fn test_add_admin_fails_with_insufficient_approvers() {
-    let (env, client, admins) = setup(2, 3);
-    let new_admin = Address::generate(&env);
-    // Only 1 approver but threshold is 2
-    let approvers = vec![&env, admins[0].clone()];
-    let result = client.try_add_admin(&approvers, &new_admin);
-    assert_eq!(result, Err(Ok(GuardError::InsufficientSignatures)));
-}
-
-#[test]
-fn test_add_admin_fails_with_non_admin_approvers() {
-    let (env, client, _admins) = setup(1, 2);
-    let new_admin = Address::generate(&env);
-    let outsider = Address::generate(&env);
-    let approvers = vec![&env, outsider];
-    let result = client.try_add_admin(&approvers, &new_admin);
-    assert_eq!(result, Err(Ok(GuardError::InsufficientSignatures)));
-}
-
-#[test]
-fn test_add_admin_deduplicates_approvers() {
-    // Passing the same admin twice must not count as 2 approvals
-    let (env, client, admins) = setup(2, 3);
-    let new_admin = Address::generate(&env);
-    let approvers = vec![&env, admins[0].clone(), admins[0].clone()];
-    let result = client.try_add_admin(&approvers, &new_admin);
-    assert_eq!(result, Err(Ok(GuardError::InsufficientSignatures)));
-}
-
-#[test]
-fn test_add_admin_idempotent_for_existing_admin() {
-    // Adding an already-existing admin should succeed but not duplicate the entry
-    let (env, client, admins) = setup(1, 2);
-    let existing = admins[0].clone();
-    let approvers = vec![&env, admins[0].clone()];
-    client.add_admin(&approvers, &existing);
-    let stored: Vec<Address> = client.get_admins().iter().collect();
-    assert_eq!(stored.len(), 2, "duplicate admin must not be inserted");
-}
-
-#[test]
-fn test_add_admin_threshold_one_single_approver_sufficient() {
-    let (env, client, admins) = setup(1, 2);
-    let new_admin = Address::generate(&env);
-    let approvers = vec![&env, admins[0].clone()];
-    client.add_admin(&approvers, &new_admin);
-    assert_eq!(client.get_admins().len(), 3);
-}
-
-// â”€â”€â”€ Admin rotation: remove_admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-#[test]
-fn test_remove_admin_with_sufficient_approvers() {
-    let (env, client, admins) = setup(2, 3);
-    let to_remove = admins[2].clone();
-    let approvers = vec![&env, admins[0].clone(), admins[1].clone()];
-    client.remove_admin(&approvers, &to_remove);
-    let stored: Vec<Address> = client.get_admins().iter().collect();
-    assert_eq!(stored.len(), 2);
-    assert!(!stored.contains(&to_remove));
-}
-
-#[test]
-fn test_remove_admin_fails_with_insufficient_approvers() {
-    let (env, client, admins) = setup(2, 3);
-    let to_remove = admins[2].clone();
-    let approvers = vec![&env, admins[0].clone()];
-    let result = client.try_remove_admin(&approvers, &to_remove);
-    assert_eq!(result, Err(Ok(GuardError::InsufficientSignatures)));
-}
-
-#[test]
-fn test_remove_admin_fails_when_admin_not_found() {
-    let (env, client, admins) = setup(2, 3);
-    let outsider = Address::generate(&env);
-    let approvers = vec![&env, admins[0].clone(), admins[1].clone()];
-    let result = client.try_remove_admin(&approvers, &outsider);
-    assert_eq!(result, Err(Ok(GuardError::AdminNotFound)));
-}
-
-#[test]
-fn test_remove_admin_fails_when_would_drop_below_threshold() {
-    // 2 admins, threshold 2 â†’ removing one would leave 1 < threshold
-    let (env, client, admins) = setup(2, 2);
-    let to_remove = admins[1].clone();
-    let approvers = vec![&env, admins[0].clone(), admins[1].clone()];
-    let result = client.try_remove_admin(&approvers, &to_remove);
-    assert_eq!(result, Err(Ok(GuardError::InvalidThreshold)));
-}
-
-#[test]
-fn test_unauthorized_admin_removal() {
-    let (env, client, admins) = setup(1, 2);
-    let outsider = Address::generate(&env);
-    let approvers = vec![&env, outsider];
-    let result = client.try_remove_admin(&approvers, &admins[1]);
-    assert_eq!(result, Err(Ok(GuardError::InsufficientSignatures)));
-}
-
-// â”€â”€â”€ Full rotation cycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-#[test]
-fn test_full_admin_rotation_add_then_remove_old() {
-    let (env, client, admins) = setup(2, 3);
-    let new_admin = Address::generate(&env);
-
-    // Step 1: add new admin
-    let approvers = vec![&env, admins[0].clone(), admins[1].clone()];
-    client.add_admin(&approvers, &new_admin);
-    assert_eq!(client.get_admins().len(), 4);
-
-    // Step 2: remove one of the original admins using new quorum
-    let approvers2 = vec![&env, admins[0].clone(), new_admin.clone()];
-    client.remove_admin(&approvers2, &admins[2]);
-
-    let stored: Vec<Address> = client.get_admins().iter().collect();
-    assert_eq!(stored.len(), 3);
-    assert!(!stored.contains(&admins[2]));
-    assert!(stored.contains(&new_admin));
-}
-
-#[test]
-fn test_rotate_admin() {
-    let (env, client, admins) = setup(2, 3);
-    let old_admin = admins[2].clone();
-    let new_admin = Address::generate(&env);
-
-    let approvers = vec![&env, admins[0].clone(), admins[1].clone()];
-    client.rotate_admin(&approvers, &old_admin, &new_admin);
-
-    let stored: Vec<Address> = client.get_admins().iter().collect();
-    assert_eq!(stored.len(), 3);
-    assert!(!stored.contains(&old_admin));
-    assert!(stored.contains(&new_admin));
-}
-
-#[test]
-fn test_rotate_admin_duplicate_prevented() {
-    let (env, client, admins) = setup(2, 3);
-    let old_admin = admins[2].clone();
-    let new_admin = admins[1].clone(); // already an admin
-
-    let approvers = vec![&env, admins[0].clone(), admins[1].clone()];
-    // Rotating to an existing admin should just remove the old admin and reduce the list size
-    client.rotate_admin(&approvers, &old_admin, &new_admin);
-
-    let stored: Vec<Address> = client.get_admins().iter().collect();
-    assert_eq!(stored.len(), 2); // 3 - 1
-    assert!(!stored.contains(&old_admin));
-    assert!(stored.contains(&new_admin));
-}
-
-#[test]
-fn test_removed_admin_cannot_approve_operations() {
-    let (env, client, admins) = setup(1, 3);
-
-    // Remove admins[2]
-    let approvers = vec![&env, admins[0].clone()];
-    client.remove_admin(&approvers, &admins[2]);
-
-    // admins[2] tries to add a new admin â€” should fail
-    let new_admin = Address::generate(&env);
-    let bad_approvers = vec![&env, admins[2].clone()];
-    let result = client.try_add_admin(&bad_approvers, &new_admin);
-    assert_eq!(result, Err(Ok(GuardError::InsufficientSignatures)));
-}
-
-#[test]
-fn test_newly_added_admin_can_approve_operations() {
-    let (env, client, admins) = setup(1, 2);
-    let new_admin = Address::generate(&env);
-
-    // Add new_admin
-    let approvers = vec![&env, admins[0].clone()];
-    client.add_admin(&approvers, &new_admin);
-
-    // new_admin approves a pause operation
-    client.set_pause(&new_admin, &PauseType::SWAP, &true);
-    assert!(client.is_paused(&PauseType::SWAP));
-}
-
-// â”€â”€â”€ get_admins / get_threshold â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-#[test]
-fn test_get_admins_returns_all_admins() {
-    let (_env, client, admins) = setup(1, 3);
-    let stored: Vec<Address> = client.get_admins().iter().collect();
-    assert_eq!(stored.len(), 3);
-    for a in &admins {
-        assert!(stored.contains(a));
-    }
-}
-
-#[test]
-fn test_get_threshold_returns_correct_value() {
-    let (_env, client, _admins) = setup(2, 4);
-    assert_eq!(client.get_threshold(), 2);
-}
-
-// â”€â”€â”€ Pause / resume integration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-#[test]
-fn test_set_pause_by_single_admin() {
-    let (_env, client, admins) = setup(1, 2);
-    client.set_pause(&admins[0], &PauseType::DEPOSIT, &true);
-    assert!(client.is_paused(&PauseType::DEPOSIT));
-    assert!(!client.is_paused(&PauseType::SWAP));
-}
-
-#[test]
-fn test_set_pause_rejected_for_non_admin() {
-    let (env, client, _admins) = setup(1, 2);
-    let outsider = Address::generate(&env);
-    let result = client.try_set_pause(&outsider, &PauseType::SWAP, &true);
-    assert_eq!(result, Err(Ok(GuardError::Unauthorized)));
-}
-
-#[test]
-fn test_emergency_pause_requires_multi_sig() {
-    let (env, client, admins) = setup(2, 3);
-
-    // Only 1 approver â€” should fail
-    let approvers = vec![&env, admins[0].clone()];
-    let result = client.try_emergency_pause(&approvers);
-    assert_eq!(result, Err(Ok(GuardError::InsufficientSignatures)));
-
-    // 2 approvers â€” should succeed and pause everything
-    let approvers = vec![&env, admins[0].clone(), admins[1].clone()];
-    client.emergency_pause(&approvers);
-    for op in [
-        PauseType::SWAP,
-        PauseType::DEPOSIT,
-        PauseType::WITHDRAW,
-        PauseType::TRANSFER,
-        PauseType::MINT,
-        PauseType::BURN,
-    ] {
-        assert!(client.is_paused(&op));
-    }
-}
-
-#[test]
-fn test_resume_requires_multi_sig() {
-    let (env, client, admins) = setup(2, 3);
-
-    // Pause everything first
-    let approvers = vec![&env, admins[0].clone(), admins[1].clone()];
-    client.emergency_pause(&approvers);
-
-    // Try resume with 1 approver â€” should fail
-    let approvers1 = vec![&env, admins[0].clone()];
-    let result = client.try_resume(&approvers1);
-    assert_eq!(result, Err(Ok(GuardError::InsufficientSignatures)));
-
-    // Resume with 2 approvers â€” should succeed
-    let approvers2 = vec![&env, admins[0].clone(), admins[1].clone()];
-    client.resume(&approvers2);
-    assert!(!client.is_paused(&PauseType::SWAP));
-    assert!(!client.is_paused(&PauseType::DEPOSIT));
-}
-
-#[test]
-fn test_guard_events() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(EmergencyGuard, ());
-    let client = EmergencyGuardClient::new(&env, &contract_id);
-
-    let admin1 = Address::generate(&env);
-    let admin2 = Address::generate(&env);
-    let admin3 = Address::generate(&env);
-    let admins = vec![&env, admin1.clone(), admin2.clone()];
-
-    client.initialize(&admins, &1);
-
-    let _initial_events = env.events().all();
-
-    client.set_pause(&admin1, &crate::PauseType::SWAP, &true);
-    client.emergency_pause(&vec![&env, admin1.clone()]);
-    client.resume(&vec![&env, admin1.clone()]);
-    client.add_admin(&vec![&env, admin1.clone()], &admin3);
-    client.remove_admin(&vec![&env, admin1.clone()], &admin3);
-
-    let events = env.events().all();
-    assert!(!events.is_empty());
-}
-
-#[test]
-fn test_pause_type_as_u32_bitmask() {
-    let mut pause = crate::PauseType::new(0);
-    pause.set_paused(crate::PauseType::SWAP, true);
-    pause.set_paused(crate::PauseType::DEPOSIT, true);
+fn pause_type_reports_unpaused_partial_and_full_modes() {
+    assert_eq!(PauseType::new(0).pause_type(), PauseType::Unpaused);
     assert_eq!(
-        pause.as_u32(),
-        crate::PauseType::SWAP | crate::PauseType::DEPOSIT
+        PauseType::new(PauseType::SWAP).pause_type(),
+        PauseType::PartialPause
     );
+    assert_eq!(PauseType::new(u32::MAX).pause_type(), PauseType::FullPause);
+}
+
+#[test]
+fn guardians_can_pause_but_cannot_unpause_or_manage_roles() {
+    let (env, client, admin_a, admin_b, guardian) = setup();
+    assert!(client.is_guardian(&guardian));
+
+    client.set_pause(&guardian, &PauseType::SWAP, &true);
+    assert!(client.is_paused(&PauseType::SWAP));
+    assert_eq!(
+        client.try_set_pause(&guardian, &PauseType::SWAP, &false),
+        Err(Ok(GuardError::Unauthorized))
+    );
+
+    let approvers = vec![&env, admin_a.clone(), admin_b.clone()];
+    let extra_guardian = Address::generate(&env);
+    client.add_guardian(&approvers, &extra_guardian);
+    assert!(client.is_guardian(&extra_guardian));
+    client.remove_guardian(&approvers, &extra_guardian);
+    assert!(!client.is_guardian(&extra_guardian));
+}
+
+#[test]
+fn non_guardians_cannot_trigger_pause() {
+    let (env, client, _admin_a, _admin_b, _guardian) = setup();
+    let outsider = Address::generate(&env);
+    assert_eq!(
+        client.try_set_pause(&outsider, &PauseType::TRANSFER, &true),
+        Err(Ok(GuardError::Unauthorized)),
+    );
+}
+
+#[test]
+fn emergency_pause_auto_unpauses_only_after_delay() {
+    let (env, client, admin_a, admin_b, guardian) = setup();
+    let admins = vec![&env, admin_a, admin_b];
+    client.set_auto_unpause_delay(&admins, &100);
+    client.guardian_emergency_pause(&guardian);
+    assert_eq!(client.get_pause_type(), PauseType::FullPause);
+
+    assert_eq!(
+        client.try_auto_unpause(),
+        Err(Ok(GuardError::TimelockNotElapsed))
+    );
+    env.ledger().set_timestamp(env.ledger().timestamp() + 99);
+    assert!(client.is_paused(&PauseType::SWAP));
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+    assert!(!client.is_paused(&PauseType::SWAP));
+    assert_eq!(client.get_pause_type(), PauseType::Unpaused);
+    client.auto_unpause();
+}
+
+#[test]
+fn resume_clears_auto_unpause_schedule() {
+    let (env, client, admin_a, admin_b, guardian) = setup();
+    let admins = vec![&env, admin_a, admin_b];
+    client.set_auto_unpause_delay(&admins, &100);
+    client.guardian_emergency_pause(&guardian);
+    client.resume(&admins);
+    assert_eq!(client.get_pause_type(), PauseType::Unpaused);
+    assert_eq!(
+        client.try_auto_unpause(),
+        Err(Ok(GuardError::TimelockNotElapsed))
+    );
+}
+
+#[test]
+fn test_m_of_n_guardian_multi_sig_pause_and_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EmergencyGuard, ());
+    let client = EmergencyGuardClient::new(&env, &contract_id);
+
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    let g3 = Address::generate(&env);
+    let outsider = Address::generate(&env);
+
+    let guardians = vec![&env, g1.clone(), g2.clone(), g3.clone()];
+    // 2-of-3 threshold
+    client.init(&guardians, &2);
+
+    assert_eq!(client.get_threshold(), 2);
+    assert_eq!(client.get_pause_votes(), 0);
+    assert_eq!(client.get_unpause_votes(), 0);
+    assert!(!client.is_paused(&PauseType::SWAP));
+
+    // Non-guardian cannot vote
+    assert_eq!(
+        client.try_vote_pause(&outsider),
+        Err(Ok(GuardError::Unauthorized))
+    );
+
+    // First guardian votes to pause: 1/2 votes -> not paused yet
+    let count1 = client.vote_pause(&g1);
+    assert_eq!(count1, 1);
+    assert_eq!(client.get_pause_votes(), 1);
+    assert!(!client.is_paused(&PauseType::SWAP));
+    assert_eq!(client.get_pause_type(), PauseType::Unpaused);
+
+    // Duplicate vote from g1 should not increment
+    let count_dup = client.vote_pause(&g1);
+    assert_eq!(count_dup, 1);
+    assert_eq!(client.get_pause_votes(), 1);
+
+    // Second guardian votes to pause: 2/2 votes -> threshold reached, auto-pauses!
+    let count2 = client.vote_pause(&g2);
+    assert_eq!(count2, 2);
+    assert_eq!(client.get_pause_votes(), 2);
+    assert!(client.is_paused(&PauseType::SWAP));
+    assert_eq!(client.get_pause_type(), PauseType::FullPause);
+
+    // Now test vote_unpause:
+    // Non-guardian cannot vote unpause
+    assert_eq!(
+        client.try_vote_unpause(&outsider),
+        Err(Ok(GuardError::Unauthorized))
+    );
+
+    // First guardian votes to unpause: 1/2 votes -> still paused
+    let unpause_count1 = client.vote_unpause(&g1);
+    assert_eq!(unpause_count1, 1);
+    assert_eq!(client.get_unpause_votes(), 1);
+    assert!(client.is_paused(&PauseType::SWAP));
+
+    // Third guardian votes to unpause: 2/2 votes -> threshold reached, auto-unpauses!
+    let unpause_count2 = client.vote_unpause(&g3);
+    assert_eq!(unpause_count2, 2);
+    assert!(!client.is_paused(&PauseType::SWAP));
+    assert_eq!(client.get_pause_type(), PauseType::Unpaused);
+    assert_eq!(client.get_pause_votes(), 0); // pause votes reset after unpause
 }

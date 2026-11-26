@@ -7,11 +7,47 @@
  */
 
 import type { AnalyzeResponse } from './sorobantypes';
+import { loadSettings, resolveEndpoint } from './userSettings';
 
 const DEFAULT_DEV_API_URL = 'http://localhost:8080';
 
 export const API_URL =
   process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, '') ?? DEFAULT_DEV_API_URL;
+
+/**
+ * Base URL for every backend call.
+ *
+ * A custom indexer URL saved on the /settings page takes precedence over the
+ * build-time `NEXT_PUBLIC_API_URL`, so power users can point the app at their
+ * own self-hosted backend without a rebuild. Resolved per request because the
+ * preference can change while the app is open.
+ */
+export function getApiBaseUrl(): string {
+  return resolveEndpoint(loadSettings().indexerUrl, API_URL);
+}
+
+/**
+ * Optional per-network backends for the multi-network comparison view (#1282).
+ *
+ * The analyzer is configured with a single RPC endpoint at startup, so
+ * comparing networks today means running one backend per network and
+ * pointing these at them. Unset networks fall back to the default backend,
+ * which also receives the `network` field on each request so a server that
+ * can switch networks per request works without client changes.
+ *
+ * Each variable is referenced literally so Next.js can inline it at build.
+ */
+const NETWORK_API_URLS: Record<string, string | undefined> = {
+  mainnet: process.env.NEXT_PUBLIC_API_URL_MAINNET,
+  testnet: process.env.NEXT_PUBLIC_API_URL_TESTNET,
+  futurenet: process.env.NEXT_PUBLIC_API_URL_FUTURENET,
+  localhost: process.env.NEXT_PUBLIC_API_URL_LOCALHOST,
+};
+
+export function getNetworkApiBaseUrl(networkId: string): string {
+  const override = NETWORK_API_URLS[networkId]?.trim();
+  return override ? override.replace(/\/+$/, '') : getApiBaseUrl();
+}
 
 export const apiConfig = {
   baseUrl: API_URL,
@@ -22,6 +58,8 @@ export interface ApiRequestOptions extends Omit<RequestInit, 'body'> {
   params?: Record<string, string | number | boolean | null | undefined>;
   token?: string;
   body?: BodyInit | object | null;
+  /** Overrides the backend for this request (e.g. a per-network backend). */
+  baseUrl?: string;
 }
 
 export class ApiError extends Error {
@@ -46,9 +84,13 @@ export class ApiError extends Error {
   }
 }
 
-export function apiUrl(path: string, params?: ApiRequestOptions['params']): string {
+export function apiUrl(
+  path: string,
+  params?: ApiRequestOptions['params'],
+  baseUrl: string = getApiBaseUrl(),
+): string {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-  const url = new URL(`${API_URL}${normalizedPath}`);
+  const url = new URL(`${baseUrl}${normalizedPath}`);
 
   if (params) {
     Object.entries(params).forEach(([key, value]) => {
@@ -92,7 +134,7 @@ async function parseResponse(response: Response): Promise<unknown> {
 }
 
 async function request<T>(endpoint: string, options: ApiRequestOptions = {}): Promise<T> {
-  const { params, token, headers, body, ...requestInit } = options;
+  const { params, token, headers, body, baseUrl, ...requestInit } = options;
   const requestHeaders = new Headers(headers);
 
   if (!requestHeaders.has('Accept')) {
@@ -107,7 +149,7 @@ async function request<T>(endpoint: string, options: ApiRequestOptions = {}): Pr
     requestHeaders.set('Content-Type', 'application/json');
   }
 
-  const response = await fetch(apiUrl(endpoint, params), {
+  const response = await fetch(apiUrl(endpoint, params, baseUrl), {
     ...requestInit,
     headers: requestHeaders,
     body: buildBody(body),
@@ -153,6 +195,8 @@ export interface AnalyzeRequest {
   ledger_overrides?: Record<string, string>;
   protocol_version?: number;
   enable_experimental?: boolean;
+  /** Target network id (e.g. `testnet`, `futurenet`). */
+  network?: string;
 }
 
 export interface AnalyzeWasmRequest {
@@ -163,12 +207,69 @@ export interface AnalyzeWasmRequest {
   enable_experimental?: boolean;
 }
 
+import { simulationQueueManager } from './requestQueue';
+
 export const analyzeService = {
   analyze(req: AnalyzeRequest, token?: string): Promise<AnalyzeResponse> {
-    return apiClient.post<AnalyzeResponse>('/analyze', req, { token });
+    return simulationQueueManager.enqueue(() =>
+      apiClient.post<AnalyzeResponse>('/analyze', req, { token }),
+    );
   },
 
   analyzeWasm(req: AnalyzeWasmRequest, token?: string): Promise<AnalyzeResponse> {
-    return apiClient.post<AnalyzeResponse>('/analyze/wasm', req, { token });
+    return simulationQueueManager.enqueue(() =>
+      apiClient.post<AnalyzeResponse>('/analyze/wasm', req, { token }),
+    );
+  },
+};
+
+export interface NetworkAnalysisOutcome {
+  networkId: string;
+  report?: AnalyzeResponse;
+  error?: string;
+}
+
+/**
+ * Run the same simulation on several networks at once (#1282). Requests go
+ * out in parallel; one network failing does not hide the others' results.
+ */
+export async function analyzeAcrossNetworks(
+  req: Omit<AnalyzeRequest, 'network'>,
+  networkIds: string[],
+  token?: string,
+): Promise<NetworkAnalysisOutcome[]> {
+  const settled = await Promise.allSettled(
+    networkIds.map((networkId) =>
+      apiClient.post<AnalyzeResponse>(
+        '/analyze',
+        { ...req, network: networkId },
+        { token, baseUrl: getNetworkApiBaseUrl(networkId) },
+      ),
+    ),
+  );
+
+  return settled.map((outcome, i) =>
+    outcome.status === 'fulfilled'
+      ? { networkId: networkIds[i], report: outcome.value }
+      : {
+          networkId: networkIds[i],
+          error:
+            outcome.reason instanceof Error
+              ? outcome.reason.message
+              : 'Simulation failed',
+        },
+  );
+}
+
+/**
+ * Persisted simulation results (#1286). The server stores every completed
+ * simulation and returns its id as `simulation_id`; this fetches one back.
+ */
+export const simulationService = {
+  get(simulationId: string, token?: string): Promise<unknown> {
+    return apiClient.get<unknown>(
+      `/api/simulations/${encodeURIComponent(simulationId)}`,
+      { token },
+    );
   },
 };

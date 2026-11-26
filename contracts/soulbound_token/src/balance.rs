@@ -2,6 +2,19 @@ use crate::storage_types::DataKey;
 use soroban_sdk::{Address, Env};
 
 pub fn read_balance(e: &Env, addr: Address) -> i128 {
+    if let Some(token_id) = e
+        .storage()
+        .persistent()
+        .get::<_, u64>(&DataKey::OwnerToken(addr.clone()))
+    {
+        if e.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::TokenRevoked(token_id))
+            .unwrap_or(false)
+        {
+            return 0;
+        }
+    }
     let key = DataKey::Balance(addr);
     e.storage()
         .persistent()

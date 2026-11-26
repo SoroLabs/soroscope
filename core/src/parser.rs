@@ -1,9 +1,11 @@
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use soroban_sdk::xdr::{
-    Hash, Limits, ScAddress, ScMap, ScMapEntry, ScString, ScSymbol, ScVal, ScVec, StringM, Uint256,
-    VecM, WriteXdr,
+    Hash, Int128Parts, Limits, ScAddress, ScMap, ScMapEntry, ScString, ScSymbol, ScVal, ScVec,
+    StringM, Uint256, VecM, WriteXdr,
 };
 use stellar_strkey::Strkey;
+use stellar_xdr::curr::{ScEnvMetaEntry, ScSpecEntry, ScSpecTypeDef};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -142,7 +144,7 @@ impl ArgParser {
         }
     }
 
-    fn parse_address(address: &str) -> Result<ScAddress, String> {
+    pub fn parse_address(address: &str) -> Result<ScAddress, String> {
         let strkey = Strkey::from_string(address).map_err(|e| e.to_string())?;
 
         match strkey {
@@ -155,6 +157,825 @@ impl ArgParser {
             _ => Err("Unsupported address type".to_string()),
         }
     }
+
+    /// Parse a decimal integer as a full 128-bit Soroban integer.
+    ///
+    /// JSON numbers cannot carry an `i128`, and a bare integer otherwise parses
+    /// as `i64`/`u64`. Anything that needs the wide type — SAC `transfer`
+    /// amounts are the motivating case — spells it `"i128:<decimal>"`.
+    pub fn parse_i128(text: &str) -> Result<ScVal, ParserError> {
+        let value: i128 = text.trim().parse().map_err(|e| ParserError::InvalidType {
+            location: "$".to_string(),
+            expected: "i128".to_string(),
+            found: format!("{text:?} ({e})"),
+        })?;
+        Ok(ScVal::I128(Int128Parts {
+            hi: (value >> 64) as i64,
+            lo: value as u64,
+        }))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract Bytecode Security Scanner (Issue #36)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How serious a scanner finding is.
+///
+/// Only [`Severity::Critical`] findings cause [`SecurityReport::verified`] to
+/// be `false`; everything else is advisory so operators can triage a contract
+/// without being blocked from deploying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// Informational only — no action required.
+    Info,
+    /// Suspicious but legal; worth a human look.
+    Warning,
+    /// Verification fails: the module is malformed or unsafe to execute.
+    Critical,
+}
+
+/// Machine-readable classification for a [`SecurityFinding`].
+///
+/// Kept separate from the human-readable `detail` string so callers can filter
+/// or alert on a stable identifier rather than matching on prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    /// The binary is not a valid WebAssembly module.
+    MalformedBinary,
+    /// A linear memory declares no maximum, so it can grow unbounded.
+    UnboundedMemoryGrowth,
+    /// A declared memory maximum exceeds the configured page budget.
+    ExcessiveMemoryLimit,
+    /// `memory.grow` is reachable in a function body.
+    DynamicMemoryGrowth,
+    /// Floating-point instructions are present (non-deterministic across hosts).
+    FloatingPointOperation,
+    /// The module exports no functions at all.
+    MissingExports,
+    /// An exported name does not look like a Soroban contract entry point.
+    NonStandardEntryPoint,
+    /// A `start` section runs code at instantiation time.
+    StartSectionPresent,
+    /// The module imports host functions outside the Soroban environment.
+    NonStandardImport,
+    /// The module declares a mutable global, i.e. cross-invocation state.
+    MutableGlobal,
+}
+
+/// A single issue discovered while scanning a WASM binary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityFinding {
+    /// Stable classification of the issue.
+    pub kind: FindingKind,
+    /// How serious the issue is.
+    pub severity: Severity,
+    /// Human-readable explanation, including offending names/values.
+    pub detail: String,
+}
+
+/// Result of scanning a contract's WASM bytecode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityReport {
+    /// `false` when at least one [`Severity::Critical`] finding was recorded.
+    pub verified: bool,
+    /// Every finding, ordered most severe first.
+    pub findings: Vec<SecurityFinding>,
+    /// Names of every exported function, in declaration order.
+    pub exported_functions: Vec<String>,
+    /// Total number of linear memories declared or imported.
+    pub memory_count: usize,
+}
+
+impl SecurityReport {
+    /// Highest severity across all findings, or `None` for a clean report.
+    pub fn max_severity(&self) -> Option<Severity> {
+        self.findings.iter().map(|f| f.severity).max()
+    }
+
+    /// Every finding matching `kind`.
+    pub fn findings_of(&self, kind: FindingKind) -> impl Iterator<Item = &SecurityFinding> {
+        self.findings.iter().filter(move |f| f.kind == kind)
+    }
+}
+
+/// Tunable thresholds for [`WasmSecurityScanner`].
+#[derive(Debug, Clone)]
+pub struct ScannerConfig {
+    /// Largest acceptable declared memory maximum, in 64 KiB WASM pages.
+    ///
+    /// Soroban contracts are expected to stay well inside this; the default of
+    /// 512 pages (32 MiB) is generous while still catching absurd requests.
+    pub max_memory_pages: u64,
+    /// Treat floating-point instructions as a finding.
+    ///
+    /// Float results can differ across hosts, so deterministic execution
+    /// environments generally want this on.
+    pub flag_floating_point: bool,
+    /// Import module names considered standard for Soroban contracts.
+    pub allowed_import_modules: Vec<String>,
+}
+
+impl Default for ScannerConfig {
+    fn default() -> Self {
+        Self {
+            max_memory_pages: 512,
+            flag_floating_point: true,
+            // Soroban host functions are grouped into single-letter modules
+            // ("x" for context, "b" for buf, "m" for map, and so on); "env"
+            // is the catch-all used by the SDK's generated glue.
+            allowed_import_modules: [
+                "env", "x", "b", "m", "v", "i", "c", "a", "l", "d", "t",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        }
+    }
+}
+
+/// Static safety checker for Soroban contract WASM binaries.
+///
+/// The scanner is deliberately conservative: it performs a structural pass over
+/// the module (validating it first, then walking sections and function bodies)
+/// and reports anything that would make execution non-deterministic, unbounded,
+/// or otherwise surprising. It never executes the module.
+///
+/// # Example
+///
+/// ```
+/// use soroscope_core::parser::WasmSecurityScanner;
+///
+/// let wasm_bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+/// let report = WasmSecurityScanner::new().scan(wasm_bytes);
+/// if !report.verified {
+///     eprintln!("rejected: {:?}", report.findings);
+/// }
+/// ```
+pub struct WasmSecurityScanner {
+    config: ScannerConfig,
+}
+
+impl Default for WasmSecurityScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WasmSecurityScanner {
+    /// Scanner with [`ScannerConfig::default`] thresholds.
+    pub fn new() -> Self {
+        Self {
+            config: ScannerConfig::default(),
+        }
+    }
+
+    /// Scanner with caller-supplied thresholds.
+    pub fn with_config(config: ScannerConfig) -> Self {
+        Self { config }
+    }
+
+    /// Scan `wasm_bytes` and return a [`SecurityReport`].
+    ///
+    /// A malformed binary short-circuits: validation failure is reported as a
+    /// single [`FindingKind::MalformedBinary`] critical finding, because no
+    /// further structural claim about the module would be trustworthy.
+    pub fn scan(&self, wasm_bytes: &[u8]) -> SecurityReport {
+        // Validate first. Everything downstream assumes a well-formed module,
+        // and wasmparser's streaming reader would otherwise happily report
+        // sections from a truncated or corrupt binary.
+        let mut validator = wasmparser::Validator::new();
+        if let Err(e) = validator.validate_all(wasm_bytes) {
+            return SecurityReport {
+                verified: false,
+                findings: vec![SecurityFinding {
+                    kind: FindingKind::MalformedBinary,
+                    severity: Severity::Critical,
+                    detail: format!("WASM validation failed: {e}"),
+                }],
+                exported_functions: Vec::new(),
+                memory_count: 0,
+            };
+        }
+
+        let mut findings: Vec<SecurityFinding> = Vec::new();
+        let mut exported_functions: Vec<String> = Vec::new();
+        let mut memory_count = 0usize;
+        // Float and memory.grow findings are aggregated so a contract with a
+        // thousand float ops yields one finding, not a thousand.
+        let mut float_ops = 0usize;
+        let mut memory_grow_sites = 0usize;
+
+        for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
+            // Validation already succeeded, so a parse error here would be a
+            // wasmparser inconsistency rather than bad input; treat it as
+            // malformed anyway rather than silently continuing.
+            let payload = match payload {
+                Ok(p) => p,
+                Err(e) => {
+                    findings.push(SecurityFinding {
+                        kind: FindingKind::MalformedBinary,
+                        severity: Severity::Critical,
+                        detail: format!("WASM parse error after validation: {e}"),
+                    });
+                    break;
+                }
+            };
+
+            match payload {
+                wasmparser::Payload::MemorySection(reader) => {
+                    for mem in reader.into_iter().flatten() {
+                        memory_count += 1;
+                        self.check_memory(&mem, &mut findings);
+                    }
+                }
+                wasmparser::Payload::ImportSection(reader) => {
+                    for import in reader.into_iter().flatten() {
+                        if let wasmparser::TypeRef::Memory(mem) = import.ty {
+                            memory_count += 1;
+                            self.check_memory(&mem, &mut findings);
+                        }
+                        if !self
+                            .config
+                            .allowed_import_modules
+                            .iter()
+                            .any(|m| m == import.module)
+                        {
+                            findings.push(SecurityFinding {
+                                kind: FindingKind::NonStandardImport,
+                                severity: Severity::Warning,
+                                detail: format!(
+                                    "Import `{}::{}` is outside the standard Soroban host modules",
+                                    import.module, import.name
+                                ),
+                            });
+                        }
+                    }
+                }
+                wasmparser::Payload::ExportSection(reader) => {
+                    for export in reader.into_iter().flatten() {
+                        if export.kind == wasmparser::ExternalKind::Func {
+                            exported_functions.push(export.name.to_string());
+                        }
+                    }
+                }
+                wasmparser::Payload::GlobalSection(reader) => {
+                    for global in reader.into_iter().flatten() {
+                        if global.ty.mutable {
+                            findings.push(SecurityFinding {
+                                kind: FindingKind::MutableGlobal,
+                                severity: Severity::Info,
+                                detail:
+                                    "Module declares a mutable global; state is not persisted \
+                                     across invocations and may indicate a porting mistake"
+                                        .to_string(),
+                            });
+                        }
+                    }
+                }
+                wasmparser::Payload::StartSection { func, .. } => {
+                    findings.push(SecurityFinding {
+                        kind: FindingKind::StartSectionPresent,
+                        severity: Severity::Warning,
+                        detail: format!(
+                            "Module declares a start section (function {func}) that runs \
+                             automatically at instantiation"
+                        ),
+                    });
+                }
+                wasmparser::Payload::CodeSectionEntry(body) => {
+                    self.scan_body(&body, &mut float_ops, &mut memory_grow_sites);
+                }
+                _ => {}
+            }
+        }
+
+        if self.config.flag_floating_point && float_ops > 0 {
+            findings.push(SecurityFinding {
+                kind: FindingKind::FloatingPointOperation,
+                severity: Severity::Critical,
+                detail: format!(
+                    "Module contains {float_ops} floating-point instruction(s); float results \
+                     are not guaranteed deterministic across hosts and Soroban rejects them"
+                ),
+            });
+        }
+
+        if memory_grow_sites > 0 {
+            findings.push(SecurityFinding {
+                kind: FindingKind::DynamicMemoryGrowth,
+                severity: Severity::Warning,
+                detail: format!(
+                    "Module calls `memory.grow` at {memory_grow_sites} site(s); memory use \
+                     is input-dependent and may exhaust the host budget"
+                ),
+            });
+        }
+
+        self.check_exports(&exported_functions, &mut findings);
+
+        // Most severe first so callers can render or truncate by priority.
+        findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+
+        SecurityReport {
+            verified: !findings.iter().any(|f| f.severity == Severity::Critical),
+            findings,
+            exported_functions,
+            memory_count,
+        }
+    }
+
+    /// Flag a memory whose maximum is absent or larger than the budget.
+    fn check_memory(&self, mem: &wasmparser::MemoryType, findings: &mut Vec<SecurityFinding>) {
+        match mem.maximum {
+            None => findings.push(SecurityFinding {
+                kind: FindingKind::UnboundedMemoryGrowth,
+                severity: Severity::Critical,
+                detail: format!(
+                    "Linear memory declares no maximum (initial {} pages); it can grow \
+                     until the host budget is exhausted",
+                    mem.initial
+                ),
+            }),
+            Some(max) if max > self.config.max_memory_pages => {
+                findings.push(SecurityFinding {
+                    kind: FindingKind::ExcessiveMemoryLimit,
+                    severity: Severity::Warning,
+                    detail: format!(
+                        "Linear memory maximum of {} pages exceeds the {}-page budget",
+                        max, self.config.max_memory_pages
+                    ),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Count float instructions and `memory.grow` sites in one function body.
+    ///
+    /// Errors while reading the body are ignored: validation has already
+    /// passed, so a failure here cannot indicate malformed input, and skipping
+    /// a body only makes the scan more permissive rather than unsound.
+    fn scan_body(
+        &self,
+        body: &wasmparser::FunctionBody<'_>,
+        float_ops: &mut usize,
+        memory_grow_sites: &mut usize,
+    ) {
+        let reader = match body.get_operators_reader() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        for op in reader.into_iter().flatten() {
+            if matches!(op, wasmparser::Operator::MemoryGrow { .. }) {
+                *memory_grow_sites += 1;
+            }
+            if self.config.flag_floating_point && Self::is_float_op(&op) {
+                *float_ops += 1;
+            }
+        }
+    }
+
+    /// Whether `op` is a floating-point instruction.
+    ///
+    /// Matching on the debug name keeps this robust across wasmparser releases
+    /// that add new float opcodes; every float instruction in the spec is
+    /// prefixed `F32`/`F64` (or `F32x4`/`F64x2` for SIMD).
+    fn is_float_op(op: &wasmparser::Operator<'_>) -> bool {
+        let name = format!("{op:?}");
+        name.starts_with("F32") || name.starts_with("F64")
+    }
+
+    /// Flag missing exports and names that are not valid Soroban entry points.
+    fn check_exports(&self, exports: &[String], findings: &mut Vec<SecurityFinding>) {
+        if exports.is_empty() {
+            findings.push(SecurityFinding {
+                kind: FindingKind::MissingExports,
+                severity: Severity::Critical,
+                detail: "Module exports no functions; it has no callable contract entry point"
+                    .to_string(),
+            });
+            return;
+        }
+
+        for name in exports {
+            if !Self::is_standard_entry_point(name) {
+                findings.push(SecurityFinding {
+                    kind: FindingKind::NonStandardEntryPoint,
+                    severity: Severity::Warning,
+                    detail: format!(
+                        "Exported function `{name}` is not a valid Soroban entry point name \
+                         (expected a 1-32 character symbol of [a-zA-Z0-9_] not starting with \
+                         a digit)"
+                    ),
+                });
+            }
+        }
+    }
+
+    /// Whether `name` is a legal Soroban contract function symbol.
+    ///
+    /// Soroban identifiers are `ScSymbol`s: 1–32 characters drawn from
+    /// `[a-zA-Z0-9_]` and never leading with a digit. Reserved underscore-
+    /// prefixed names emitted by the toolchain (`_start`, `__data_end`) are
+    /// allowed through so ordinary SDK output does not trip the check.
+    fn is_standard_entry_point(name: &str) -> bool {
+        if name.starts_with('_') {
+            return true;
+        }
+        if name.is_empty() || name.len() > 32 {
+            return false;
+        }
+        if name.starts_with(|c: char| c.is_ascii_digit()) {
+            return false;
+        }
+        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract Spec & Env Meta Validation (Issue #1013)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const MAX_SUPPORTED_ENV_VERSION: u64 = 22;
+
+#[derive(Error, Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub enum SpecValidationError {
+    #[error("No contract spec section found in WASM module")]
+    NoSpec,
+    #[error("Truncated or malformed {section} section at byte offset {offset}")]
+    TruncatedSection { section: String, offset: usize },
+    #[error("Mismatched env meta interface version {version} in {section} section at byte offset {offset}")]
+    MismatchedEnvVersion {
+        section: String,
+        offset: usize,
+        version: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ArgumentDescriptor {
+    Supported {
+        name: String,
+        type_name: String,
+    },
+    Unsupported {
+        name: String,
+        function: String,
+        type_name: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionSpec {
+    pub name: String,
+    pub arguments: Vec<ArgumentDescriptor>,
+    pub env_meta_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecAnalysisResult {
+    pub env_meta_version: Option<u64>,
+    pub functions: Vec<FunctionSpec>,
+    pub unsupported_types_count: usize,
+}
+
+pub struct ContractSpecValidator;
+
+impl ContractSpecValidator {
+    pub fn parse_and_validate(wasm_bytes: &[u8]) -> Result<SpecAnalysisResult, SpecValidationError> {
+        let mut spec_data: Option<(Vec<u8>, usize)> = None;
+        let mut env_meta_version: Option<(u64, usize)> = None;
+
+        for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
+            match payload {
+                Ok(wasmparser::Payload::CustomSection(custom)) => {
+                    let name = custom.name();
+                    if name == "contractspecv0" {
+                        spec_data = Some((custom.data().to_vec(), custom.data_offset()));
+                    } else if name == "contractenvmetav0" {
+                        let data = custom.data();
+                        let mut cursor = std::io::Cursor::new(data);
+                        match ScEnvMetaEntry::read_xdr(&mut cursor, Limits::none()) {
+                            Ok(entry) => match entry {
+                                ScEnvMetaEntry::InterfaceVersion(ver) => {
+                                    if ver > MAX_SUPPORTED_ENV_VERSION {
+                                        return Err(SpecValidationError::MismatchedEnvVersion {
+                                            section: "contractenvmetav0".to_string(),
+                                            offset: custom.data_offset(),
+                                            version: ver,
+                                        });
+                                    }
+                                    env_meta_version = Some((ver, custom.data_offset()));
+                                }
+                            },
+                            Err(_) => {
+                                return Err(SpecValidationError::TruncatedSection {
+                                    section: "contractenvmetav0".to_string(),
+                                    offset: custom.data_offset(),
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+                _ => {}
+            }
+        }
+
+        let (data, spec_offset) = match spec_data {
+            Some(s) => s,
+            None => return Err(SpecValidationError::NoSpec),
+        };
+
+        let mut cursor = std::io::Cursor::new(&data);
+        let mut entries = Vec::new();
+
+        while (cursor.position() as usize) < data.len() {
+            let offset_before = cursor.position() as usize;
+            match ScSpecEntry::read_xdr(&mut cursor, Limits::none()) {
+                Ok(entry) => entries.push(entry),
+                Err(_) => {
+                    return Err(SpecValidationError::TruncatedSection {
+                        section: "contractspecv0".to_string(),
+                        offset: spec_offset + offset_before,
+                    });
+                }
+            }
+        }
+
+        let mut functions = Vec::new();
+        let mut unsupported_types_count = 0;
+        let env_ver = env_meta_version.map(|(v, _)| v);
+
+        for entry in entries {
+            if let ScSpecEntry::Function(func) = entry {
+                let func_name = func.name.to_string_lossy();
+                let mut arguments = Vec::new();
+
+                for input in func.inputs.iter() {
+                    let arg_name = input.name.to_string_lossy();
+                    let is_supp = Self::is_type_supported(&input.type_);
+                    let type_name = Self::type_to_string(&input.type_);
+
+                    if is_supp {
+                        arguments.push(ArgumentDescriptor::Supported {
+                            name: arg_name,
+                            type_name,
+                        });
+                    } else {
+                        unsupported_types_count += 1;
+                        arguments.push(ArgumentDescriptor::Unsupported {
+                            name: arg_name,
+                            function: func_name.clone(),
+                            type_name,
+                        });
+                    }
+                }
+
+                functions.push(FunctionSpec {
+                    name: func_name,
+                    arguments,
+                    env_meta_version: env_ver,
+                });
+            }
+        }
+
+        Ok(SpecAnalysisResult {
+            env_meta_version: env_ver,
+            functions,
+            unsupported_types_count,
+        })
+    }
+
+    fn is_type_supported(type_def: &ScSpecTypeDef) -> bool {
+        match type_def {
+            ScSpecTypeDef::U32
+            | ScSpecTypeDef::I32
+            | ScSpecTypeDef::U64
+            | ScSpecTypeDef::I64
+            | ScSpecTypeDef::U128
+            | ScSpecTypeDef::I128
+            | ScSpecTypeDef::U256
+            | ScSpecTypeDef::I256
+            | ScSpecTypeDef::Bool
+            | ScSpecTypeDef::Void
+            | ScSpecTypeDef::String
+            | ScSpecTypeDef::Symbol
+            | ScSpecTypeDef::Bytes
+            | ScSpecTypeDef::Address => true,
+            ScSpecTypeDef::Option(opt) => Self::is_type_supported(&opt.value_type),
+            ScSpecTypeDef::Vec(vec) => Self::is_type_supported(&vec.element_type),
+            ScSpecTypeDef::Map(map) => {
+                Self::is_type_supported(&map.key_type) && Self::is_type_supported(&map.value_type)
+            }
+            ScSpecTypeDef::Tuple(tuple) => tuple.type_vec.iter().all(Self::is_type_supported),
+            _ => false,
+        }
+    }
+
+    fn type_to_string(type_def: &ScSpecTypeDef) -> String {
+        match type_def {
+            ScSpecTypeDef::U32 => "u32".to_string(),
+            ScSpecTypeDef::I32 => "i32".to_string(),
+            ScSpecTypeDef::U64 => "u64".to_string(),
+            ScSpecTypeDef::I64 => "i64".to_string(),
+            ScSpecTypeDef::U128 => "u128".to_string(),
+            ScSpecTypeDef::I128 => "i128".to_string(),
+            ScSpecTypeDef::U256 => "u256".to_string(),
+            ScSpecTypeDef::I256 => "i256".to_string(),
+            ScSpecTypeDef::Bool => "bool".to_string(),
+            ScSpecTypeDef::Void => "void".to_string(),
+            ScSpecTypeDef::String => "string".to_string(),
+            ScSpecTypeDef::Symbol => "symbol".to_string(),
+            ScSpecTypeDef::Bytes => "bytes".to_string(),
+            ScSpecTypeDef::Address => "address".to_string(),
+            ScSpecTypeDef::Option(opt) => format!("Option<{}>", Self::type_to_string(&opt.value_type)),
+            ScSpecTypeDef::Vec(vec) => format!("Vec<{}>", Self::type_to_string(&vec.element_type)),
+            ScSpecTypeDef::Map(map) => format!(
+                "Map<{}, {}>",
+                Self::type_to_string(&map.key_type),
+                Self::type_to_string(&map.value_type)
+            ),
+            ScSpecTypeDef::Tuple(_) => "Tuple".to_string(),
+            ScSpecTypeDef::UdtUnionCaseV0(_) => "udt_union".to_string(),
+            ScSpecTypeDef::UdtStructCaseV0(_) => "udt_struct".to_string(),
+            _ => "unsupported_udt".to_string(),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Upload validation (Issue #1400)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The 8-byte header every Soroban WASM module starts with: the `\0asm` magic
+/// followed by binary format version 1 (little-endian).
+pub const WASM_HEADER: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+
+/// Default maximum size of an uploaded WASM binary (2 MB).
+pub const DEFAULT_MAX_WASM_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+/// Largest custom section accepted in an upload (512 KB). Custom sections are
+/// opaque to the host, so an oversized one is the usual shape of a
+/// decompression bomb hiding inside an otherwise small module.
+pub const MAX_CUSTOM_SECTION_BYTES: usize = 512 * 1024;
+
+/// Why an uploaded WASM binary was rejected.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum UploadValidationError {
+    /// The upload exceeded the configured byte limit (HTTP 413).
+    #[error("WASM upload exceeds the {limit} byte limit")]
+    TooLarge { limit: usize },
+
+    /// The first bytes are not `\0asm` + version 1 (HTTP 422).
+    #[error("Invalid WASM header: expected \\0asm magic bytes followed by version 1")]
+    InvalidHeader,
+
+    /// A custom section is larger than [`MAX_CUSTOM_SECTION_BYTES`] (HTTP 422).
+    #[error("Custom section '{name}' is {size} bytes, exceeding the {limit} byte limit")]
+    CustomSectionTooLarge {
+        name: String,
+        size: usize,
+        limit: usize,
+    },
+
+    /// The module could not be parsed (HTTP 422).
+    #[error("Malformed WASM module: {0}")]
+    Malformed(String),
+
+    /// The upload body itself could not be read (HTTP 400).
+    #[error("Failed to read WASM upload: {0}")]
+    ReadFailed(String),
+}
+
+/// Environment variable overriding the per-file WASM upload limit, in bytes.
+pub const MAX_WASM_UPLOAD_BYTES_ENV: &str = "SOROSCOPE_MAX_WASM_UPLOAD_BYTES";
+
+/// The configured per-file WASM upload limit: `SOROSCOPE_MAX_WASM_UPLOAD_BYTES`
+/// when set to a positive integer, otherwise [`DEFAULT_MAX_WASM_UPLOAD_BYTES`].
+pub fn max_wasm_upload_bytes() -> usize {
+    std::env::var(MAX_WASM_UPLOAD_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_WASM_UPLOAD_BYTES)
+}
+
+/// Request body limit for WASM upload routes. Leaves room for two raw files
+/// (`/analyze/compare`) or one base64-encoded file (`/analyze/wasm`) plus the
+/// form / JSON envelope; anything beyond it is rejected with HTTP 413 while
+/// the body is still streaming.
+pub fn upload_body_limit() -> axum::extract::DefaultBodyLimit {
+    axum::extract::DefaultBodyLimit::max(max_wasm_upload_bytes() * 3 + 64 * 1024)
+}
+
+/// Stream a multipart file field through a [`StreamingWasmValidator`], so a
+/// non-WASM upload fails on its first chunk and an oversized one stops at the
+/// limit instead of being buffered in full.
+pub async fn read_wasm_upload(
+    mut field: axum::extract::multipart::Field<'_>,
+    limit: usize,
+) -> Result<Vec<u8>, UploadValidationError> {
+    let mut validator = StreamingWasmValidator::new(limit);
+    loop {
+        match field.chunk().await {
+            Ok(Some(chunk)) => validator.push(&chunk)?,
+            Ok(None) => break,
+            Err(e) if e.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE => {
+                return Err(UploadValidationError::TooLarge { limit });
+            }
+            Err(e) => return Err(UploadValidationError::ReadFailed(e.to_string())),
+        }
+    }
+    validator.finish()
+}
+
+/// Incremental validator for WASM uploads.
+///
+/// Feed body chunks to [`push`](Self::push) as they arrive. The header is
+/// checked as soon as enough bytes are available — normally on the first
+/// chunk — and the running size is checked *before* each chunk is buffered,
+/// so neither a non-WASM payload nor an oversized one is ever fully read into
+/// memory.
+#[derive(Debug)]
+pub struct StreamingWasmValidator {
+    limit: usize,
+    buffer: Vec<u8>,
+}
+
+impl StreamingWasmValidator {
+    /// Create a validator that accepts at most `limit` bytes.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Accept the next chunk of the upload.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<(), UploadValidationError> {
+        if self.buffer.len() + chunk.len() > self.limit {
+            return Err(UploadValidationError::TooLarge { limit: self.limit });
+        }
+
+        // Compare whatever part of the header this chunk covers, so a bad
+        // payload fails on its first chunk even when that chunk is short.
+        let start = self.buffer.len();
+        if start < WASM_HEADER.len() {
+            let end = (start + chunk.len()).min(WASM_HEADER.len());
+            if chunk[..end - start] != WASM_HEADER[start..end] {
+                return Err(UploadValidationError::InvalidHeader);
+            }
+        }
+
+        self.buffer.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// Finish the upload: the header must be complete and no custom section
+    /// may exceed [`MAX_CUSTOM_SECTION_BYTES`]. Returns the validated bytes.
+    pub fn finish(self) -> Result<Vec<u8>, UploadValidationError> {
+        if self.buffer.len() < WASM_HEADER.len() {
+            return Err(UploadValidationError::InvalidHeader);
+        }
+        check_custom_sections(&self.buffer, MAX_CUSTOM_SECTION_BYTES)?;
+        Ok(self.buffer)
+    }
+}
+
+/// Validate a WASM binary that is already in memory against `limit`, the
+/// header and the custom-section cap.
+pub fn validate_wasm_upload(bytes: &[u8], limit: usize) -> Result<(), UploadValidationError> {
+    if bytes.len() > limit {
+        return Err(UploadValidationError::TooLarge { limit });
+    }
+    if bytes.len() < WASM_HEADER.len() || bytes[..WASM_HEADER.len()] != WASM_HEADER {
+        return Err(UploadValidationError::InvalidHeader);
+    }
+    check_custom_sections(bytes, MAX_CUSTOM_SECTION_BYTES)
+}
+
+/// Reject any custom section larger than `limit` bytes.
+pub fn check_custom_sections(bytes: &[u8], limit: usize) -> Result<(), UploadValidationError> {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload {
+            Ok(wasmparser::Payload::CustomSection(custom)) if custom.data().len() > limit => {
+                return Err(UploadValidationError::CustomSectionTooLarge {
+                    name: custom.name().to_string(),
+                    size: custom.data().len(),
+                    limit,
+                });
+            }
+            Ok(_) => {}
+            Err(e) => return Err(UploadValidationError::Malformed(e.to_string())),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -241,5 +1062,543 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("$.a.b[1]"));
         assert!(err.contains("expected integer, found number 1.5"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Security scanner (Issue #36)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Assemble a minimal module from a WAT-like byte builder.
+    ///
+    /// Hand-rolling the binary keeps these tests free of a WAT dependency
+    /// while still exercising real section encoding.
+    fn wasm_module(sections: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut out = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        for (id, body) in sections {
+            out.push(*id);
+            leb128(body.len() as u64, &mut out);
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    fn leb128(mut v: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Type section with a single `() -> ()` function type.
+    fn type_section() -> (u8, Vec<u8>) {
+        (1, vec![0x01, 0x60, 0x00, 0x00])
+    }
+
+    /// Function section declaring one function of type 0.
+    fn func_section() -> (u8, Vec<u8>) {
+        (3, vec![0x01, 0x00])
+    }
+
+    /// Export section exporting function 0 under `name`.
+    fn export_section(name: &str) -> (u8, Vec<u8>) {
+        let mut body = vec![0x01];
+        body.push(name.len() as u8);
+        body.extend_from_slice(name.as_bytes());
+        body.push(0x00); // kind: func
+        body.push(0x00); // index 0
+        (7, body)
+    }
+
+    /// Code section with one body containing `ops` then `end`.
+    fn code_section(ops: &[u8]) -> (u8, Vec<u8>) {
+        let mut func = vec![0x00]; // zero local declarations
+        func.extend_from_slice(ops);
+        func.push(0x0b); // end
+        let mut body = vec![0x01];
+        leb128(func.len() as u64, &mut body);
+        body.extend_from_slice(&func);
+        (10, body)
+    }
+
+    /// Memory section: `limits` flag 0x00 = min only, 0x01 = min+max.
+    fn memory_section(min: u64, max: Option<u64>) -> (u8, Vec<u8>) {
+        let mut body = vec![0x01];
+        match max {
+            None => {
+                body.push(0x00);
+                leb128(min, &mut body);
+            }
+            Some(m) => {
+                body.push(0x01);
+                leb128(min, &mut body);
+                leb128(m, &mut body);
+            }
+        }
+        (5, body)
+    }
+
+    /// A well-formed contract: bounded memory, integer-only, one good export.
+    pub fn clean_module() -> Vec<u8> {
+        wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("transfer"),
+            code_section(&[]),
+        ])
+    }
+
+    pub fn clean_module_with_custom(custom: (u8, Vec<u8>)) -> Vec<u8> {
+        wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("transfer"),
+            custom,
+            code_section(&[]),
+        ])
+    }
+
+    #[test]
+    fn scanner_accepts_clean_module() {
+        let report = WasmSecurityScanner::new().scan(&clean_module());
+        assert!(
+            report.verified,
+            "clean module should verify, findings: {:?}",
+            report.findings
+        );
+        assert_eq!(report.exported_functions, vec!["transfer".to_string()]);
+        assert_eq!(report.memory_count, 1);
+    }
+
+    #[test]
+    fn scanner_rejects_malformed_binary() {
+        // Valid magic, truncated body.
+        let bad = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0xff];
+        let report = WasmSecurityScanner::new().scan(&bad);
+        assert!(!report.verified);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].kind, FindingKind::MalformedBinary);
+        assert_eq!(report.findings[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn scanner_rejects_non_wasm_bytes() {
+        let report = WasmSecurityScanner::new().scan(b"this is not wasm at all");
+        assert!(!report.verified);
+        assert_eq!(report.findings[0].kind, FindingKind::MalformedBinary);
+    }
+
+    #[test]
+    fn scanner_rejects_empty_input() {
+        let report = WasmSecurityScanner::new().scan(&[]);
+        assert!(!report.verified);
+        assert_eq!(report.findings[0].kind, FindingKind::MalformedBinary);
+    }
+
+    #[test]
+    fn scanner_flags_unbounded_memory() {
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, None),
+            export_section("go"),
+            code_section(&[]),
+        ]);
+        let report = WasmSecurityScanner::new().scan(&wasm);
+        assert!(!report.verified, "unbounded memory must fail verification");
+        assert_eq!(
+            report
+                .findings_of(FindingKind::UnboundedMemoryGrowth)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn scanner_warns_on_excessive_memory_maximum() {
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(4096)),
+            export_section("go"),
+            code_section(&[]),
+        ]);
+        let report = WasmSecurityScanner::new().scan(&wasm);
+        // Warning only: the module is still bounded, so it verifies.
+        assert!(report.verified);
+        assert_eq!(
+            report.findings_of(FindingKind::ExcessiveMemoryLimit).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn scanner_flags_floating_point_operations() {
+        // f64.const 1.0; drop
+        let mut ops = vec![0x44];
+        ops.extend_from_slice(&1.0f64.to_le_bytes());
+        ops.push(0x1a); // drop
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("calc"),
+            code_section(&ops),
+        ]);
+        let report = WasmSecurityScanner::new().scan(&wasm);
+        assert!(!report.verified, "float ops must fail verification");
+        assert_eq!(
+            report
+                .findings_of(FindingKind::FloatingPointOperation)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn scanner_allows_floats_when_disabled() {
+        let mut ops = vec![0x44];
+        ops.extend_from_slice(&1.0f64.to_le_bytes());
+        ops.push(0x1a);
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("calc"),
+            code_section(&ops),
+        ]);
+        let config = ScannerConfig {
+            flag_floating_point: false,
+            ..ScannerConfig::default()
+        };
+        let report = WasmSecurityScanner::with_config(config).scan(&wasm);
+        assert!(report.verified);
+        assert_eq!(
+            report
+                .findings_of(FindingKind::FloatingPointOperation)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn scanner_warns_on_dynamic_memory_growth() {
+        // i32.const 1; memory.grow 0; drop
+        let ops = vec![0x41, 0x01, 0x40, 0x00, 0x1a];
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("grow"),
+            code_section(&ops),
+        ]);
+        let report = WasmSecurityScanner::new().scan(&wasm);
+        // memory.grow alone is a warning, not a hard failure.
+        assert!(report.verified);
+        assert_eq!(
+            report.findings_of(FindingKind::DynamicMemoryGrowth).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn scanner_flags_missing_exports() {
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            code_section(&[]),
+        ]);
+        let report = WasmSecurityScanner::new().scan(&wasm);
+        assert!(!report.verified, "a module with no exports must fail");
+        assert_eq!(report.findings_of(FindingKind::MissingExports).count(), 1);
+    }
+
+    #[test]
+    fn scanner_warns_on_non_standard_entry_point() {
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("bad-name!"),
+            code_section(&[]),
+        ]);
+        let report = WasmSecurityScanner::new().scan(&wasm);
+        assert!(report.verified, "a bad name is advisory, not fatal");
+        assert_eq!(
+            report
+                .findings_of(FindingKind::NonStandardEntryPoint)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn scanner_allows_toolchain_reserved_exports() {
+        // Underscore-prefixed names come from the toolchain, not the contract
+        // author, so they must not be reported as non-standard.
+        assert!(WasmSecurityScanner::is_standard_entry_point("_start"));
+        assert!(WasmSecurityScanner::is_standard_entry_point("__data_end"));
+        assert!(WasmSecurityScanner::is_standard_entry_point("transfer"));
+        assert!(WasmSecurityScanner::is_standard_entry_point("set_admin"));
+
+        assert!(!WasmSecurityScanner::is_standard_entry_point("has space"));
+        assert!(!WasmSecurityScanner::is_standard_entry_point("1leading"));
+        assert!(!WasmSecurityScanner::is_standard_entry_point(""));
+        assert!(!WasmSecurityScanner::is_standard_entry_point(
+            &"x".repeat(33)
+        ));
+        assert!(WasmSecurityScanner::is_standard_entry_point(&"x".repeat(32)));
+    }
+
+    #[test]
+    fn findings_are_sorted_most_severe_first() {
+        // Unbounded memory (critical) + odd export name (warning).
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, None),
+            export_section("bad-name!"),
+            code_section(&[]),
+        ]);
+        let report = WasmSecurityScanner::new().scan(&wasm);
+        assert!(report.findings.len() >= 2);
+        for pair in report.findings.windows(2) {
+            assert!(
+                pair[0].severity >= pair[1].severity,
+                "findings must be ordered most severe first"
+            );
+        }
+        assert_eq!(report.max_severity(), Some(Severity::Critical));
+    }
+
+    #[test]
+    fn report_serialises_to_json() {
+        let report = WasmSecurityScanner::new().scan(&clean_module());
+        let json = serde_json::to_string(&report).expect("report should serialise");
+        assert!(json.contains("\"verified\":true"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Contract Spec & Env Meta Validation tests (Issue #1013)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn spec_validation_returns_nospec_when_section_missing() {
+        let wasm = clean_module();
+        let res = ContractSpecValidator::parse_and_validate(&wasm);
+        assert_eq!(res.unwrap_err(), SpecValidationError::NoSpec);
+    }
+
+    #[test]
+    fn spec_validation_returns_truncated_section() {
+        let section_data = vec![0x00, 0x01, 0xff]; // malformed XDR
+        let mut body = vec!["contractspecv0".len() as u8];
+        body.extend_from_slice("contractspecv0".as_bytes());
+        body.extend_from_slice(&section_data);
+        let custom_section = (0u8, body);
+
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("transfer"),
+            custom_section,
+            code_section(&[]),
+        ]);
+
+        let res = ContractSpecValidator::parse_and_validate(&wasm);
+        assert!(matches!(res.unwrap_err(), SpecValidationError::TruncatedSection { .. }));
+    }
+
+    #[test]
+    fn spec_validation_returns_mismatched_env_version() {
+        use soroban_sdk::xdr::Limits;
+        let env_meta = ScEnvMetaEntry::InterfaceVersion(999);
+        let env_bytes = env_meta.to_xdr(Limits::none()).unwrap();
+
+        let mut body = vec!["contractenvmetav0".len() as u8];
+        body.extend_from_slice("contractenvmetav0".as_bytes());
+        body.extend_from_slice(&env_bytes);
+        let env_section = (0u8, body);
+
+        let mut spec_body = vec!["contractspecv0".len() as u8];
+        spec_body.extend_from_slice("contractspecv0".as_bytes());
+        let spec_section = (0u8, spec_body);
+
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("transfer"),
+            env_section,
+            spec_section,
+            code_section(&[]),
+        ]);
+
+        let res = ContractSpecValidator::parse_and_validate(&wasm);
+        assert!(matches!(res.unwrap_err(), SpecValidationError::MismatchedEnvVersion { version: 999, .. }));
+    }
+
+    #[test]
+    fn spec_validation_inventory_supported_and_unsupported_types() {
+        use soroban_sdk::xdr::{
+            Limits, ScSpecFunctionV0, ScSpecFunctionInputV0, ScSpecTypeDef, StringM, VecM, WriteXdr,
+        };
+
+        let fn_entry = ScSpecEntry::Function(ScSpecFunctionV0 {
+            doc: StringM::default(),
+            name: "test_fn".try_into().unwrap(),
+            inputs: vec![
+                ScSpecFunctionInputV0 {
+                    doc: StringM::default(),
+                    name: "arg_u64".try_into().unwrap(),
+                    type_: ScSpecTypeDef::U64,
+                },
+                ScSpecFunctionInputV0 {
+                    doc: StringM::default(),
+                    name: "arg_unsupported".try_into().unwrap(),
+                    type_: ScSpecTypeDef::UdtUnionCaseV0(Box::new(soroban_sdk::xdr::ScSpecUdtUnionCaseV0::Tuple(
+                        soroban_sdk::xdr::ScSpecUdtUnionCaseTupleV0 {
+                            doc: StringM::default(),
+                            name: "Case".try_into().unwrap(),
+                            type_vec: VecM::default(),
+                        },
+                    ))),
+                },
+            ].try_into().unwrap(),
+            outputs: VecM::default(),
+        });
+
+        let spec_bytes = fn_entry.to_xdr(Limits::none()).unwrap();
+
+        let mut body = vec!["contractspecv0".len() as u8];
+        body.extend_from_slice("contractspecv0".as_bytes());
+        body.extend_from_slice(&spec_bytes);
+        let spec_section = (0u8, body);
+
+        let wasm = wasm_module(&[
+            type_section(),
+            func_section(),
+            memory_section(1, Some(16)),
+            export_section("test_fn"),
+            spec_section,
+            code_section(&[]),
+        ]);
+
+        let res = ContractSpecValidator::parse_and_validate(&wasm).unwrap();
+        assert_eq!(res.functions.len(), 1);
+        let func = &res.functions[0];
+        assert_eq!(func.name, "test_fn");
+        assert_eq!(func.arguments.len(), 2);
+        assert!(matches!(&func.arguments[0], ArgumentDescriptor::Supported { name, .. } if name == "arg_u64"));
+        assert!(matches!(&func.arguments[1], ArgumentDescriptor::Unsupported { name, function, .. } if name == "arg_unsupported" && function == "test_fn"));
+        assert_eq!(res.unsupported_types_count, 1);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Upload validation (Issue #1400)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn upload_validator_accepts_a_clean_module_in_chunks() {
+        let wasm = clean_module();
+        let mut validator = StreamingWasmValidator::new(DEFAULT_MAX_WASM_UPLOAD_BYTES);
+        for chunk in wasm.chunks(3) {
+            validator.push(chunk).unwrap();
+        }
+        assert_eq!(validator.finish().unwrap(), wasm);
+    }
+
+    #[test]
+    fn upload_validator_rejects_non_wasm_on_the_first_chunk() {
+        let mut validator = StreamingWasmValidator::new(DEFAULT_MAX_WASM_UPLOAD_BYTES);
+        assert_eq!(
+            validator.push(b"PK\x03\x04 not a wasm module"),
+            Err(UploadValidationError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn upload_validator_rejects_a_short_first_chunk_that_already_mismatches() {
+        let mut validator = StreamingWasmValidator::new(DEFAULT_MAX_WASM_UPLOAD_BYTES);
+        assert_eq!(
+            validator.push(&[0x00, 0x62]),
+            Err(UploadValidationError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn upload_validator_rejects_the_wrong_binary_version() {
+        let mut validator = StreamingWasmValidator::new(DEFAULT_MAX_WASM_UPLOAD_BYTES);
+        assert_eq!(
+            validator.push(&[0x00, 0x61, 0x73, 0x6d, 0x02, 0x00, 0x00, 0x00]),
+            Err(UploadValidationError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn upload_validator_rejects_oversized_payloads_before_buffering() {
+        let mut validator = StreamingWasmValidator::new(16);
+        validator.push(&WASM_HEADER).unwrap();
+        assert_eq!(
+            validator.push(&[0u8; 9]),
+            Err(UploadValidationError::TooLarge { limit: 16 })
+        );
+        assert_eq!(validator.buffer.len(), WASM_HEADER.len());
+    }
+
+    #[test]
+    fn upload_validator_rejects_a_truncated_header() {
+        let mut validator = StreamingWasmValidator::new(DEFAULT_MAX_WASM_UPLOAD_BYTES);
+        validator.push(&WASM_HEADER[..4]).unwrap();
+        assert_eq!(
+            validator.finish(),
+            Err(UploadValidationError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn upload_validator_rejects_an_oversized_custom_section() {
+        let name = b"bomb";
+        let mut body = vec![name.len() as u8];
+        body.extend_from_slice(name);
+        body.resize(body.len() + MAX_CUSTOM_SECTION_BYTES + 1, 0);
+        let wasm = clean_module_with_custom((0, body));
+
+        let mut validator = StreamingWasmValidator::new(DEFAULT_MAX_WASM_UPLOAD_BYTES);
+        validator.push(&wasm).unwrap();
+        assert_eq!(
+            validator.finish(),
+            Err(UploadValidationError::CustomSectionTooLarge {
+                name: "bomb".to_string(),
+                size: MAX_CUSTOM_SECTION_BYTES + 1,
+                limit: MAX_CUSTOM_SECTION_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_wasm_upload_checks_size_header_and_custom_sections() {
+        assert_eq!(
+            validate_wasm_upload(&clean_module(), DEFAULT_MAX_WASM_UPLOAD_BYTES),
+            Ok(())
+        );
+        assert_eq!(
+            validate_wasm_upload(&clean_module(), 8),
+            Err(UploadValidationError::TooLarge { limit: 8 })
+        );
+        assert_eq!(
+            validate_wasm_upload(b"not wasm", DEFAULT_MAX_WASM_UPLOAD_BYTES),
+            Err(UploadValidationError::InvalidHeader)
+        );
     }
 }

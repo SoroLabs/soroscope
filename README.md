@@ -97,6 +97,16 @@ See [`core/MERKLE_TREE_README.md`](./core/MERKLE_TREE_README.md) for full API re
 
 The **web** app is a Next.js + Tailwind CSS dashboard for exploring resource usage visually.
 
+### Features
+- **Client-Side Simulation Rate Limiting**: Throttles contract simulation requests to a maximum of 2 calls per second via `RequestQueueManager` to prevent hitting Soroban RPC rate limits (429/503).
+- **Infinite Scroll Telemetry Logs**: Smooth `IntersectionObserver`-based infinite scrolling for browsing historical telemetry logs and transaction records.
+- **Subgraph Schema Visualizer**: Interactive React Flow node diagram of cross-contract calls and the ledger keys each invocation reads or writes (**Schema** tab).
+- **Global Search (`Cmd+K` / `Ctrl+K`)**: Quick-search overlay for jumping to any panel, page or contract function from anywhere in the app.
+- **Custom Endpoints**: `/settings` stores a self-hosted Soroban RPC and indexer URL in LocalStorage, with a connection test for each.
+- **Off-Thread WASM Decoding**: Uploaded bytecode is decoded and validated in a dedicated Web Worker, so large contracts never freeze the UI.
+
+See [docs/FRONTEND_FEATURES.md](docs/FRONTEND_FEATURES.md) for details.
+
 ### Install Dependencies
 ```bash
 cd web
@@ -116,6 +126,14 @@ Then open:
 npm run build
 npm start
 ```
+
+### 🧮 Interactive Token Yield & Staking Calculator Widget
+The web dashboard includes an interactive **Token Yield & Staking Calculator Widget** enabling users to estimate projected APY, compounding returns, and rewards prior to locking tokens into Soroban smart contracts:
+- **Interactive Parameters**: Sliders and numerical inputs for Deposit Amount, Lock Duration (1-36M), Base APY, Compound Frequency (Daily, Weekly, Monthly, Quarterly, Annually, Simple Interest), and Duration Tier Multiplier toggles.
+- **Real-Time Return Projections**: Computes Projected Total Balance, Total Rewards, Effective APY, ROI %, and Estimated Daily & Monthly Earnings.
+- **Milestone Schedule**: Interactive Monthly Milestone Schedule detailing cumulative yield and balance progression.
+- **Input Guardrails**: Numerical fields enforce their documented bounds and sanitize typed text, so negative, blank, non-numeric or overflowing input (e.g. `-`, `abc`, `1e400`) clamps to a finite in-range value instead of producing `NaN` projections.
+- **Unit Testing**: Tests under `web/lib/stakingCalculator.test.cjs` and `web/components/StakingCalculator.test.cjs`.
 
 ---
 

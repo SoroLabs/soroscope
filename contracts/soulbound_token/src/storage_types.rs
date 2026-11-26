@@ -5,8 +5,13 @@ use soroban_sdk::{contracttype, Address};
 pub enum DataKey {
     Balance(Address),
     Admin,
-    // Metadata keys
     Name,
     Symbol,
     Decimals,
+    IdentityMetadata(Address),
+    NextTokenId,
+    OwnerToken(Address),
+    TokenOwner(u64),
+    TokenIssuer(u64),
+    TokenRevoked(u64),
 }

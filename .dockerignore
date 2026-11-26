@@ -1,0 +1,11 @@
+target/
+.git/
+.github/
+web/
+node_modules/
+*.md
+.env*
+.vscode/
+.idea/
+*.log
+*.tmp

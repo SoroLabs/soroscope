@@ -33,4 +33,8 @@ pub enum DataKey {
     State(Address),
     /// Single instance key replacing Name + Symbol + Decimals.
     Metadata,
+    /// Immutable maximum supply cap set during initialization.
+    MaxSupply,
+    /// Dynamic total supply tracking.
+    TotalSupply,
 }

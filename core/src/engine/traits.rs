@@ -3,7 +3,7 @@ use soroban_sdk::xdr::ScVal;
 use async_trait::async_trait;
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum ProviderError {
     #[error("RPC request failed: {0}")]
     RpcRequestFailed(String),
@@ -15,7 +15,7 @@ pub enum ProviderError {
     NodeError(String),
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum CacheError {
     #[error("Cache read failed: {0}")]
     ReadError(String),
@@ -23,7 +23,7 @@ pub enum CacheError {
     WriteError(String),
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum ParserError {
     #[error("Parse error: {0}")]
     ParseError(String),

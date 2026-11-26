@@ -96,3 +96,33 @@ test('HeaderNav: drawer link buttons target satisfies touch-friendly 48px height
   // Mobile drawer links: min-h-[48px]
   assert.equal(validateTouchTargetSize(48, 280), true);
 });
+
+// Mirrors HeaderNav quick-link metadata for route/active-state behavior.
+const HEADER_QUICK_LINKS = [
+  { id: 'simulator', label: 'Simulator', kind: 'tab', tab: 'explorer', href: '/?tab=explorer#simulator' },
+  { id: 'analytics', label: 'Analytics', kind: 'tab', tab: 'schema', href: '/?tab=schema#analytics' },
+  { id: 'staking', label: 'Staking Calculator', kind: 'tab', tab: 'explorer', href: '/?tab=explorer#staking-calculator' },
+  { id: 'settings', label: 'Settings', kind: 'route', href: '/settings' },
+];
+
+function isHeaderQuickLinkActive(item, activeTab, pathname) {
+  if (item.kind === 'route') return pathname === item.href;
+  return activeTab === item.tab;
+}
+
+test('HeaderNav: mobile quick links include Simulator, Analytics, Staking Calculator, and Settings', () => {
+  assert.deepEqual(
+    HEADER_QUICK_LINKS.map((item) => item.label),
+    ['Simulator', 'Analytics', 'Staking Calculator', 'Settings'],
+  );
+});
+
+test('HeaderNav: quick navigation highlights tab and route links by active page', () => {
+  const analytics = HEADER_QUICK_LINKS.find((item) => item.id === 'analytics');
+  const settings = HEADER_QUICK_LINKS.find((item) => item.id === 'settings');
+
+  assert.equal(isHeaderQuickLinkActive(analytics, 'schema', '/'), true);
+  assert.equal(isHeaderQuickLinkActive(analytics, 'explorer', '/'), false);
+  assert.equal(isHeaderQuickLinkActive(settings, 'explorer', '/settings'), true);
+  assert.equal(isHeaderQuickLinkActive(settings, 'explorer', '/'), false);
+});

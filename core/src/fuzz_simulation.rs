@@ -39,7 +39,8 @@ mod tests {
                 ledger_read_bytes: lr,
                 ledger_write_bytes: lw,
                 transaction_size_bytes: tx,
-            })
+                            ..Default::default()
+})
     }
 
     /// Arbitrary `TtlEntryReport`.
@@ -47,8 +48,10 @@ mod tests {
         ("[a-zA-Z0-9]{1,16}", any::<u32>(), -500_000i64..500_000i64).prop_map(|(key, live, rem)| {
             TtlEntryReport {
                 key,
+                key_kind: LedgerKeyKind::Other,
                 live_until_ledger: live,
                 remaining_ledgers: rem,
+                entry_xdr_size_bytes: None,
             }
         })
     }
@@ -59,6 +62,14 @@ mod tests {
             contract_id: cid,
             function: func,
             children: vec![],
+            cpu_instructions: None,
+            ram_bytes: None,
+            ledger_read_bytes: None,
+            ledger_write_bytes: None,
+            exclusive_cpu_instructions: None,
+            exclusive_ram_bytes: None,
+            exclusive_ledger_read_bytes: None,
+            exclusive_ledger_write_bytes: None,
         });
 
         leaf.prop_recursive(3, 15, 4, |inner| {
@@ -71,6 +82,14 @@ mod tests {
                     contract_id: cid,
                     function: func,
                     children: kids,
+                    cpu_instructions: None,
+                    ram_bytes: None,
+                    ledger_read_bytes: None,
+                    ledger_write_bytes: None,
+                    exclusive_cpu_instructions: None,
+                    exclusive_ram_bytes: None,
+                    exclusive_ledger_read_bytes: None,
+                    exclusive_ledger_write_bytes: None,
                 })
         })
     }
@@ -84,16 +103,23 @@ mod tests {
             "[a-zA-Z0-9+/=]{0,64}",
         )
             .prop_map(|(res, ledger, cost, td)| SimulationResult {
+                bytes_by_durability: BytesByDurability::from_aggregates_as_other(
+                    res.ledger_read_bytes,
+                    res.ledger_write_bytes,
+                ),
                 resources: res,
+                auth_tree: Default::default(),
                 transaction_hash: None,
                 latest_ledger: ledger,
                 cost_stroops: cost,
+                rent_bytes: Some(0),
                 state_dependency: None,
                 ttl_analysis: None,
                 transaction_data: td,
                 call_graph: None,
                 state_snapshot: None,
                 protocol_version: 0,
+                fee_calibration: Default::default(),
             })
     }
 
@@ -362,8 +388,10 @@ mod tests {
         ) {
             let entries = vec![TtlEntryReport {
                 key,
+                key_kind: LedgerKeyKind::Other,
                 live_until_ledger: live_until,
                 remaining_ledgers: 200_000, // > 120_000 threshold
+                entry_xdr_size_bytes: None,
             }];
             let suggestions =
                 SimulationEngine::build_extend_ttl_suggestions(&entries, 100);
@@ -409,12 +437,43 @@ mod tests {
             prop_assert_ne!(k1, k2);
         }
 
+        /// Fuzz test automated contract simulation argument generation for Address, i128, Bytes, Symbol.
+        #[test]
+        fn fuzz_automated_contract_simulation_args(
+            cid in prop::sample::select(vec![
+                "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK",
+            ]),
+            func in "[a-zA-Z_][a-zA-Z0-9_]{1,16}",
+            args in proptest::collection::vec(
+                prop_oneof![
+                    Just("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_string()),
+                    Just("CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_string()),
+                    any::<i128>().prop_map(|n| n.to_string()),
+                    "[0-9a-fA-F]{2,64}".prop_map(|h| format!("0x{}", h)),
+                    "[a-zA-Z_][a-zA-Z0-9_]{1,20}".prop_map(|s| format!(":{}", s)),
+                ],
+                0..6
+            ),
+        ) {
+            let engine = SimulationEngine::new("https://test.com".into());
+            for arg in &args {
+                let _ = engine.parse_sc_val_arg(arg);
+            }
+            let arg_refs: Vec<String> = args;
+            let key = SimulationCache::generate_key(&cid, &func, &arg_refs);
+            prop_assert_eq!(key.len(), 64);
+        }
+
         // ─── 10. CallGraph::to_mermaid ──────────────────────────────────
 
         /// Must never panic on arbitrary call trees; output starts correctly.
         #[test]
         fn fuzz_call_graph_to_mermaid(root in arb_call_node()) {
-            let graph = CallGraph { root };
+            let graph = CallGraph {
+                root,
+                incomplete: false,
+            };
             let mermaid = graph.to_mermaid();
             prop_assert!(mermaid.starts_with("graph TD\n"));
             prop_assert!(!mermaid.is_empty());
@@ -467,6 +526,93 @@ mod tests {
             prop_assert_eq!(deser.latest_ledger, snap.latest_ledger);
             prop_assert_eq!(deser.ledger_entries.len(), snap.ledger_entries.len());
             prop_assert_eq!(deser.ttl_entries.len(), snap.ttl_entries.len());
+        }
+
+        // ─── 13. Automated Contract Simulation Fuzzing Suite (Issue #9) ─────
+        //
+        // Generates random valid Soroban argument values (Address, i128, Bytes,
+        // Symbol) and verifies the engine can parse and build transactions without
+        // panicking. Covers the acceptance criteria: 100 random iterations per
+        // argument type with no engine crash.
+
+        /// Random valid Stellar contract address strings must parse successfully.
+        #[test]
+        fn fuzz_random_address_args_no_panic(
+            // 32 random bytes that will form a contract-class address
+            bytes in proptest::collection::vec(any::<u8>(), 32),
+        ) {
+            use soroban_sdk::xdr::{Hash, ScAddress, ScVal};
+            let engine = SimulationEngine::new("https://test.rpc".into());
+            let hash = Hash(bytes.try_into().unwrap());
+            let sc_val = ScVal::Address(ScAddress::Contract(hash));
+            // estimate_scval_size must never panic on an Address
+            let size = engine.estimate_scval_size(&sc_val);
+            prop_assert_eq!(size, 32, "Address ScVal must report 32 bytes");
+        }
+
+        /// Random i128 values serialised as strings must parse correctly.
+        #[test]
+        fn fuzz_random_i128_args_parse_ok(
+            hi in any::<i64>(),
+            lo in any::<u64>(),
+        ) {
+            use soroban_sdk::xdr::{Int128Parts, ScVal};
+            let engine = SimulationEngine::new("https://test.rpc".into());
+            let sc_val = ScVal::I128(Int128Parts { hi, lo });
+            let size = engine.estimate_scval_size(&sc_val);
+            prop_assert_eq!(size, 16, "i128 ScVal must report 16 bytes");
+        }
+
+        /// Random byte arrays (up to 256 B) must survive size estimation.
+        #[test]
+        fn fuzz_random_bytes_args_no_panic(
+            raw in proptest::collection::vec(any::<u8>(), 0..=256),
+        ) {
+            use soroban_sdk::xdr::{ScBytes, ScVal};
+            let engine = SimulationEngine::new("https://test.rpc".into());
+            let sc_bytes: ScBytes = raw.clone().try_into().unwrap_or_default();
+            let sc_val = ScVal::Bytes(sc_bytes);
+            let size = engine.estimate_scval_size(&sc_val);
+            prop_assert_eq!(size as usize, raw.len(), "Bytes ScVal size must equal byte length");
+        }
+
+        /// Random symbols (1–32 chars from the Soroban symbol alphabet) must
+        /// survive round-trips through the engine arg parser.
+        #[test]
+        fn fuzz_random_symbol_args_no_panic(
+            sym in "[a-zA-Z_][a-zA-Z0-9_]{0,30}",
+        ) {
+            let engine = SimulationEngine::new("https://test.rpc".into());
+            // `:symbol` prefix is the engine's input format for ScVal::Symbol
+            let input = format!(":{}", sym);
+            // Must not panic; result can be Ok or Err
+            let _ = engine.parse_sc_val_arg(&input);
+        }
+
+        /// End-to-end: build a transaction with a random mix of typed args and
+        /// verify the base64 output is non-empty (no crash).
+        #[test]
+        fn fuzz_mixed_args_transaction_no_crash(
+            func in "[a-zA-Z_][a-zA-Z0-9_]{0,15}",
+            bool_arg in prop::bool::ANY,
+            int_arg in any::<i64>(),
+            sym in "[a-zA-Z_][a-zA-Z0-9_]{0,10}",
+        ) {
+            let engine = SimulationEngine::new("https://test.rpc".into());
+            let args = vec![
+                if bool_arg { "true".to_string() } else { "false".to_string() },
+                int_arg.to_string(),
+                format!(":{}", sym),
+            ];
+            let result = engine.create_invoke_transaction(
+                "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                &func,
+                args,
+            );
+            // Must not panic; a successful result must be non-empty base64
+            if let Ok(b64) = result {
+                prop_assert!(!b64.is_empty());
+            }
         }
     }
 }

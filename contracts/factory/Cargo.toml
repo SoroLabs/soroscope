@@ -9,10 +9,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 emergency_guard = { path = "../emergency_guard", default-features = false }
-soroban-sdk = "22.0.0"
+soroban-sdk.workspace = true
 
 [dev-dependencies]
-soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
 emergency_guard = { path = "../emergency_guard" }
 
 # We need the pool contract code for integration tests

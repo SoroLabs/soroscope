@@ -8,10 +8,10 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-soroban-sdk = "22.0.0"
+soroban-sdk.workspace = true
 soroscope-math = { path = "../math" }
 soroscope-error-codes = { path = "../error_codes" }
 emergency_guard = { path = "../emergency_guard" }
 
 [dev-dependencies]
-soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }

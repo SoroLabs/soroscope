@@ -1,5 +1,6 @@
 /**
  * Error handling utilities for parsing and formatting backend error responses
+ * and Soroban contract error codes.
  */
 
 export interface BackendErrorResponse {
@@ -14,6 +15,100 @@ export interface FormattedError {
   details?: string;
   statusCode: number;
   isNetworkError: boolean;
+}
+
+/**
+ * Lookup table converting Soroban contract error codes (integers) to user-friendly messages.
+ * Maps standard contract error codes and domain-specific error numbers to descriptive text.
+ */
+export const CONTRACT_ERROR_MAP: Record<number, string> = {
+  // Standard Soroban Contract Error Codes (1..17)
+  1: 'Contract is already initialized',
+  2: 'Contract is not initialized',
+  3: 'Unauthorized access or action',
+  4: 'Insufficient token balance',
+  5: 'Insufficient pool liquidity',
+  6: 'Insufficient LP shares',
+  7: 'Insufficient token allowance',
+  8: 'Slippage tolerance exceeded',
+  9: 'Invalid fee parameter',
+  10: 'No pending fee update',
+  11: 'Timelock delay has not elapsed',
+  12: 'Oracle source not configured',
+  13: 'Invalid or stale oracle price',
+  14: 'Contract operations are paused',
+  15: 'Arithmetic overflow in contract math',
+  16: 'Division by zero',
+  17: 'Invalid input arguments',
+
+  // Common Domain / Custom Soroban Contract Error Codes (100..120)
+  100: 'Account or position not found',
+  101: 'Invalid contract state or configuration',
+  102: 'Operation deadline has expired',
+  103: 'Transaction resource limit exceeded',
+  104: 'Unauthorized operation or invalid admin authorization',
+  105: 'Contract is locked or emergency paused',
+  106: 'Undercollateralized position or insufficient collateral ratio',
+  107: 'Flash loan repayment failed or vault balance mismatch',
+  108: 'Invalid signature or authorization payload',
+  109: 'Maximum deposit or mint limit exceeded',
+  110: 'Auction or offer has ended',
+};
+
+/**
+ * Extract contract error code integer from raw error string (e.g. "HostError #104", "Error(Contract, #104)", "#104").
+ */
+export function parseContractErrorCode(message: string): number | null {
+  if (!message || typeof message !== 'string') return null;
+
+  const patterns = [
+    /HostError\s*#(\d+)/i,
+    /Error\s*\(\s*Contract\s*,\s*#?(\d+)\s*\)/i,
+    /Error\s*\(\s*Value\s*,\s*#?(\d+)\s*\)/i,
+    /ContractError\s*#?(\d+)/i,
+    /Contract\s*Error\s*#?(\d+)/i,
+    /Error\s*code\s*:?\s*#?(\d+)/i,
+    /Error\s*#(\d+)/i,
+    /Code\s*#?(\d+)/i,
+    /#(\d+)/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = message.match(pattern);
+    if (match && match[1]) {
+      const code = parseInt(match[1], 10);
+      if (!isNaN(code)) {
+        return code;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Convert a contract error integer to a descriptive human-readable message.
+ */
+export function getDescriptiveContractError(code: number): string | null {
+  return CONTRACT_ERROR_MAP[code] || null;
+}
+
+/**
+ * Parse raw error message and format any embedded contract error codes into a descriptive user message.
+ */
+export function formatContractErrorMessage(message: string): string {
+  if (!message) return 'An unexpected error occurred';
+
+  const code = parseContractErrorCode(message);
+  if (code !== null) {
+    const descriptive = getDescriptiveContractError(code);
+    if (descriptive) {
+      return `Contract Error #${code}: ${descriptive}`;
+    }
+    return `Contract Error #${code}: Custom contract error ${code}`;
+  }
+
+  return message;
 }
 
 /**
@@ -92,9 +187,11 @@ export function formatError(error: unknown): FormattedError {
       };
     }
 
+    const formattedMessage = formatContractErrorMessage(error.message);
+
     return {
       type: 'ERROR',
-      message: error.message || 'An unexpected error occurred',
+      message: formattedMessage || error.message || 'An unexpected error occurred',
       statusCode: 0,
       isNetworkError: false,
     };
@@ -112,6 +209,13 @@ export function formatError(error: unknown): FormattedError {
  * Create a user-friendly error message from BackendErrorResponse
  */
 export function createUserFriendlyMessage(errorResponse: BackendErrorResponse): string {
+  if (errorResponse.message) {
+    const formattedContractError = formatContractErrorMessage(errorResponse.message);
+    if (formattedContractError !== errorResponse.message) {
+      return formattedContractError;
+    }
+  }
+
   const errorMessages: Record<string, string> = {
     BAD_REQUEST: 'Invalid request. Please check your inputs and try again.',
     UNAUTHORIZED: 'You are not authorized to perform this action.',
@@ -119,6 +223,10 @@ export function createUserFriendlyMessage(errorResponse: BackendErrorResponse): 
     INTERNAL_SERVER_ERROR: 'Server error. Please try again later.',
     SERVICE_UNAVAILABLE: 'The service is currently unavailable. Please try again later.',
   };
+
+  if (errorResponse.message && !errorMessages[errorResponse.message]) {
+    return formatContractErrorMessage(errorResponse.message);
+  }
 
   return (
     errorMessages[errorResponse.error] ||

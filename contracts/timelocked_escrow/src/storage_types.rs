@@ -8,7 +8,11 @@ pub enum DataKey {
     Config,
     Guardians,
     Approvals,
+    RecoveryApprovals,
     ApprovalEpoch,
+    Admin,
+    /// Ledger sequence at which the admin voted for an emergency release.
+    AdminReleaseVote,
 }
 
 // ── Escrow Configuration ──────────────────────────────────────
@@ -22,7 +26,10 @@ pub struct EscrowConfig {
     pub amount: i128,
     pub unlock_ledger: u32,
     pub is_released: bool,
+    pub is_recovered: bool,
     pub is_cancelled: bool,
+    pub cancellation_fee_bps: u32,
+    pub protocol_vault: Address,
 }
 
 // ── Errors ────────────────────────────────────────────────────
@@ -43,6 +50,22 @@ pub enum Error {
     Unauthorized = 10,
     InvalidGuardianCount = 11,
     DuplicateGuardian = 12,
+    CancellationFeeTooHigh = 13,
+    InvalidTimelockExtension = 14,
+    LockPeriodTooShort = 15,
+    AdminReleaseNotVoted = 16,
+    AdminReleaseAlreadyVoted = 17,
+    AdminReleaseDelayNotElapsed = 18,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum EscrowStatus {
+    Initialized,
+    Funded,
+    Released,
+    Recovered,
+    Cancelled,
 }
 
 // ── Event Structs ─────────────────────────────────────────────
@@ -79,6 +102,19 @@ pub struct CancelEvent {
     pub depositor: Address,
     pub token: Address,
     pub amount: i128,
+    pub fee: i128,
+    pub protocol_vault: Address,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct MutualCancelEvent {
+    pub depositor: Address,
+    pub beneficiary: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub fee: i128,
+    pub protocol_vault: Address,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,4 +123,28 @@ pub struct GuardianRotationEvent {
     pub old_guardians: Vec<Address>,
     pub new_guardians: Vec<Address>,
     pub new_epoch: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct AdminReleaseVoteEvent {
+    pub admin: Address,
+    pub voted_at_ledger: u32,
+    pub executable_at_ledger: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct AdminReleaseEvent {
+    pub admin: Address,
+    pub beneficiary: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct StatusChangeEvent {
+    pub previous_status: EscrowStatus,
+    pub new_status: EscrowStatus,
 }

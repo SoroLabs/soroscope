@@ -35,6 +35,89 @@ export function isRpcNetworkError(error: Error | null): boolean {
   );
 }
 
+/**
+ * Sanitizes sensitive tokens, secret keys, and credentials from error messages and stack traces.
+ */
+export function sanitizeTelemetry(text: string): string {
+  if (!text) return '';
+  return text
+    // Stellar secret keys (starts with S, 56 characters base32)
+    .replace(/\bS[A-Z2-7]{55}\b/g, '[REDACTED_STELLAR_SECRET_KEY]')
+    // Bearer tokens
+    .replace(/Bearer\s+[A-Za-z0-9\-_.~+/]+=*/gi, 'Bearer [REDACTED_BEARER_TOKEN]')
+    // Authorization headers or key=val tokens
+    .replace(/(api[_-]?key|secret|token|password|auth|authorization)=["']?[^&"'\s]+/gi, '$1=[REDACTED]')
+    // Hex private keys (32 or 64 bytes)
+    .replace(/\b(0x)?[0-9a-fA-F]{64}\b/g, '[REDACTED_HEX_KEY]');
+}
+
+/**
+ * Builds a plain-text diagnostics report for the current error state with sanitization.
+ */
+export function buildDiagnosticsReport(
+  error: Error,
+  errorInfo: React.ErrorInfo | null,
+): string {
+  const lines = [
+    `Error: ${error.name || 'Error'}`,
+    `Message: ${sanitizeTelemetry(error.message || '(no message)')}`,
+    '',
+    'Stack Trace:',
+    sanitizeTelemetry(error.stack || '(no stack trace available)'),
+  ];
+
+  if (errorInfo?.componentStack) {
+    lines.push('', 'Component Stack:', sanitizeTelemetry(errorInfo.componentStack));
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Generates a sanitized JSON crash bundle for telemetry export.
+ */
+export function generateCrashBundle(
+  error: Error,
+  errorInfo: React.ErrorInfo | null,
+): string {
+  const bundle = {
+    appVersion: '1.0.0',
+    timestamp: new Date().toISOString(),
+    userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
+    url: typeof window !== 'undefined' ? window.location.href : 'unknown',
+    error: {
+      name: error.name || 'Error',
+      message: sanitizeTelemetry(error.message || ''),
+      stack: sanitizeTelemetry(error.stack || ''),
+    },
+    componentStack: errorInfo?.componentStack
+      ? sanitizeTelemetry(errorInfo.componentStack)
+      : null,
+  };
+  return JSON.stringify(bundle, null, 2);
+}
+
+/**
+ * Resets cached application state in LocalStorage while preserving sensitive user secrets if any.
+ */
+export function resetCachedAppState(): void {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    const keysToPreserve = ['encrypted_key', 'wallet_auth', 'user_credentials'];
+    const preserved: Record<string, string> = {};
+    for (const key of keysToPreserve) {
+      const val = window.localStorage.getItem(key);
+      if (val !== null) preserved[key] = val;
+    }
+    window.localStorage.clear();
+    for (const [k, v] of Object.entries(preserved)) {
+      window.localStorage.setItem(k, v);
+    }
+  } catch (err) {
+    console.error('Failed to reset cached state:', err);
+  }
+}
+
 export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
   state: ErrorBoundaryState = {
     error: null,
@@ -59,6 +142,47 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
     this.setState((prevState) => ({ showDetails: !prevState.showDetails }));
   };
 
+  copyDiagnostics = async () => {
+    const { error, errorInfo } = this.state;
+    if (!error) return;
+
+    const report = buildDiagnosticsReport(error, errorInfo);
+
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(report);
+      } else if (typeof window !== 'undefined') {
+        window.prompt('Copy diagnostics:', report);
+      }
+    } catch (copyError) {
+      console.error('Failed to copy diagnostics:', copyError);
+    }
+  };
+
+  resetAndReload = () => {
+    resetCachedAppState();
+    if (typeof window !== 'undefined') {
+      window.location.reload();
+    }
+  };
+
+  exportCrashBundle = () => {
+    const { error, errorInfo } = this.state;
+    if (!error) return;
+    const json = generateCrashBundle(error, errorInfo);
+    try {
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `crash-report-${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Failed to export crash bundle:', err);
+    }
+  };
+
   render() {
     const { error, errorInfo, showDetails } = this.state;
 
@@ -79,7 +203,7 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
         <div
           role="alert"
           aria-live="assertive"
-          className="flex min-h-[320px] items-center justify-center rounded-xl border border-red-900/60 bg-[#0d1117] p-6 text-red-100 shadow-2xl"
+          className="flex min-h-[320px] items-center justify-center rounded-xl border border-red-900/60 bg-[var(--bg-elevated)] p-6 text-red-100 shadow-2xl"
         >
           <div className="w-full max-w-xl rounded-xl border border-red-800/60 bg-red-950/30 p-6 shadow-xl shadow-black/20">
             <div className="flex items-start gap-4">
@@ -134,10 +258,31 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
                   </button>
                   <button
                     type="button"
+                    onClick={this.resetAndReload}
+                    className="rounded-lg border border-purple-700/80 bg-purple-900/40 px-4 py-2.5 text-sm font-semibold text-purple-50 transition-colors hover:bg-purple-800/60 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                  >
+                    Reset Cached State &amp; Reload
+                  </button>
+                  <button
+                    type="button"
+                    onClick={this.copyDiagnostics}
+                    className="rounded-lg border border-amber-700/80 bg-amber-900/40 px-4 py-2.5 text-sm font-semibold text-amber-50 transition-colors hover:bg-amber-800/60 focus:outline-none focus:ring-2 focus:ring-amber-500/50"
+                  >
+                    Copy Diagnostics
+                  </button>
+                  <button
+                    type="button"
+                    onClick={this.exportCrashBundle}
+                    className="rounded-lg border border-blue-700/80 bg-blue-900/40 px-4 py-2.5 text-sm font-semibold text-blue-50 transition-colors hover:bg-blue-800/60 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                  >
+                    Export Crash Bundle
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => window.location.reload()}
                     className="rounded-lg border border-slate-700 bg-slate-800/80 px-4 py-2.5 text-sm font-semibold text-slate-100 transition-colors hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-500/50"
                   >
-                    Reload dashboard
+                    Reload Application
                   </button>
                 </div>
               </div>

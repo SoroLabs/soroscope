@@ -555,7 +555,7 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "GuardAdmins"
+                              "symbol": "Admins"
                             }
                           ]
                         },
@@ -571,12 +571,16 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "GuardThreshold"
+                              "symbol": "PauseState"
                             }
                           ]
                         },
                         "val": {
-                          "u32": 1
+                          "vec": [
+                            {
+                              "u32": 0
+                            }
+                          ]
                         }
                       },
                       {
@@ -669,6 +673,18 @@
                               }
                             }
                           ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "SignatureThreshold"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
                         }
                       }
                     ]

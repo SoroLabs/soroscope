@@ -22,7 +22,7 @@
 //! contract checks that the amount received from a pool withdrawal is within
 //! `slippage_bps` of the expected amount before proceeding.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 #[cfg(test)]
 mod test;
@@ -42,11 +42,13 @@ pub enum Error {
     SlippageExceeded = 7,
     InsufficientShares = 8,
     Unauthorized = 9,
+    InvalidWeights = 10,
 }
 
 // ── External pool interface ───────────────────────────────────────────────────
 
 /// Minimal interface the vault calls on each registered AMM pool.
+#[soroban_sdk::contractclient(name = "AmmPoolClient")]
 pub trait AmmPool {
     /// Deposit `amount_a` and `amount_b`; returns LP shares minted.
     fn deposit(e: Env, to: Address, amount_a: i128, amount_b: i128) -> i128;
@@ -62,8 +64,6 @@ pub trait AmmPool {
     fn token_a(e: Env) -> Address;
 }
 
-soroban_sdk::contractclient!(name = "AmmPoolClient", trait = AmmPool);
-
 // ── Storage types ─────────────────────────────────────────────────────────────
 
 /// Vault-wide configuration and accounting, stored as a single instance entry.
@@ -75,6 +75,10 @@ pub struct VaultState {
     pub admin: Address,
     /// Total vault shares outstanding.
     pub total_shares: i128,
+    /// Net deposit-token assets deployed into pools and backing `total_shares`.
+    /// Tracked separately from the idle token balance so donations and pool
+    /// positions are both reflected in the effective NAV.
+    pub total_assets: i128,
     /// Maximum slippage tolerated on rebalance withdrawals, in bps.
     pub slippage_bps: i128,
     /// Assumed daily volume as a fraction of pool reserve, in bps (default 10_000 = 100%).
@@ -91,6 +95,8 @@ pub struct PoolAllocation {
     pub lp_shares: i128,
     /// Whether the deposit token is token_a (true) or token_b (false) in this pool.
     pub deposit_is_a: bool,
+    /// Target weight in basis points (e.g. 5,000 = 50%).
+    pub weight: u32,
 }
 
 #[contracttype]
@@ -109,6 +115,14 @@ pub const MAX_POOLS: u32 = 8;
 pub const TTL_LEDGERS: u32 = 17_280;
 pub const DEFAULT_SLIPPAGE_BPS: i128 = 100; // 1 %
 pub const DEFAULT_VOLUME_PROXY_BPS: i128 = 10_000; // 100 % of reserve
+
+/// Virtual shares offset mirroring OpenZeppelin's ERC-4626 `10**_decimalsOffset()`
+/// (six decimals). The offset makes the initial price per share very small so a
+/// direct token donation cannot round a victim's minted shares down to zero.
+pub const VIRTUAL_SHARES: i128 = 1_000_000;
+/// Virtual assets offset. Keeps every conversion denominator >= 1 so an empty
+/// vault can never divide by zero.
+pub const VIRTUAL_ASSETS: i128 = 1;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -134,6 +148,43 @@ fn save_pools(e: &Env, pools: &Vec<PoolAllocation>) {
     e.storage().instance().set(&DataKey::Pools, pools);
 }
 
+/// Effective assets backing outstanding shares.
+///
+/// `total_assets` tracks amounts routed into pools, while the vault's token
+/// balance captures idle funds and direct token donations. Taking the larger
+/// of the two avoids double counting in mock/AMM setups where deposits stay in
+/// the vault, while still making donations visible to share pricing.
+fn effective_total_assets(e: &Env, vault: &VaultState) -> i128 {
+    let idle = soroban_sdk::token::Client::new(e, &vault.deposit_token)
+        .balance(&e.current_contract_address());
+    vault.total_assets.max(idle)
+}
+
+/// `shares = assets * (total_shares + VIRTUAL_SHARES) / (total_assets + VIRTUAL_ASSETS)`.
+///
+/// Integer division truncates toward zero, so the result always rounds down in
+/// favour of the vault. The `+ VIRTUAL_ASSETS` term guarantees a non-zero
+/// denominator even when the vault is empty.
+fn convert_to_shares_inner(total_shares: i128, total_assets: i128, assets: i128) -> i128 {
+    if assets <= 0 {
+        return 0;
+    }
+    assets.saturating_mul(total_shares.saturating_add(VIRTUAL_SHARES))
+        / total_assets.saturating_add(VIRTUAL_ASSETS)
+}
+
+/// `assets = shares * (total_assets + VIRTUAL_ASSETS) / (total_shares + VIRTUAL_SHARES)`.
+///
+/// Mirrors [`convert_to_shares_inner`] and likewise rounds down so redeeming
+/// shareholders never receive more than their pro-rata NAV.
+fn convert_to_assets_inner(total_shares: i128, total_assets: i128, shares: i128) -> i128 {
+    if shares <= 0 {
+        return 0;
+    }
+    shares.saturating_mul(total_assets.saturating_add(VIRTUAL_ASSETS))
+        / total_shares.saturating_add(VIRTUAL_SHARES)
+}
+
 /// Estimate APR in bps for the deposit token in a given pool.
 ///
 /// apr_bps = fee_bps * volume_proxy_bps / 10_000
@@ -146,6 +197,7 @@ fn estimate_apr_bps(fee_bps: i128, volume_proxy_bps: i128) -> i128 {
 }
 
 /// How much of the deposit token the vault has in a given pool allocation.
+#[allow(dead_code)] // retained for NAV-aware routing once total LP supply is exposed
 fn deposit_value_in_pool(e: &Env, alloc: &PoolAllocation) -> i128 {
     if alloc.lp_shares == 0 {
         return 0;
@@ -164,6 +216,20 @@ fn deposit_value_in_pool(e: &Env, alloc: &PoolAllocation) -> i128 {
     } else {
         reserve_b
     }
+}
+
+fn validate_weighted_pools(e: &Env, pools: &Vec<PoolAllocation>) -> Result<(), Error> {
+    for i in 0..pools.len() {
+        let alloc = pools.get(i).unwrap();
+        if alloc.weight == 0 {
+            continue;
+        }
+        let client = AmmPoolClient::new(e, &alloc.pool);
+        if client.get_fee() <= 0 {
+            return Err(Error::InvalidWeights);
+        }
+    }
+    Ok(())
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -194,6 +260,7 @@ impl MultiYieldVault {
                 deposit_token,
                 admin,
                 total_shares: 0,
+                total_assets: 0,
                 slippage_bps,
                 volume_proxy_bps,
             },
@@ -203,11 +270,7 @@ impl MultiYieldVault {
 
     /// Register a new AMM pool.  `deposit_is_a` tells the vault whether the
     /// deposit token is token_a (true) or token_b (false) in that pool.
-    pub fn register_pool(
-        e: Env,
-        pool: Address,
-        deposit_is_a: bool,
-    ) -> Result<(), Error> {
+    pub fn register_pool(e: Env, pool: Address, deposit_is_a: bool) -> Result<(), Error> {
         let vault = load_vault(&e)?;
         vault.admin.require_auth();
 
@@ -224,7 +287,44 @@ impl MultiYieldVault {
             pool,
             lp_shares: 0,
             deposit_is_a,
+            weight: 0,
         });
+        save_pools(&e, &pools);
+        Ok(())
+    }
+
+    /// Set strategy weights for the registered pools.
+    /// Weights must be specified in basis points, sum to 10,000, and no single weight can exceed 5,000 (50%).
+    pub fn set_weights(e: Env, weights: Vec<u32>) -> Result<(), Error> {
+        let vault = load_vault(&e)?;
+        vault.admin.require_auth();
+
+        let mut pools = load_pools(&e);
+        if weights.len() != pools.len() {
+            return Err(Error::InvalidWeights);
+        }
+
+        let mut sum_weights: u32 = 0;
+        for i in 0..weights.len() {
+            let w = weights.get(i).unwrap();
+            if w > 5_000 {
+                return Err(Error::InvalidWeights);
+            }
+            sum_weights += w;
+        }
+
+        if sum_weights != 10_000 {
+            return Err(Error::InvalidWeights);
+        }
+
+        for i in 0..pools.len() {
+            let mut alloc = pools.get(i).unwrap();
+            alloc.weight = weights.get(i).unwrap();
+            pools.set(i, alloc);
+        }
+
+        validate_weighted_pools(&e, &pools)?;
+
         save_pools(&e, &pools);
         Ok(())
     }
@@ -248,47 +348,88 @@ impl MultiYieldVault {
         from.require_auth();
         let mut vault = load_vault(&e)?;
         let pools = load_pools(&e);
-        if pools.len() == 0 {
+        if pools.is_empty() {
             return Err(Error::PoolNotFound);
         }
 
+        // Price shares against the pre-deposit NAV. Computing this before the
+        // token transfer keeps the depositor's own assets out of the ratio and
+        // prevents a 1-stroop first deposit from receiving a disproportionate
+        // number of shares.
+        let shares = convert_to_shares_inner(
+            vault.total_shares,
+            effective_total_assets(&e, &vault),
+            amount,
+        );
+        if shares <= 0 {
+            // Reject dust deposits that would mint zero shares so they cannot
+            // become a free donation to existing holders.
+            return Err(Error::InvalidAmount);
+        }
+
         // Pull deposit token from user into vault.
-        soroban_sdk::token::Client::new(&e, &vault.deposit_token)
-            .transfer(&from, &e.current_contract_address(), &amount);
+        soroban_sdk::token::Client::new(&e, &vault.deposit_token).transfer(
+            &from,
+            &e.current_contract_address(),
+            &amount,
+        );
 
-        // Find best pool by APR.
-        let best_idx = Self::best_pool_idx(&e, &pools, &vault);
+        // Validate weights sum
+        let mut sum_weights: u32 = 0;
+        let mut last_non_zero_idx: Option<u32> = None;
+        for i in 0..pools.len() {
+            let w = pools.get(i).unwrap().weight;
+            sum_weights += w;
+            if w > 0 {
+                last_non_zero_idx = Some(i);
+            }
+        }
+        if sum_weights != 10_000 {
+            return Err(Error::InvalidWeights);
+        }
+        let last_idx = last_non_zero_idx.ok_or(Error::InvalidWeights)?;
+        validate_weighted_pools(&e, &pools)?;
 
-        // Deposit into best pool.  The pool requires both tokens; we supply
-        // `amount` of the deposit token and 0 of the other side.  The pool
-        // will mint shares proportional to the minimum ratio — depositing only
-        // one side is a known limitation; a production vault would swap half
-        // first.  For simplicity we deposit single-sided (amount, 0) or (0, amount).
+        // Deposit into pools based on weights.
         let mut pools_mut = pools;
-        let mut alloc = pools_mut.get(best_idx).unwrap();
-        let client = AmmPoolClient::new(&e, &alloc.pool);
+        let mut remaining_amount = amount;
 
-        let (dep_a, dep_b) = if alloc.deposit_is_a {
-            (amount, 0i128)
-        } else {
-            (0i128, amount)
-        };
+        for i in 0..pools_mut.len() {
+            let mut alloc = pools_mut.get(i).unwrap();
+            if alloc.weight == 0 {
+                continue;
+            }
+            let pool_amount = if i == last_idx {
+                remaining_amount
+            } else {
+                amount * (alloc.weight as i128) / 10_000
+            };
 
-        // Approve pool to pull tokens from vault.
-        soroban_sdk::token::Client::new(&e, &vault.deposit_token)
-            .approve(&e.current_contract_address(), &alloc.pool, &amount, &(e.ledger().sequence() + 1));
+            if pool_amount <= 0 {
+                continue;
+            }
+            remaining_amount -= pool_amount;
 
-        let new_lp = client.deposit(&e.current_contract_address(), &dep_a, &dep_b);
-        alloc.lp_shares += new_lp;
-        pools_mut.set(best_idx, alloc);
+            let client = AmmPoolClient::new(&e, &alloc.pool);
+            let (dep_a, dep_b) = if alloc.deposit_is_a {
+                (pool_amount, 0i128)
+            } else {
+                (0i128, pool_amount)
+            };
+
+            // Approve pool to pull tokens from vault.
+            soroban_sdk::token::Client::new(&e, &vault.deposit_token).approve(
+                &e.current_contract_address(),
+                &alloc.pool,
+                &pool_amount,
+                &(e.ledger().sequence() + 1),
+            );
+
+            let new_lp = client.deposit(&e.current_contract_address(), &dep_a, &dep_b);
+            alloc.lp_shares += new_lp;
+            pools_mut.set(i, alloc);
+        }
         save_pools(&e, &pools_mut);
-
-        // Mint vault shares proportional to deposit.
-        let shares = if vault.total_shares == 0 {
-            amount
-        } else {
-            amount // 1:1 for simplicity; production would use NAV-based pricing
-        };
 
         let bal_key = DataKey::Balance(from.clone());
         let cur: i128 = e.storage().persistent().get(&bal_key).unwrap_or(0);
@@ -298,6 +439,7 @@ impl MultiYieldVault {
             .extend_ttl(&bal_key, TTL_LEDGERS, TTL_LEDGERS);
 
         vault.total_shares += shares;
+        vault.total_assets += amount;
         save_vault(&e, &vault);
 
         Ok(shares)
@@ -317,37 +459,46 @@ impl MultiYieldVault {
             return Err(Error::InsufficientShares);
         }
 
-        // Proportional share of total vault assets.
+        // Price the redemption with the virtual offset. Truncation rounds down,
+        // so the redeemer always receives slightly less than the pro-rata NAV
+        // and the remainder stays with the remaining shareholders.
+        let assets = convert_to_assets_inner(
+            vault.total_shares,
+            effective_total_assets(&e, &vault),
+            shares,
+        );
+        if assets <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Burn the caller's pro-rata LP shares in every pool.
         let fraction_num = shares;
         let fraction_den = vault.total_shares;
-
         let mut pools = load_pools(&e);
-        let mut total_received: i128 = 0;
 
         for i in 0..pools.len() {
             let mut alloc = pools.get(i).unwrap();
             if alloc.lp_shares == 0 {
                 continue;
             }
-            // Withdraw proportional LP shares from this pool.
             let lp_to_burn = alloc.lp_shares * fraction_num / fraction_den;
             if lp_to_burn == 0 {
                 continue;
             }
 
             let client = AmmPoolClient::new(&e, &alloc.pool);
-            let (out_a, out_b) = client.withdraw(&e.current_contract_address(), &lp_to_burn);
-
-            let received = if alloc.deposit_is_a { out_a } else { out_b };
-            total_received += received;
+            let _ = client.withdraw(&e.current_contract_address(), &lp_to_burn);
             alloc.lp_shares -= lp_to_burn;
             pools.set(i, alloc);
         }
         save_pools(&e, &pools);
 
-        // Send deposit token to user.
-        soroban_sdk::token::Client::new(&e, &vault.deposit_token)
-            .transfer(&e.current_contract_address(), &to, &total_received);
+        // Send the virtual-offset-adjusted amount to the user.
+        soroban_sdk::token::Client::new(&e, &vault.deposit_token).transfer(
+            &e.current_contract_address(),
+            &to,
+            &assets,
+        );
 
         e.storage().persistent().set(&bal_key, &(cur - shares));
         e.storage()
@@ -355,21 +506,15 @@ impl MultiYieldVault {
             .extend_ttl(&bal_key, TTL_LEDGERS, TTL_LEDGERS);
 
         vault.total_shares -= shares;
+        vault.total_assets = vault.total_assets.saturating_sub(assets);
         save_vault(&e, &vault);
 
-        Ok(total_received)
+        Ok(assets)
     }
 
     // ── Rebalancing ───────────────────────────────────────────────────────────
 
-    /// Rebalance: move all funds to the highest-APR pool.
-    ///
-    /// For each pool that is not the best:
-    ///   1. Withdraw all LP shares → receive deposit token back.
-    ///   2. Slippage check: received ≥ expected × (1 − slippage_bps/10_000).
-    ///   3. Deposit everything into the best pool.
-    ///
-    /// Anyone can call this (permissionless rebalancing).
+    /// Rebalance: redistribute all assets across all pools based on strategy weights.
     pub fn rebalance(e: Env) -> Result<(), Error> {
         let vault = load_vault(&e)?;
         let mut pools = load_pools(&e);
@@ -377,14 +522,26 @@ impl MultiYieldVault {
             return Ok(()); // nothing to rebalance
         }
 
-        let best_idx = Self::best_pool_idx(&e, &pools, &vault);
+        // Validate weights sum
+        let mut sum_weights: u32 = 0;
+        let mut last_non_zero_idx: Option<u32> = None;
+        for i in 0..pools.len() {
+            let w = pools.get(i).unwrap().weight;
+            sum_weights += w;
+            if w > 0 {
+                last_non_zero_idx = Some(i);
+            }
+        }
+        if sum_weights != 10_000 {
+            return Err(Error::InvalidWeights);
+        }
+        let last_idx = last_non_zero_idx.ok_or(Error::InvalidWeights)?;
+        validate_weighted_pools(&e, &pools)?;
+
         let mut total_to_move: i128 = 0;
 
-        // Step 1: withdraw from all non-best pools.
+        // Step 1: withdraw from all pools.
         for i in 0..pools.len() {
-            if i == best_idx {
-                continue;
-            }
             let mut alloc = pools.get(i).unwrap();
             if alloc.lp_shares == 0 {
                 continue;
@@ -398,9 +555,6 @@ impl MultiYieldVault {
             } else {
                 client.get_reserve_b()
             };
-            // We don't have total LP supply, so we use a conservative estimate:
-            // expected ≈ lp_shares (1:1 if pool was seeded 1:1, otherwise approximate).
-            // In production, expose total_lp_supply on the pool interface.
             let expected = reserve.min(alloc.lp_shares);
 
             let (out_a, out_b) = client.withdraw(&e.current_contract_address(), &alloc.lp_shares);
@@ -417,32 +571,49 @@ impl MultiYieldVault {
             pools.set(i, alloc);
         }
 
-        // Step 2: deposit everything into the best pool.
+        // Step 2: deposit back according to weights.
         if total_to_move > 0 {
-            let mut best_alloc = pools.get(best_idx).unwrap();
-            let client = AmmPoolClient::new(&e, &best_alloc.pool);
+            let mut remaining_amount = total_to_move;
+            for i in 0..pools.len() {
+                let mut alloc = pools.get(i).unwrap();
+                if alloc.weight == 0 {
+                    continue;
+                }
+                let pool_amount = if i == last_idx {
+                    remaining_amount
+                } else {
+                    total_to_move * (alloc.weight as i128) / 10_000
+                };
 
-            let (dep_a, dep_b) = if best_alloc.deposit_is_a {
-                (total_to_move, 0i128)
-            } else {
-                (0i128, total_to_move)
-            };
+                if pool_amount <= 0 {
+                    continue;
+                }
+                remaining_amount -= pool_amount;
 
-            soroban_sdk::token::Client::new(&e, &vault.deposit_token).approve(
-                &e.current_contract_address(),
-                &best_alloc.pool,
-                &total_to_move,
-                &(e.ledger().sequence() + 1),
-            );
+                let client = AmmPoolClient::new(&e, &alloc.pool);
+                let (dep_a, dep_b) = if alloc.deposit_is_a {
+                    (pool_amount, 0i128)
+                } else {
+                    (0i128, pool_amount)
+                };
 
-            let new_lp = client.deposit(&e.current_contract_address(), &dep_a, &dep_b);
-            best_alloc.lp_shares += new_lp;
-            pools.set(best_idx, best_alloc);
+                soroban_sdk::token::Client::new(&e, &vault.deposit_token).approve(
+                    &e.current_contract_address(),
+                    &alloc.pool,
+                    &pool_amount,
+                    &(e.ledger().sequence() + 1),
+                );
+
+                let new_lp = client.deposit(&e.current_contract_address(), &dep_a, &dep_b);
+                alloc.lp_shares += new_lp;
+                pools.set(i, alloc);
+            }
         }
 
         save_pools(&e, &pools);
 
-        e.events().publish(("rebalance",), (best_idx as u32, total_to_move));
+        e.events()
+            .publish((Symbol::new(&e, "rebalance"),), (last_idx, total_to_move));
         Ok(())
     }
 
@@ -463,6 +634,32 @@ impl MultiYieldVault {
             .unwrap_or(0)
     }
 
+    /// Effective assets backing vault shares (deployed assets plus idle/donated tokens).
+    pub fn total_assets(e: Env) -> Result<i128, Error> {
+        let vault = load_vault(&e)?;
+        Ok(effective_total_assets(&e, &vault))
+    }
+
+    /// ERC-4626 style preview of shares minted for `assets`, using virtual offsets.
+    pub fn convert_to_shares(e: Env, assets: i128) -> Result<i128, Error> {
+        let vault = load_vault(&e)?;
+        Ok(convert_to_shares_inner(
+            vault.total_shares,
+            effective_total_assets(&e, &vault),
+            assets,
+        ))
+    }
+
+    /// ERC-4626 style preview of assets returned for `shares`, using virtual offsets.
+    pub fn convert_to_assets(e: Env, shares: i128) -> Result<i128, Error> {
+        let vault = load_vault(&e)?;
+        Ok(convert_to_assets_inner(
+            vault.total_shares,
+            effective_total_assets(&e, &vault),
+            shares,
+        ))
+    }
+
     /// Returns the estimated APR (in bps) for each registered pool, in order.
     pub fn get_aprs(e: Env) -> Result<Vec<i128>, Error> {
         let vault = load_vault(&e)?;
@@ -480,6 +677,7 @@ impl MultiYieldVault {
     // ── Internal ──────────────────────────────────────────────────────────────
 
     /// Returns the index of the pool with the highest estimated APR.
+    #[allow(dead_code)] // reserved for APR-driven deposit routing
     fn best_pool_idx(e: &Env, pools: &Vec<PoolAllocation>, vault: &VaultState) -> u32 {
         let mut best_idx = 0u32;
         let mut best_apr: i128 = -1;

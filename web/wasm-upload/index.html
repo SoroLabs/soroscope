@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WASM Upload — Off-Thread Decoding</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; }
+    #status { margin-top: 1rem; white-space: pre-wrap; }
+    #fps { font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>WASM Bytecode Upload</h1>
+  <p>Heavy WASM parsing and validation runs in a dedicated Web Worker so the UI thread stays responsive.</p>
+
+  <input type="file" id="wasmFile" accept=".wasm,application/wasm" />
+  <p>Main-thread FPS: <span id="fps">--</span></p>
+  <pre id="status">Idle.</pre>
+
+  <script>
+    // --- Main thread: keep UI responsive, offload decoding to a worker ---
+    const statusEl = document.getElementById('status');
+    const fpsEl = document.getElementById('fps');
+    const fileInput = document.getElementById('wasmFile');
+
+    // Lightweight FPS meter to prove the main thread never freezes.
+    let frames = 0;
+    let lastFpsTime = performance.now();
+    function tick() {
+      frames++;
+      const now = performance.now();
+      if (now - lastFpsTime >= 1000) {
+        fpsEl.textContent = String(Math.round((frames * 1000) / (now - lastFpsTime)));
+        frames = 0;
+        lastFpsTime = now;
+      }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+
+    // Inline worker source so the worker is self-contained (no extra network fetch).
+    const workerSource = `
+      // --- Worker thread: heavy WASM parsing & validation ---
+      self.onmessage = function (event) {
+        const { id, buffer } = event.data || {};
+        try {
+          const bytes = new Uint8Array(buffer);
+
+          // Validate the WASM magic number: 0x00 0x61 0x73 0x6D ("\\0asm").
+          if (bytes.length < 8) {
+            throw new Error('File too small to be a valid WASM module.');
+          }
+          const magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+          if (magic[0] !== 0x00 || magic[1] !== 0x61 || magic[2] !== 0x73 || magic[3] !== 0x6d) {
+            throw new Error('Invalid WASM magic number.');
+          }
+
+          // Version is a little-endian uint32 at offset 4.
+          const version =
+            bytes[4] | (bytes[5] << 8) | (bytes[6] << 16) | (bytes[7] << 24);
+          if (version !== 1) {
+            throw new Error('Unsupported WASM version: ' + version);
+          }
+
+          // Heavy pass: scan section headers to exercise off-thread decoding.
+          let offset = 8;
+          const sections = [];
+          while (offset < bytes.length) {
+            const sectionId = bytes[offset++];
+            let size = 0;
+            let shift = 0;
+            let byte;
+            do {
+              byte = bytes[offset++];
+              size |= (byte & 0x7f) << shift;
+              shift += 7;
+            } while (byte & 0x80);
+            sections.push({ id: sectionId, size: size });
+            offset += size;
+          }
+
+          self.postMessage({
+            id: id,
+            ok: true,
+            result: {
+              byteLength: bytes.length,
+              version: version,
+              sectionCount: sections.length,
+              sections: sections
+            }
+          });
+        } catch (err) {
+          self.postMessage({ id: id, ok: false, error: String(err && err.message ? err.message : err) });
+        }
+      };
+    `;
+
+    const workerBlob = new Blob([workerSource], { type: 'application/javascript' });
+    const workerUrl = URL.createObjectURL(workerBlob);
+    const worker = new Worker(workerUrl);
+
+    let requestId = 0;
+    const pending = new Map();
+
+    worker.onmessage = function (event) {
+      const { id, ok, result, error } = event.data || {};
+      const resolve = pending.get(id);
+      if (!resolve) return;
+      pending.delete(id);
+      if (ok) {
+        resolve(result);
+      } else {
+        resolve(Promise.reject(new Error(error)));
+      }
+    };
+
+    // postMessage-based request/response bridge to the worker.
+    function decodeWasm(buffer) {
+      return new Promise(function (resolve, reject) {
+        const id = ++requestId;
+        pending.set(id, function (value) {
+          if (value instanceof Promise) {
+            value.then(resolve, reject);
+          } else {
+            resolve(value);
+          }
+        });
+        // Transfer the ArrayBuffer to avoid copying large payloads.
+        worker.postMessage({ id: id, buffer: buffer }, [buffer]);
+      });
+    }
+
+    fileInput.addEventListener('change', async function () {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      statusEl.textContent = 'Reading ' + file.name + ' (' + file.size + ' bytes)...';
+      try {
+        const buffer = await file.arrayBuffer();
+        statusEl.textContent = 'Decoding off-thread...';
+        const result = await decodeWasm(buffer);
+        statusEl.textContent =
+          'Decoded ' + file.name + '\n' +
+          'Bytes: ' + result.byteLength + '\n' +
+          'Version: ' + result.version + '\n' +
+          'Sections: ' + result.sectionCount + '\n' +
+          JSON.stringify(result.sections, null, 2);
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + (err && err.message ? err.message : err);
+      }
+    });
+  </script>
+</body>
+</html>

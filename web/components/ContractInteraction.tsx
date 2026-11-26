@@ -1,11 +1,11 @@
-import React from 'react';
+import React, { useCallback, useEffect, useRef } from 'react';
 import { ContractFunction, SimulationInputs } from '../lib/sorobantypes';
 import { DynamicForm } from './DynamicForm';
 
 interface ContractInteractionProps {
     selectedFunction: ContractFunction;
     loading: boolean;
-    onSubmit: (inputs: SimulationInputs) => Promise<void>;
+    onSubmit: (inputs: SimulationInputs, signal?: AbortSignal) => Promise<void>;
 }
 
 export const ContractInteraction: React.FC<ContractInteractionProps> = ({
@@ -13,13 +13,59 @@ export const ContractInteraction: React.FC<ContractInteractionProps> = ({
     loading,
     onSubmit,
 }) => {
+    const requestIdRef = useRef<number>(0);
+    const abortControllerRef = useRef<AbortController | null>(null);
+
+    useEffect(() => {
+        return () => {
+            if (abortControllerRef.current) {
+                abortControllerRef.current.abort();
+                abortControllerRef.current = null;
+            }
+        };
+    }, []);
+
+    const handleSubmit = useCallback(
+        async (inputs: SimulationInputs): Promise<void> => {
+            const requestId = ++requestIdRef.current;
+
+            if (abortControllerRef.current) {
+                abortControllerRef.current.abort();
+            }
+
+            const controller = new AbortController();
+            abortControllerRef.current = controller;
+
+            try {
+                await onSubmit(inputs, controller.signal);
+            } catch (err) {
+                if (
+                    controller.signal.aborted ||
+                    (err instanceof Error && err.name === 'AbortError')
+                ) {
+                    return;
+                }
+                throw err;
+            } finally {
+                if (requestId !== requestIdRef.current) {
+                    // A newer request has superseded this one; ignore results.
+                    return;
+                }
+                if (abortControllerRef.current === controller) {
+                    abortControllerRef.current = null;
+                }
+            }
+        },
+        [onSubmit]
+    );
+
     return (
         <div
             style={{
-                backgroundColor: '#161b22',
+                backgroundColor: 'var(--bg-card)',
                 borderRadius: '8px',
                 padding: '24px',
-                border: '1px solid #30363d',
+                border: '1px solid var(--border-default)',
             }}
         >
             <h2
@@ -34,7 +80,7 @@ export const ContractInteraction: React.FC<ContractInteractionProps> = ({
             </h2>
             <DynamicForm
                 func={selectedFunction}
-                onSubmit={onSubmit}
+                onSubmit={handleSubmit}
                 loading={loading}
             />
         </div>

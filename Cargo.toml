@@ -1,7 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "contracts/error_codes",
-    "contracts/math",
-    "contracts/staking_rewards",
+    "contracts/*",
+    "core",
 ]
+
+[workspace.dependencies]
+soroban-sdk = "22.0.0"
+ed25519-dalek = "=2.1.1"

@@ -59,8 +59,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 50130926446945349
-                    "lo": 355492709645010928
+                    "lo": 398140299220290939
                   }
                 }
               ]
@@ -85,8 +84,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 870064092811774438
-                    "lo": 124762536472384040
+                    "lo": 520282853232442103
                   }
                 }
               ]
@@ -111,15 +109,13 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 50130926446945349
-                    "lo": 355492709645010928
+                    "lo": 398140299220290939
                   }
                 },
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 870064092811774438
-                    "lo": 124762536472384040
+                    "lo": 520282853232442103
                   }
                 }
               ]
@@ -141,8 +137,7 @@
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 50130926446945349
-                        "lo": 355492709645010928
+                        "lo": 398140299220290939
                       }
                     }
                   ]
@@ -165,8 +160,7 @@
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 870064092811774438
-                        "lo": 124762536472384040
+                        "lo": 520282853232442103
                       }
                     }
                   ]
@@ -228,65 +222,6 @@
         }
       ]
     ],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
-              "function_name": "swap",
-              "args": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                },
-                {
-                  "bool": false
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 291417319641333908
-                  }
-                },
-                {
-                  "i128": {
-                    "hi": 2,
-                    "lo": 13106511852580896768
-                  }
-                }
-              ]
-            }
-          },
-          "sub_invocations": [
-            {
-              "function": {
-                "contract_fn": {
-                  "contract_address": "CBEPDNVYXQGWB5YUBXKJWYJA7OXTZW5LFLNO5JRRGE6Z6C5OSUZPCCEL",
-                  "function_name": "transfer",
-                  "args": [
-                    {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                    },
-                    {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                    },
-                    {
-                      "i128": {
-                        "hi": 0,
-                        "lo": 25322839136356741
-                      }
-                    }
-                  ]
-                }
-              },
-              "sub_invocations": []
-            }
-          ]
-        }
-      ]
-    ],
-    [],
     []
   ],
   "ledger": {
@@ -591,8 +526,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 208847118823495613
-                    "lo": 210599554018407896
+                    "lo": 455132476170566423
                   }
                 }
               }
@@ -641,7 +575,7 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "GuardAdmins"
+                              "symbol": "Admins"
                             }
                           ]
                         },
@@ -657,12 +591,16 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "GuardThreshold"
+                              "symbol": "PauseState"
                             }
                           ]
                         },
                         "val": {
-                          "u32": 1
+                          "vec": [
+                            {
+                              "u32": 0
+                            }
+                          ]
                         }
                       },
                       {
@@ -712,8 +650,7 @@
                               "val": {
                                 "i128": {
                                   "hi": 0,
-                                  "lo": 75453765583302090
-                                  "lo": 355492709645010928
+                                  "lo": 398140299220290939
                                 }
                               }
                             },
@@ -724,8 +661,7 @@
                               "val": {
                                 "i128": {
                                   "hi": 0,
-                                  "lo": 578646773170440530
-                                  "lo": 124762536472384040
+                                  "lo": 520282853232442103
                                 }
                               }
                             },
@@ -752,12 +688,23 @@
                               "val": {
                                 "i128": {
                                   "hi": 0,
-                                  "lo": 208847118823495613
-                                  "lo": 210599554018407896
+                                  "lo": 455132476170566423
                                 }
                               }
                             }
                           ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "SignatureThreshold"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
                         }
                       }
                     ]
@@ -792,39 +739,6 @@
                 "key": {
                   "ledger_key_nonce": {
                     "nonce": 2032731177588607455
-                  }
-                },
-                "durability": "temporary",
-                "val": "void"
-              }
-            },
-            "ext": "v0"
-          },
-          6311999
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
-            "key": {
-              "ledger_key_nonce": {
-                "nonce": 6277191135259896685
-              }
-            },
-            "durability": "temporary"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
-                "key": {
-                  "ledger_key_nonce": {
-                    "nonce": 6277191135259896685
                   }
                 },
                 "durability": "temporary",
@@ -880,8 +794,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 75453765583302090
-                          "lo": 355492709645010928
+                          "lo": 398140299220290939
                         }
                       }
                     },
@@ -1027,7 +940,7 @@
                       "val": {
                         "i128": {
                           "hi": 2,
-                          "lo": 13081189013444540027
+                          "lo": 13106511852580896768
                         }
                       }
                     },
@@ -1212,8 +1125,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 578646773170440530
-                          "lo": 124762536472384040
+                          "lo": 520282853232442103
                         }
                       }
                     },
@@ -1359,7 +1271,7 @@
                       "val": {
                         "i128": {
                           "hi": 2,
-                          "lo": 13397929172222230676
+                          "lo": 13106511852580896768
                         }
                       }
                     },

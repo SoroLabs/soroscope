@@ -19,6 +19,18 @@ This contract provides a full-featured governance system where proposals progres
 - **Quorum Requirements**: Minimum participation thresholds
 - **Timelock Execution**: Delayed execution for security
 - **Admin Controls**: Proposal cancellation and parameter management
+- **M-of-N Execution Authorization**: A configurable, distinct set of administrators must approve execution.
+
+## Multi-signature execution
+
+Use `initialize_with_admins` to configure the execution administrator set and the required threshold. The primary `admin` remains responsible for voter management, while `execute_proposal` accepts the proposal ID and a list of approving administrators. Every approver must be a configured administrator, authorize the call, and be distinct; duplicate addresses never count twice.
+
+```rust
+client.initialize_with_admins(&primary_admin, &admins, &2, &9, &false);
+client.execute_proposal(&proposal_id, &approvers); // requires two distinct admin approvals
+```
+
+The legacy `initialize` method configures a one-of-one execution policy for backwards compatibility.
 
 ## Proposal States
 
@@ -52,7 +64,7 @@ fn cancel_proposal_admin(e: Env, proposal_id: u32)  // Admin only
 ### Voting
 ```rust
 fn cast_vote(e: Env, proposal_id: u32, support: bool)
-fn delegate(e: Env, delegate: Address)
+fn delegate(e: Env, delegator: Address, delegate: Address) -> Result<(), Error>
 fn set_voting_power(e: Env, user: Address, power: i128)  // Admin only
 ```
 
@@ -89,7 +101,7 @@ client.start_voting(&proposal_id);
 client.cast_vote(&proposal_id, &true);
 
 // Or delegate
-client.delegate(&trusted_delegate);
+client.delegate(&user1, &trusted_delegate);
 
 // Queue successful proposal
 client.queue_proposal(&proposal_id);
@@ -103,7 +115,7 @@ client.execute_proposal(&proposal_id);
 - **Timelock**: Prevents flash loan attacks on governance
 - **Quorum Requirements**: Ensures sufficient participation
 - **Admin Oversight**: Emergency cancellation capabilities
-- **Delegation Safety**: Secure voting power delegation
+- **Delegation Safety**: Registered voters can delegate to other registered voters; cycles are rejected and delegated voting units are aggregated at the final delegate when a proposal is created.
 - **State Validation**: Strict state transitions
 
 ## Building

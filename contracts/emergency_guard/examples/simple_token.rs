@@ -129,8 +129,6 @@ impl SimpleToken {
             .set(&DataKey::TotalSupply, &(supply - amount));
     }
 
-    pub fn get_pause_state(env: Env) -> u32 {
-        EmergencyGuard::get_pause_state(env)
     // ==== EMERGENCY GUARD FUNCTIONS ====
 
     /// Pause only transfers (minting and burning still work)
@@ -145,7 +143,6 @@ impl SimpleToken {
 
     /// Resume transfers
     pub fn resume_transfers(env: Env) {
-        DefaultEmergencyGuard::unpause(&env, PauseType::TRANSFER).expect("Unauthorized");
         let admin: Address = env
             .storage()
             .instance()
@@ -229,8 +226,6 @@ impl SimpleToken {
 
     pub fn get_threshold(env: Env) -> u32 {
         EmergencyGuard::get_threshold(env)
-    }
-
     }
 
     /// Add new admin (requires existing admin authorization)

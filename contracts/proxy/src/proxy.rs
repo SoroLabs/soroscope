@@ -1,6 +1,23 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, BytesN, Env, IntoVal, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    IntoVal, Symbol, Val, Vec,
 };
+
+pub const TIMELOCK_DELAY: u64 = 172_800; // 48 hours in seconds (48 * 60 * 60)
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Error {
+    InvalidImplementation = 1,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingUpgrade {
+    pub new_implementation: Address,
+    pub eta: u64,
+}
 
 #[contracttype]
 pub enum DataKey {
@@ -8,6 +25,16 @@ pub enum DataKey {
     Implementation,
     Counter,
     Storage(BytesN<32>),
+    PendingUpgrade,
+}
+
+fn validate_implementation(env: &Env, implementation: &Address) -> Result<(), Error> {
+    let method = Symbol::new(env, "calculate");
+    let args = Vec::from_array(env, [0i32.into_val(env), 0i32.into_val(env)]);
+    match env.try_invoke_contract::<i32, soroban_sdk::InvokeError>(implementation, &method, args) {
+        Ok(Ok(_)) => Ok(()),
+        _ => Err(Error::InvalidImplementation),
+    }
 }
 
 #[contract]
@@ -16,53 +43,171 @@ pub struct Proxy;
 #[contractimpl]
 impl Proxy {
     pub fn initialize(env: Env, admin: Address, implementation: Address) {
-        if env.storage().persistent().has(&DataKey::Admin) {
+        if env.storage().instance().has(&DataKey::Admin) {
             panic!("Proxy already initialized");
         }
 
-        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
-            .persistent()
+            .instance()
             .set(&DataKey::Implementation, &implementation);
-        env.storage().persistent().set(&DataKey::Counter, &0i32);
+        env.storage().instance().set(&DataKey::Counter, &0i32);
     }
 
     pub fn get_admin(env: Env) -> Address {
-        env.storage().persistent().get(&DataKey::Admin).unwrap()
+        env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
     pub fn get_implementation(env: Env) -> Address {
         env.storage()
-            .persistent()
+            .instance()
             .get(&DataKey::Implementation)
             .unwrap()
     }
 
-    pub fn upgrade_to(env: Env, implementation: Address) {
+    /// Returns pending upgrade details if one exists
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().persistent().get(&DataKey::PendingUpgrade)
+    }
+    /// Step 1: Propose an upgrade with a 48-hour timelock delay
+    pub fn propose_upgrade(env: Env, new_implementation: Address) -> Result<(), Error> {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
+        validate_implementation(&env, &new_implementation)?;
+
+        let eta = env.ledger().timestamp() + TIMELOCK_DELAY;
+        let proposal = PendingUpgrade {
+            new_implementation: new_implementation.clone(),
+            eta,
+        };
+
         env.storage()
             .persistent()
-            .set(&DataKey::Implementation, &implementation);
+            .set(&DataKey::PendingUpgrade, &proposal);
+
+        env.events()
+            .publish((symbol_short!("propose"),), (new_implementation, eta));
+        Ok(())
     }
 
+    /// Step 2: Execute the pending upgrade once 48 hours have passed
+    pub fn execute_upgrade(env: Env) -> Result<(), Error> {
+        let admin = Self::get_admin(env.clone());
+        admin.require_auth();
+
+        let proposal: PendingUpgrade = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingUpgrade)
+            .expect("No pending upgrade proposal found");
+
+        if env.ledger().timestamp() < proposal.eta {
+            panic!("Timelock delay of 48 hours has not elapsed");
+        }
+
+        validate_implementation(&env, &proposal.new_implementation)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Implementation, &proposal.new_implementation);
+
+        env.storage().persistent().remove(&DataKey::PendingUpgrade);
+
+        env.events()
+            .publish((symbol_short!("upgraded"),), proposal.new_implementation);
+        Ok(())
+    }
+
+    /// Step 3: Admin can cancel a pending upgrade
+    pub fn cancel_upgrade(env: Env) {
+        let admin = Self::get_admin(env.clone());
+        admin.require_auth();
+
+        env.storage().persistent().remove(&DataKey::PendingUpgrade);
+
+        env.events().publish((symbol_short!("cancel"),), ());
+    }
+
+    /// Legacy upgrade method kept for backward compatibility (delegates to proposal flow)
+    pub fn upgrade_to(env: Env, implementation: Address) -> Result<(), Error> {
+        Self::propose_upgrade(env, implementation)
+    }
+
+    /// Execute the pending upgrade (after timelock) and immediately call a method on the new implementation.
+    /// The upgrade must have already been proposed via `propose_upgrade` and the 48-hour
+    /// timelock must have elapsed before calling this.
     pub fn upgrade_to_and_call(
         env: Env,
         implementation: Address,
         method: Symbol,
         args: Vec<Val>,
-    ) -> Val {
+    ) -> Result<Val, Error> {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
-        env.storage()
+
+        let proposal: PendingUpgrade = env
+            .storage()
             .persistent()
-            .set(&DataKey::Implementation, &implementation);
-        Self::delegate_call(env, method, args)
+            .get(&DataKey::PendingUpgrade)
+            .expect("No pending upgrade proposal – call propose_upgrade first");
+
+        if proposal.new_implementation != implementation {
+            panic!("Implementation does not match the pending proposal");
+        }
+
+        if env.ledger().timestamp() < proposal.eta {
+            panic!("Timelock delay of 48 hours has not elapsed");
+        }
+
+        validate_implementation(&env, &proposal.new_implementation)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Implementation, &proposal.new_implementation);
+        env.storage().persistent().remove(&DataKey::PendingUpgrade);
+
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            proposal.new_implementation.clone(),
+        );
+
+        Ok(Self::invoke_implementation(&env, &implementation, &method, args, None))
     }
 
-    pub fn delegate_call(env: Env, method: Symbol, args: Vec<Val>) -> Val {
+    /// Call `method` on the current implementation on behalf of `caller`.
+    ///
+    /// Soroban always reports the immediate calling contract as the invoker of a
+    /// cross-contract call, so the implementation cannot recover the original
+    /// user from the host. To keep authorization checks meaningful, the proxy
+    /// requires the caller's authorization and forwards it to the implementation
+    /// as the **first** argument of the call. Implementation entry points invoked
+    /// through the proxy must therefore accept `caller: Address` as their first
+    /// parameter and call `caller.require_auth()` themselves.
+    pub fn delegate_call(env: Env, caller: Address, method: Symbol, args: Vec<Val>) -> Val {
+        caller.require_auth();
         let implementation = Self::get_implementation(env.clone());
-        env.invoke_contract(&implementation, &method, args)
+        Self::invoke_implementation(&env, &implementation, &method, args, Some(caller))
+    }
+
+    /// Invoke `method` on `implementation`, optionally prepending `caller` to the
+    /// argument list so the implementation can authenticate the original user.
+    fn invoke_implementation(
+        env: &Env,
+        implementation: &Address,
+        method: &Symbol,
+        args: Vec<Val>,
+        caller: Option<Address>,
+    ) -> Val {
+        let forwarded: Vec<Val> = match caller {
+            Some(caller) => {
+                let mut forwarded = Vec::new(env);
+                forwarded.push_back(caller.into_val(env));
+                for arg in args.iter() {
+                    forwarded.push_back(arg);
+                }
+                forwarded
+            }
+            None => args,
+        };
+        env.invoke_contract(implementation, method, forwarded)
     }
 
     pub fn increment(env: Env, amount: i32) -> i32 {
@@ -75,14 +220,11 @@ impl Proxy {
     }
 
     pub fn get_value(env: Env) -> i32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Counter)
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::Counter).unwrap_or(0)
     }
 
     pub fn set_value(env: Env, value: i32) {
-        env.storage().persistent().set(&DataKey::Counter, &value);
+        env.storage().instance().set(&DataKey::Counter, &value);
     }
 
     pub fn set_storage(env: Env, key: BytesN<32>, value: Val) {

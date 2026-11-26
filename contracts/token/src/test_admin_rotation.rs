@@ -6,11 +6,13 @@ fn setup(env: &Env) -> (TokenClient<'_>, Address) {
     let contract_id = env.register(Token, ());
     let client = TokenClient::new(env, &contract_id);
     let admin = Address::generate(env);
+    let guardian = Address::generate(env);
     client.initialize(
         &admin,
         &7,
         &String::from_str(env, "Test Token"),
         &String::from_str(env, "TEST"),
+        &guardian,
     );
     (client, admin)
 }

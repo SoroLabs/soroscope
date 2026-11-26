@@ -131,7 +131,7 @@
 1. All of the above paths, sequentially
 2. Read [contracts/emergency_guard/README.md](contracts/emergency_guard/README.md) - API docs (20 min)
 3. Study [simple_token.rs](contracts/emergency_guard/examples/simple_token.rs) example (15 min)
-4. Review [src/test.rs](contracts/emergency_guard/src/test.rs) test cases (15 min)
+4. Review [contracts/emergency_guard/src/test.rs](contracts/emergency_guard/src/test.rs) test cases (15 min)
 5. Ready for any task related to EmergencyGuard
 
 ## 📋 Quick Reference
@@ -157,10 +157,14 @@ soroscope/
 ├── IMPLEMENTATION_GUIDE.md          - Usage guide
 ├── ARCHITECTURE.md                  - System design
 ├── VISUAL_GUIDE.md                  - Visual explanations
-├── EMERGENCY_GUARD_SETUP.md         - Quick setup
 └── contracts/
     └── EMERGENCY_GUARD_INTEGRATION.md - Integration steps
 ```
+
+> **Note:** If a file listed above is not present in your checkout, it may live on a
+> feature branch or have been consolidated into another document. Use the links in
+> the sections above as the source of truth; broken links should be reported via an
+> issue so the index can be corrected.
 
 ## 🎯 Common Questions
 
@@ -215,7 +219,7 @@ soroscope/
 
 - [ ] Review [ARCHITECTURE.md](ARCHITECTURE.md) - Security section
 - [ ] Study [contracts/emergency_guard/src/lib.rs](contracts/emergency_guard/src/lib.rs) - Source code
-- [ ] Check [src/test.rs](contracts/emergency_guard/src/test.rs) - Test coverage
+- [ ] Check [contracts/emergency_guard/src/test.rs](contracts/emergency_guard/src/test.rs) - Test coverage
 - [ ] Verify [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) - Error handling
 
 ### For Technical Leads
@@ -269,3 +273,8 @@ soroscope/
 **Last Updated**: April 24, 2026  
 **Status**: ✅ Complete and ready for use  
 **Branch**: `feature/emergency-guard-trait`
+
+> **CLI note:** Examples elsewhere in the docs use the current `stellar contract build`
+> and `stellar contract deploy` commands. The legacy `soroban contract build` /
+> `soroban contract deploy` invocations are still accepted by older `soroban-cli`
+> releases for backwards compatibility, but new work should target `stellar-cli`.

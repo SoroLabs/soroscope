@@ -7,7 +7,8 @@ use soroban_sdk::{
 };
 
 const INITIAL_RATE: i128 = 100_000_000_000_000; // 0.0001 in Fixed (18 decimals)
-const DECAY_RATE: i128 = 10_000_000_000_000_000; // 0.01 in Fixed (18 decimals)
+const EPOCH_DECAY_PERCENT: i128 = 10_000_000_000_000_000; // 0.01 in Fixed (18 decimals) = 1% per epoch
+const EPOCH_LENGTH: u32 = 10;
 const STAKE_AMOUNT: i128 = 10_000;
 
 fn advance_ledger(e: &Env, by: u32) {
@@ -46,11 +47,11 @@ fn setup() -> (
         &staking_token,
         &reward_token,
         &INITIAL_RATE,
-        &DECAY_RATE,
+        &EPOCH_DECAY_PERCENT,
+        &EPOCH_LENGTH,
         &0u32, // start block
     );
 
-    // Mint staking tokens to users later, and mint reward tokens to the contract
     let reward_client = token::StellarAssetClient::new(&e, &reward_token);
     reward_client.mint(&contract_id, &1_000_000_000);
 
@@ -66,14 +67,14 @@ fn test_initialization() {
     assert_eq!(config.staking_token, staking_token);
     assert_eq!(config.reward_token, reward_token);
     assert_eq!(config.initial_rate.0, INITIAL_RATE);
-    assert_eq!(config.decay_rate.0, DECAY_RATE);
+    assert_eq!(config.epoch_decay_percent.0, EPOCH_DECAY_PERCENT);
+    assert_eq!(config.epoch_length, EPOCH_LENGTH);
     assert_eq!(config.start_block, 0);
     assert!(!config.is_paused);
 }
 
 #[test]
 fn test_stake_and_yield_accumulation_no_decay() {
-    // Re-initialize with 0 decay rate (alpha = 1)
     let e = Env::default();
     e.mock_all_auths();
     e.cost_estimate().budget().reset_unlimited();
@@ -94,7 +95,8 @@ fn test_stake_and_yield_accumulation_no_decay() {
         &staking_token,
         &reward_token,
         &INITIAL_RATE,
-        &0i128, // decay_rate = 0
+        &0i128, // epoch_decay_percent = 0 (no decay)
+        &EPOCH_LENGTH,
         &10u32, // start_block = 10
     );
 
@@ -102,7 +104,6 @@ fn test_stake_and_yield_accumulation_no_decay() {
     let staking_client = token::StellarAssetClient::new(&e, &staking_token);
     staking_client.mint(&user, &STAKE_AMOUNT);
 
-    // Fast forward ledger to block 10
     advance_ledger(&e, 10);
 
     // Stake at block 10
@@ -112,14 +113,11 @@ fn test_stake_and_yield_accumulation_no_decay() {
     assert_eq!(client.get_accrued_rewards(&user), 0);
     assert_eq!(client.get_pending_rewards(&user), 0);
 
-    // Advance 5 blocks (from 10 to 15)
+    // Advance 5 blocks (from 10 to 15) — still in epoch 0
     advance_ledger(&e, 5);
 
-    // Expected multiplier: exp(r0 * 5)
-    // r0 = 0.0001, so r0 * 5 = 0.0005
-    // exp(0.0005) = 1.00050012502
-    // Expected reward = 10,000 * (1.00050012502 - 1) = 5.0012502
-    // Truncated to integer: 5
+    // Expected: multiplier = exp(r0 * 5) = exp(0.0001 * 5) = exp(0.0005) ≈ 1.00050012502
+    // reward = 10,000 * (1.00050012502 - 1) = 5.0012502 → truncated to 5
     let pending = client.get_pending_rewards(&user);
     assert_eq!(pending, 5);
 }
@@ -132,21 +130,16 @@ fn test_stake_and_yield_accumulation_with_decay() {
     let staking_client = token::StellarAssetClient::new(&e, &staking_token);
     staking_client.mint(&user, &STAKE_AMOUNT);
 
-    // Stake at block 0
+    // Stake at block 0 — epoch 0
     client.stake(&user, &STAKE_AMOUNT);
 
-    // Advance 5 blocks (from 0 to 5)
+    // Advance 5 blocks (from 0 to 5) — still epoch 0, rate = r0 = 0.0001
     advance_ledger(&e, 5);
 
-    // Expected exponent: (r0 / d) * (1 - alpha^5)
-    // r0 = 0.0001, d = 0.01, alpha = 0.99
-    // alpha^5 = 0.99^5 = 0.9509900499
-    // 1 - alpha^5 = 0.0490099501
-    // exponent = (0.0001 / 0.01) * 0.0490099501 = 0.000490099501
-    // exp(0.000490099501) = 1.0004902196
-    // Expected reward = 10,000 * 0.0004902196 = 4.902196 => truncated to 4
+    // Expected: multiplier = exp(r0 * 5) = exp(0.0005) ≈ 1.00050012502
+    // reward = 10,000 * 0.00050012502 = 5.0012502 → truncated to 5
     let pending = client.get_pending_rewards(&user);
-    assert_eq!(pending, 4);
+    assert_eq!(pending, 5);
 
     // Claim rewards
     client.claim(&user);
@@ -155,23 +148,101 @@ fn test_stake_and_yield_accumulation_with_decay() {
 }
 
 #[test]
+fn test_epoch_boundary_decay() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    // Stake at block 0 — epoch 0
+    client.stake(&user, &STAKE_AMOUNT);
+
+    // Advance to block 10 — epoch 1 begins
+    // Blocks 0-9: epoch 0, rate = r0 = 0.0001
+    // Block 10: epoch 1, rate = r0 * (1 - 0.01)^1 = 0.0001 * 0.99 = 0.000099
+    // We advance to block 12: 10 blocks epoch 0 + 2 blocks epoch 1
+    // exponent = 10 * 0.0001 + 2 * 0.000099 = 0.001 + 0.000198 = 0.001198
+    // multiplier = exp(0.001198) ≈ 1.001198718
+    // reward = 10,000 * 0.001198718 = 11.98718 → truncated to 11
+    advance_ledger(&e, 12);
+
+    let pending = client.get_pending_rewards(&user);
+    assert_eq!(pending, 11);
+
+    // Claim to reset
+    client.claim(&user);
+
+    // Advance to block 25: remaining 8 blocks epoch 1 + 5 blocks epoch 2
+    // epoch 2 rate = r0 * 0.99^2 = 0.0001 * 0.9801 = 0.00009801
+    // exponent = 8 * 0.000099 + 5 * 0.00009801 = 0.000792 + 0.00049005 = 0.00128205
+    // multiplier = exp(0.00128205) ≈ 1.001282873
+    // reward = 10,000 * 0.001282873 = 12.82873 → truncated to 12
+    advance_ledger(&e, 13);
+
+    let pending2 = client.get_pending_rewards(&user);
+    assert_eq!(pending2, 12);
+}
+
+#[test]
+fn test_epoch_snapshot_storage() {
+    let (e, client, _, staking_token, _) = setup();
+    let contract_id = client.address.clone();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    client.stake(&user, &STAKE_AMOUNT);
+
+    // Advance to block 25 — this should create epoch 0, 1, 2 snapshots
+    advance_ledger(&e, 25);
+
+    // Trigger snapshot creation via pending_rewards
+    let _pending = client.get_pending_rewards(&user);
+
+    e.as_contract(&contract_id, || {
+        let snapshot0: EpochSnapshot = e
+            .storage()
+            .instance()
+            .get(&DataKey::EpochSnapshot(0))
+            .unwrap();
+        assert_eq!(snapshot0.rate.0, INITIAL_RATE);
+
+        let snapshot1: EpochSnapshot = e
+            .storage()
+            .instance()
+            .get(&DataKey::EpochSnapshot(1))
+            .unwrap();
+        let expected_rate1 = INITIAL_RATE * 99 / 100;
+        assert_eq!(snapshot1.rate.0, expected_rate1);
+
+        let snapshot2: EpochSnapshot = e
+            .storage()
+            .instance()
+            .get(&DataKey::EpochSnapshot(2))
+            .unwrap();
+        let expected_rate2 = INITIAL_RATE * 9801 / 10000;
+        assert_eq!(snapshot2.rate.0, expected_rate2);
+    });
+}
+
+#[test]
 fn test_compounding_interest() {
     let (e, client, _, staking_token, _) = setup();
     let user = Address::generate(&e);
 
     let staking_client = token::StellarAssetClient::new(&e, &staking_token);
-    staking_client.mint(&user, &100_000); // larger stake to see compounding clearly
+    staking_client.mint(&user, &100_000);
 
     client.stake(&user, &100_000);
 
-    // Advance 10 blocks (from 0 to 10)
+    // Advance 10 blocks (from 0 to 10) — one full epoch
     advance_ledger(&e, 10);
 
-    // Check rewards without claiming
     let pending_1 = client.get_pending_rewards(&user);
 
-    // Let's do another action to write back accrued rewards to storage (e.g. withdraw 0, or we can just let it update)
-    // Staking 1 more token triggers a reward update and stores the accrued reward
+    // Stake 1 more to trigger write-back
     staking_client.mint(&user, &1);
     client.stake(&user, &1);
 
@@ -179,10 +250,9 @@ fn test_compounding_interest() {
     assert!(accrued > 0);
     assert_eq!(accrued, pending_1);
 
-    // Now advance another 10 blocks (from 10 to 20)
+    // Advance another 10 blocks
     advance_ledger(&e, 10);
 
-    // The new pending rewards should compound on (staked_amount + accrued_rewards)
     let pending_2 = client.get_pending_rewards(&user);
     assert!(pending_2 > accrued);
 }
@@ -198,24 +268,94 @@ fn test_zero_stake_security() {
     client.stake(&user, &STAKE_AMOUNT);
     advance_ledger(&e, 10);
 
-    // User has accrued rewards
     let pending = client.get_pending_rewards(&user);
     assert!(pending > 0);
 
-    // Withdraw entire principal
     client.withdraw(&user, &STAKE_AMOUNT);
     assert_eq!(client.get_staked_balance(&user), 0);
 
-    // Accrued rewards are saved
     let accrued = client.get_accrued_rewards(&user);
     assert_eq!(accrued, pending);
 
-    // Advance another 10 blocks
+    // Advance another 10 blocks — no compounding since stake = 0
     advance_ledger(&e, 10);
 
-    // Since stake is 0, compounding is inactive. Accrued rewards must NOT increase!
     let pending_after = client.get_pending_rewards(&user);
     assert_eq!(pending_after, accrued);
+}
+
+/// Regression test for issue #124: the reward-index calculation must never
+/// panic with a subtraction underflow when the user's staked balance is zero
+/// (or after a full withdrawal leaves a zero balance with accrued rewards).
+#[test]
+fn test_zero_stake_no_underflow() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    // Stake, accrue rewards, then withdraw everything, leaving balance = 0.
+    client.stake(&user, &STAKE_AMOUNT);
+    advance_ledger(&e, 10);
+    client.withdraw(&user, &STAKE_AMOUNT);
+    assert_eq!(client.get_staked_balance(&user), 0);
+
+    let accrued = client.get_accrued_rewards(&user);
+    assert!(accrued > 0);
+
+    // With zero stake, advancing across several epochs must not underflow or
+    // panic — pending rewards simply stay pinned to the accrued carryover.
+    for _ in 0..3 {
+        advance_ledger(&e, 10);
+        assert_eq!(client.get_pending_rewards(&user), accrued);
+        assert_eq!(client.get_accrued_rewards(&user), accrued);
+        assert_eq!(client.get_staked_balance(&user), 0);
+    }
+
+    // Claiming with a zero balance returns the accrued rewards without panic.
+    assert_eq!(client.claim(&user), accrued);
+    assert_eq!(client.get_accrued_rewards(&user), 0);
+
+    // Re-staking from zero balance is also underflow-safe.
+    staking_client.mint(&user, &STAKE_AMOUNT);
+    client.stake(&user, &STAKE_AMOUNT);
+    assert_eq!(client.get_staked_balance(&user), STAKE_AMOUNT);
+    advance_ledger(&e, 5);
+    assert!(client.get_pending_rewards(&user) > 0);
+
+    // A never-before-seen user with no stake reports zero, not an error/panic.
+    let stranger = Address::generate(&e);
+    assert_eq!(client.get_staked_balance(&stranger), 0);
+    assert_eq!(client.get_pending_rewards(&stranger), 0);
+}
+
+#[test]
+fn test_multi_epoch_accumulation() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    client.stake(&user, &STAKE_AMOUNT);
+
+    // Advance 100 blocks = 10 full epochs
+    advance_ledger(&e, 100);
+
+    // Rate per epoch:
+    // epoch 0: r0 = 0.0001
+    // epoch 1: r0 * 0.99
+    // epoch 2: r0 * 0.99^2
+    // etc.
+    // Total exponent = 10 * r0 * sum_{k=0}^{9} 0.99^k
+    // sum = (1 - 0.99^10) / (1 - 0.99) = (1 - 0.904382) / 0.01 = 9.5618
+    // exponent = 10 * 0.0001 * 9.5618 = 0.0095618
+    // multiplier = exp(0.0095618) ≈ 1.009607
+    // reward = 10,000 * (1.009607 - 1) = 96.07 → truncated to 96
+    let pending = client.get_pending_rewards(&user);
+    assert!(pending > 90);
+    assert!(pending < 110);
 }
 
 #[test]
@@ -229,22 +369,18 @@ fn test_emergency_withdraw() {
     client.stake(&user, &STAKE_AMOUNT);
     advance_ledger(&e, 10);
 
-    // Verify rewards accrued
     assert!(client.get_pending_rewards(&user) > 0);
 
     // Pause staking to simulate extreme conditions
     client.pause_staking();
 
-    // Emergency withdraw should succeed even when paused
     let withdrawn = client.emergency_withdraw(&user);
     assert_eq!(withdrawn, STAKE_AMOUNT);
 
-    // Verify stake balance is zero and user state is cleared (rewards forfeited)
     assert_eq!(client.get_staked_balance(&user), 0);
     assert_eq!(client.get_accrued_rewards(&user), 0);
     assert_eq!(client.get_pending_rewards(&user), 0);
 
-    // Verify principal token is fully returned to the user
     let token_balance = token::Client::new(&e, &staking_token).balance(&user);
     assert_eq!(token_balance, STAKE_AMOUNT);
 }
@@ -292,11 +428,6 @@ fn test_pause_safeguards_claim() {
 
 #[test]
 fn test_successful_withdrawal() {
-/// Verifies that the CLAIM_REWARDS granular pause blocks claims independently
-/// of the global `is_paused` flag, satisfying issue #463 acceptance criteria.
-#[test]
-#[should_panic(expected = "Contract, #14")]
-fn test_granular_claim_rewards_pause() {
     let (e, client, _, staking_token, _) = setup();
     let user = Address::generate(&e);
 
@@ -316,6 +447,28 @@ fn test_granular_claim_rewards_pause() {
     // Verify tokens returned to user
     let token_balance = token::Client::new(&e, &staking_token).balance(&user);
     assert_eq!(token_balance, STAKE_AMOUNT);
+}
+
+/// Verifies that the CLAIM_REWARDS granular pause blocks claims independently
+/// of the global `is_paused` flag, satisfying issue #463 acceptance criteria.
+#[test]
+#[should_panic(expected = "Contract, #14")]
+fn test_granular_claim_rewards_pause() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    client.stake(&user, &STAKE_AMOUNT);
+    advance_ledger(&e, 5);
+
+    // Activate CLAIM_REWARDS granular pause via the contract's delegation function.
+    // Global is_paused remains false — only the granular bitmask bit is set.
+    client.set_claim_rewards_paused(&true);
+
+    // Claim MUST fail with ContractError::Paused (error code 14).
+    client.claim(&user);
 }
 
 #[test]
@@ -485,13 +638,145 @@ fn test_granular_pause_staking() {
     // Stake should work again after resume
     client.stake(&user, &STAKE_AMOUNT);
     assert_eq!(client.get_staked_balance(&user), STAKE_AMOUNT * 2);
+}
+
+#[test]
+fn test_emergency_withdraw_with_penalty_fee() {
+    let (e, client, _owner, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
     client.stake(&user, &STAKE_AMOUNT);
-    advance_ledger(&e, 5);
+    assert_eq!(client.get_staked_balance(&user), STAKE_AMOUNT);
 
-    // Activate CLAIM_REWARDS granular pause via the contract's delegation function.
-    // Global is_paused remains false — only the granular bitmask bit is set.
-    client.set_claim_rewards_paused(&true);
+    // Set 10% penalty fee (1000 bps)
+    assert_eq!(client.get_penalty_fee(), 0);
+    client.set_penalty_fee(&1000);
+    assert_eq!(client.get_penalty_fee(), 1000);
 
-    // Claim MUST fail with ContractError::Paused (error code 14).
-    client.claim(&user);
+    // Emergency withdraw with 10% penalty
+    let payout = client.emergency_withdraw(&user);
+    // STAKE_AMOUNT is 10,000; 10% penalty is 1,000; payout should be 9,000
+    assert_eq!(payout, 9_000);
+    assert_eq!(client.get_staked_balance(&user), 0);
+
+    let token_balance = token::Client::new(&e, &staking_token).balance(&user);
+    assert_eq!(token_balance, 9_000);
+}
+
+#[test]
+fn test_admin_withdraw_surplus_success_different_tokens() {
+    let (e, client, owner, _, reward_token) = setup();
+    let reward_client = token::Client::new(&e, &reward_token);
+
+    // In setup, 1_000_000_000 reward tokens were minted to contract.
+    // staking_token != reward_token, so total_staked_principal does not restrict reward_token.
+    let balance_before = reward_client.balance(&owner);
+    client.admin_withdraw(&500_000);
+    let balance_after = reward_client.balance(&owner);
+    assert_eq!(balance_after - balance_before, 500_000);
+}
+
+#[test]
+fn test_admin_withdraw_surplus_success_same_token() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let owner = Address::generate(&e);
+    let token_admin = Address::generate(&e);
+    let common_token = e
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = e.register(StakingRewards, ());
+    let client = StakingRewardsClient::new(&e, &contract_id);
+
+    client.initialize(
+        &owner,
+        &common_token,
+        &common_token,
+        &INITIAL_RATE,
+        &0i128,
+        &EPOCH_LENGTH,
+        &0u32,
+    );
+
+    let token_admin_client = token::StellarAssetClient::new(&e, &common_token);
+    let token_client = token::Client::new(&e, &common_token);
+    // Mint 100_000 surplus reward tokens to contract
+    token_admin_client.mint(&contract_id, &100_000);
+
+    // User stakes 40_000
+    let user = Address::generate(&e);
+    token_admin_client.mint(&user, &40_000);
+    client.stake(&user, &40_000);
+
+    // Total contract balance = 140_000, Total staked = 40_000, Max withdrawable = 100_000
+    // Admin withdraws 60_000 (within 100_000 surplus)
+    let owner_before = token_client.balance(&owner);
+    client.admin_withdraw(&60_000);
+    let owner_after = token_client.balance(&owner);
+    assert_eq!(owner_after - owner_before, 60_000);
+
+    // Remaining surplus = 40_000. Trying to withdraw 40_001 should fail.
+    let err = client.try_admin_withdraw(&40_001);
+    assert_eq!(err, Err(Ok(ContractError::WithdrawExceedsSurplus)));
+
+    // Admin withdraws exactly the remaining 40_000 surplus
+    client.admin_withdraw(&40_000);
+
+    // Now zero surplus remains; any further admin withdrawal must fail
+    let err2 = client.try_admin_withdraw(&1);
+    assert_eq!(err2, Err(Ok(ContractError::WithdrawExceedsSurplus)));
+
+    // User can still safely withdraw their 40_000 staked principal!
+    client.withdraw(&user, &40_000);
+    assert_eq!(token_client.balance(&user), 40_000);
+}
+
+#[test]
+fn test_admin_withdraw_exceeds_surplus_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let owner = Address::generate(&e);
+    let token_admin = Address::generate(&e);
+    let common_token = e
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = e.register(StakingRewards, ());
+    let client = StakingRewardsClient::new(&e, &contract_id);
+
+    client.initialize(
+        &owner,
+        &common_token,
+        &common_token,
+        &INITIAL_RATE,
+        &0i128,
+        &EPOCH_LENGTH,
+        &0u32,
+    );
+
+    let token_client = token::StellarAssetClient::new(&e, &common_token);
+
+    // User stakes 50_000
+    let user = Address::generate(&e);
+    token_client.mint(&user, &50_000);
+    client.stake(&user, &50_000);
+
+    // No surplus was minted! Total balance = 50,000, Total staked = 50,000, max_withdrawable = 0
+    let res = client.try_admin_withdraw(&1);
+    assert_eq!(res, Err(Ok(ContractError::WithdrawExceedsSurplus)));
+}
+
+#[test]
+fn test_admin_withdraw_zero_or_negative_fails() {
+    let (_, client, _, _, _) = setup();
+    assert_eq!(client.try_admin_withdraw(&0), Err(Ok(ContractError::InvalidInput)));
+    assert_eq!(client.try_admin_withdraw(&-10), Err(Ok(ContractError::InvalidInput)));
 }

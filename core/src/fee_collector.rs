@@ -1,11 +1,19 @@
 use crate::fee_store::{FeeStore, LedgerFeeSample};
+use crate::leader_lock::RedisLeaderLock;
 use crate::rpc_provider::ProviderRegistry;
+use crate::AppMetrics;
 use chrono::Utc;
 use reqwest::Client;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing;
+
+/// Maximum number of fee samples retained in memory while waiting to be
+/// persisted. Bounds memory growth during prolonged storage outages.
+pub const MAX_BUFFERED_SAMPLES: usize = 2_000;
 
 /// Errors that can occur during fee collection
 #[derive(Error, Debug)]
@@ -53,7 +61,17 @@ pub struct FeeCollector {
     store: Arc<FeeStore>,
     client: Client,
     config: FeeCollectorConfig,
-    last_collected_sequence: std::sync::atomic::AtomicU64,
+    last_collected_sequence: AtomicU64,
+    metrics: Arc<AppMetrics>,
+    /// Leader-election lease. Only the instance holding it persists ledger
+    /// fee samples, so running multiple Core instances doesn't cause
+    /// duplicate collection or racing writes to `FeeStore`.
+    leader_lock: Arc<RedisLeaderLock>,
+    /// Bounded ring buffer of fee samples awaiting persistence. Samples are
+    /// only removed after a successful `store.upsert_ledger_sample`.
+    buffered_samples: Mutex<VecDeque<LedgerFeeSample>>,
+    /// Total number of samples evicted from the buffer because it was full.
+    dropped_fee_samples_total: AtomicU64,
 }
 
 impl FeeCollector {
@@ -62,6 +80,8 @@ impl FeeCollector {
         registry: Arc<ProviderRegistry>,
         store: Arc<FeeStore>,
         config: FeeCollectorConfig,
+        metrics: Arc<AppMetrics>,
+        leader_lock: Arc<RedisLeaderLock>,
     ) -> Self {
         Self {
             registry,
@@ -71,12 +91,96 @@ impl FeeCollector {
                 .build()
                 .expect("Failed to create HTTP client"),
             config,
-            last_collected_sequence: std::sync::atomic::AtomicU64::new(0),
+            last_collected_sequence: AtomicU64::new(0),
+            metrics,
+            leader_lock,
+            buffered_samples: Mutex::new(VecDeque::with_capacity(MAX_BUFFERED_SAMPLES)),
+            dropped_fee_samples_total: AtomicU64::new(0),
         }
     }
 
-    /// Run the background collection loop
-    pub async fn run_collection_loop(self: Arc<Self>) {
+    /// Number of fee samples dropped because the in-memory buffer was full.
+    pub fn dropped_fee_samples_total(&self) -> u64 {
+        self.dropped_fee_samples_total.load(Ordering::Relaxed)
+    }
+
+    /// Current number of buffered (not yet persisted) fee samples.
+    pub fn buffered_sample_count(&self) -> usize {
+        self.buffered_samples
+            .lock()
+            .expect("buffered_samples mutex poisoned")
+            .len()
+    }
+
+    /// Insert a sample into the bounded buffer, deduplicating by
+    /// `ledger_sequence` and evicting the oldest entry when full.
+    fn buffer_sample(&self, sample: LedgerFeeSample) {
+        let mut buffer = self
+            .buffered_samples
+            .lock()
+            .expect("buffered_samples mutex poisoned");
+
+        // Deduplicate: repeated RPC polls of the same ledger must not insert
+        // duplicate entries.
+        if buffer
+            .iter()
+            .any(|s| s.ledger_sequence == sample.ledger_sequence)
+        {
+            return;
+        }
+
+        buffer.push_back(sample);
+
+        while buffer.len() > MAX_BUFFERED_SAMPLES {
+            buffer.pop_front();
+            self.dropped_fee_samples_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Attempt to persist all buffered samples. Samples are only removed from
+    /// the buffer after a successful write, so a storage failure retains at
+    /// most `MAX_BUFFERED_SAMPLES` entries.
+    async fn flush_buffered_samples(&self) -> Result<(), FeeCollectorError> {
+        loop {
+            let next = {
+                let buffer = self
+                    .buffered_samples
+                    .lock()
+                    .expect("buffered_samples mutex poisoned");
+                buffer.front().cloned()
+            };
+
+            let Some(sample) = next else {
+                return Ok(());
+            };
+
+            self.store
+                .upsert_ledger_sample(&sample)
+                .await
+                .map_err(|e| FeeCollectorError::StoreError(e.to_string()))?;
+
+            let mut buffer = self
+                .buffered_samples
+                .lock()
+                .expect("buffered_samples mutex poisoned");
+            // Remove the sample we just persisted (it should be at the front).
+            if buffer
+                .front()
+                .map(|s| s.ledger_sequence == sample.ledger_sequence)
+                .unwrap_or(false)
+            {
+                buffer.pop_front();
+            } else {
+                buffer.retain(|s| s.ledger_sequence != sample.ledger_sequence);
+            }
+        }
+    }
+
+    /// Run the background collection loop until a shutdown signal is received.
+    pub async fn run_collection_loop(
+        self: Arc<Self>,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) {
         let mut interval =
             tokio::time::interval(Duration::from_secs(self.config.collection_interval_secs));
 
@@ -86,22 +190,65 @@ impl FeeCollector {
         );
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                biased;
+                _ = shutdown.recv() => {
+                    tracing::info!("Fee collector shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    if !self.leader_lock.try_acquire_or_renew().await {
+                        tracing::debug!("not leader this cycle, skipping fee collection");
+                        continue;
+                    }
 
-            if let Err(e) = self.collect_latest_fees().await {
-                tracing::error!(error = %e, "Failed to collect fee data");
+                    let started_at = Instant::now();
+                    let result = self.collect_latest_fees().await;
+                    self.metrics
+                        .indexing_latency_seconds
+                        .with_label_values(&["fee_collector"])
+                        .observe(started_at.elapsed().as_secs_f64());
+
+                    match result {
+                        Ok(true) => {
+                            self.metrics
+                                .events_processed_total
+                                .with_label_values(&["fee_collector"])
+                                .inc();
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to collect fee data");
+                            self.metrics
+                                .indexing_errors_total
+                                .with_label_values(&["fee_collector"])
+                                .inc();
+                        }
+                    }
+                }
             }
         }
     }
 
-    /// Collect fee data from the latest ledger
-    async fn collect_latest_fees(&self) -> Result<(), FeeCollectorError> {
+    /// Collect fee data from the latest ledger. Returns `true` when a new
+    /// ledger's fee sample was fetched and persisted, `false` when there was
+    /// nothing new to collect.
+    async fn collect_latest_fees(&self) -> Result<bool, FeeCollectorError> {
         // Get latest ledger sequence
         let latest_sequence = self.get_latest_ledger_sequence().await?;
 
-        let last_collected = self
+        let mut last_collected = self
             .last_collected_sequence
             .load(std::sync::atomic::Ordering::Relaxed);
+
+        // If in-memory state is uninitialized, load from the database
+        if last_collected == 0 {
+            if let Ok(Some(db_latest)) = self.store.get_latest_sequence().await {
+                last_collected = db_latest as u64;
+                self.last_collected_sequence
+                    .store(last_collected, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
 
         // Skip if we've already collected this ledger
         if latest_sequence <= last_collected {
@@ -110,17 +257,79 @@ impl FeeCollector {
                 last_collected = last_collected,
                 "No new ledgers to collect"
             );
-            return Ok(());
+            return Ok(false);
         }
 
-        // Fetch ledger details
+        // Trigger automatic catch-up replay loop upon reconnection / gap detection
+        if last_collected > 0 && latest_sequence > last_collected + 1 {
+            let start = last_collected + 1;
+            let end = latest_sequence - 1;
+            tracing::info!(
+                start = start,
+                end = end,
+                "RPC Node re-synchronized. Catching up missed ledgers."
+            );
+            for seq in start..=end {
+                match self.fetch_ledger_fee_data(seq).await {
+                    Ok(sample) => {
+                        if let Err(e) = self.store.upsert_ledger_sample(&sample).await {
+                            tracing::error!(
+                                ledger = seq,
+                                error = %e,
+                                "Failed to save catch-up ledger sample"
+                            );
+                            break;
+                        }
+                        self.last_collected_sequence
+                            .store(seq, std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!(ledger = seq, "Successfully caught up missed ledger");
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            ledger = seq,
+                            error = %e,
+                            "Failed to fetch catch-up ledger details; stopping catch-up replay"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Fetch latest ledger details
         let sample = self.fetch_ledger_fee_data(latest_sequence).await?;
 
-        // Store in database
+        // Buffer the sample (bounded + deduplicated) before persisting.
+        self.buffer_sample(sample.clone());
+
+        // Store in database. On failure the sample remains buffered (bounded),
+        // so memory growth is capped during storage outages.
         self.store
             .upsert_ledger_sample(&sample)
             .await
             .map_err(|e| FeeCollectorError::StoreError(e.to_string()))?;
+
+        // Remove the persisted sample from the buffer.
+        {
+            let mut buffer = self
+                .buffered_samples
+                .lock()
+                .expect("buffered_samples mutex poisoned");
+            if buffer
+                .front()
+                .map(|s| s.ledger_sequence == sample.ledger_sequence)
+                .unwrap_or(false)
+            {
+                buffer.pop_front();
+            } else {
+                buffer.retain(|s| s.ledger_sequence != sample.ledger_sequence);
+            }
+        }
+
+        // Drain any previously buffered samples now that storage is healthy.
+        if let Err(e) = self.flush_buffered_samples().await {
+            tracing::warn!(error = %e, "Failed to flush buffered fee samples");
+        }
 
         // Update last collected sequence
         self.last_collected_sequence
@@ -133,7 +342,7 @@ impl FeeCollector {
             "Collected fee data"
         );
 
-        Ok(())
+        Ok(true)
     }
 
     /// Get the latest ledger sequence from RPC
@@ -383,6 +592,20 @@ impl FeeCollector {
         self.last_collected_sequence
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Fetch and store fee data for a single ledger sequence.
+    ///
+    /// Used by the `reindex` CLI subcommand to re-process historical ledgers.
+    /// The data is upserted so re-running over the same range is idempotent.
+    pub async fn fetch_and_store_ledger(&self, sequence: u64) -> Result<(), FeeCollectorError> {
+        let sample = self.fetch_ledger_fee_data(sequence).await?;
+        self.store
+            .upsert_ledger_sample(&sample)
+            .await
+            .map_err(|e| FeeCollectorError::StoreError(e.to_string()))?;
+        tracing::debug!(ledger = sequence, "Re-indexed ledger");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -395,5 +618,151 @@ mod tests {
         assert_eq!(config.collection_interval_secs, 5);
         assert_eq!(config.batch_size, 10);
         assert_eq!(config.request_timeout, Duration::from_secs(10));
+    }
+
+    fn sample(sequence: i64) -> LedgerFeeSample {
+        LedgerFeeSample {
+            ledger_sequence: sequence,
+            collected_at: Utc::now(),
+            base_reserve: 0,
+            base_fee: 100,
+            max_fee: 100,
+            fee_charged: 0,
+            transaction_count: 0,
+            ledger_close_time: Utc::now(),
+        }
+    }
+
+    async fn test_collector() -> Arc<FeeCollector> {
+        let registry = ProviderRegistry::new(vec![crate::rpc_provider::RpcProvider {
+            name: "test".to_string(),
+            url: "http://127.0.0.1:9".to_string(),
+            auth_header: None,
+            auth_value: None,
+            advertise: None,
+        }]);
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        let store = Arc::new(FeeStore::new(pool));
+        let metrics = Arc::new(AppMetrics::new().expect("metrics"));
+        let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+        let leader_lock = Arc::new(RedisLeaderLock::new(
+            redis_client,
+            "test_fee_collector",
+            Duration::from_secs(10),
+        ));
+        Arc::new(FeeCollector::new(
+            registry,
+            store,
+            FeeCollectorConfig::default(),
+            metrics,
+            leader_lock,
+        ))
+    }
+
+    #[tokio::test]
+    async fn duplicate_ledger_samples_are_deduplicated() {
+        let collector = test_collector().await;
+
+        for _ in 0..5 {
+            collector.buffer_sample(sample(42));
+        }
+
+        assert_eq!(collector.buffered_sample_count(), 1);
+        assert_eq!(collector.dropped_fee_samples_total(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffer_never_exceeds_max_capacity() {
+        let collector = test_collector().await;
+
+        let total = MAX_BUFFERED_SAMPLES + 500;
+        for seq in 0..total {
+            collector.buffer_sample(sample(seq as i64));
+        }
+
+        assert_eq!(collector.buffered_sample_count(), MAX_BUFFERED_SAMPLES);
+        assert_eq!(collector.dropped_fee_samples_total(), 500);
+
+        // The oldest samples should have been evicted.
+        let buffer = collector
+            .buffered_samples
+            .lock()
+            .expect("buffered_samples mutex poisoned");
+        assert_eq!(buffer.front().unwrap().ledger_sequence, 500);
+        assert_eq!(
+            buffer.back().unwrap().ledger_sequence,
+            (total - 1) as i64
+        );
+    }
+
+    #[tokio::test]
+    async fn buffer_stays_bounded_during_storage_outage() {
+        let collector = test_collector().await;
+
+        // Simulate a prolonged storage outage by buffering many samples
+        // without ever flushing them.
+        for seq in 0..(MAX_BUFFERED_SAMPLES * 3) {
+            collector.buffer_sample(sample(seq as i64));
+        }
+
+        assert!(collector.buffered_sample_count() <= MAX_BUFFERED_SAMPLES);
+        assert_eq!(collector.buffered_sample_count(), MAX_BUFFERED_SAMPLES);
+        assert_eq!(
+            collector.dropped_fee_samples_total(),
+            (MAX_BUFFERED_SAMPLES * 2) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_loop_exits_when_shutdown_is_broadcast() {
+        let registry = ProviderRegistry::new(vec![crate::rpc_provider::RpcProvider {
+            name: "test".to_string(),
+            url: "http://127.0.0.1:9".to_string(),
+            auth_header: None,
+            auth_value: None,
+            advertise: None,
+        }]);
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        let store = Arc::new(FeeStore::new(pool));
+        let metrics = Arc::new(AppMetrics::new().expect("metrics"));
+        let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+        let leader_lock = Arc::new(RedisLeaderLock::new(
+            redis_client,
+            "test_fee_collector",
+            Duration::from_secs(10),
+        ));
+        let collector = Arc::new(FeeCollector::new(
+            registry,
+            store,
+            FeeCollectorConfig {
+                collection_interval_secs: 60,
+                batch_size: 1,
+                request_timeout: Duration::from_millis(50),
+            },
+            metrics,
+            leader_lock,
+        ));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = tokio::spawn(async move {
+            collector.run_collection_loop(shutdown_rx).await;
+        });
+
+        // Give the loop a moment to start, then signal shutdown.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        shutdown_tx
+            .send(())
+            .expect("shutdown broadcast should succeed");
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("fee collector should exit promptly after shutdown")
+            .expect("fee collector task should not panic");
     }
 }

@@ -1,10 +1,34 @@
 extern crate std;
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, Symbol, TryIntoVal, Val, Vec};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env, Symbol, TryFromVal, Val, Vec,
+};
 
 #[test]
-fn test_proxy_upgrade_keeps_state_and_changes_logic() {
+fn test_propose_upgrade_rejects_non_contract_addresses() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let proxy_id = env.register(Proxy, ());
+    let impl_v1_id = env.register(ProxyLogicV1, ());
+    let proxy = ProxyClient::new(&env, &proxy_id);
+    proxy.initialize(&admin, &impl_v1_id);
+
+    let eoa = Address::generate(&env);
+    let undeployed_contract = env
+        .deployer()
+        .with_address(admin, BytesN::from_array(&env, &[7; 32]))
+        .deployed_address();
+
+    assert!(proxy.try_propose_upgrade(&eoa).is_err());
+    assert!(proxy.try_propose_upgrade(&undeployed_contract).is_err());
+    assert_eq!(proxy.get_pending_upgrade(), None);
+}
+
+#[test]
+fn test_proxy_upgrade_with_timelock() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -18,39 +42,106 @@ fn test_proxy_upgrade_keeps_state_and_changes_logic() {
     proxy.initialize(&admin, &impl_v1_id);
     assert_eq!(proxy.get_admin(), admin);
     assert_eq!(proxy.get_implementation(), impl_v1_id);
-    assert_eq!(proxy.get_value(), 0);
 
-    let first = proxy.increment(&7);
-    assert_eq!(first, 7);
-    assert_eq!(proxy.get_value(), 7);
+    // 1. Propose upgrade
+    proxy.propose_upgrade(&impl_v2_id);
 
-    proxy.upgrade_to(&impl_v2_id);
+    let pending = proxy.get_pending_upgrade().unwrap();
+    assert_eq!(pending.new_implementation, impl_v2_id);
+    assert_eq!(pending.eta, env.ledger().timestamp() + 172_800);
+
+    // 2. Fast-forward time by 48 hours (172,800 seconds)
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 172_800);
+
+    // 3. Execute upgrade
+    proxy.execute_upgrade();
     assert_eq!(proxy.get_implementation(), impl_v2_id);
-
-    let second = proxy.increment(&3);
-    assert_eq!(second, 20);
-    assert_eq!(proxy.get_value(), 20);
-
-    let version_symbol = Symbol::new(&env, "version");
-    let version_val: Val = proxy.delegate_call(&version_symbol, &Vec::new(&env));
-    let version: u32 = version_val.try_into_val(&env).unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(proxy.get_pending_upgrade(), None);
 }
 
 #[test]
-fn test_upgrade_to_and_call_executes_new_implementation_method() {
+#[should_panic(expected = "Timelock delay of 48 hours has not elapsed")]
+fn test_execute_upgrade_before_timelock_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
     let proxy_id = env.register(Proxy, ());
+    let impl_v1_id = env.register(ProxyLogicV1, ());
     let impl_v2_id = env.register(ProxyLogicV2, ());
 
     let proxy = ProxyClient::new(&env, &proxy_id);
-    proxy.initialize(&admin, &impl_v2_id);
+    proxy.initialize(&admin, &impl_v1_id);
 
-    let call_result: Val =
-        proxy.upgrade_to_and_call(&impl_v2_id, &Symbol::new(&env, "version"), &Vec::new(&env));
-    let version: u32 = call_result.try_into_val(&env).unwrap();
-    assert_eq!(version, 2);
+    proxy.propose_upgrade(&impl_v2_id);
+
+    // Try executing immediately without advancing time -> should panic
+    proxy.execute_upgrade();
+}
+
+#[test]
+fn test_cancel_upgrade() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let proxy_id = env.register(Proxy, ());
+    let impl_v1_id = env.register(ProxyLogicV1, ());
+    let impl_v2_id = env.register(ProxyLogicV2, ());
+
+    let proxy = ProxyClient::new(&env, &proxy_id);
+    proxy.initialize(&admin, &impl_v1_id);
+
+    proxy.propose_upgrade(&impl_v2_id);
+    assert!(proxy.get_pending_upgrade().is_some());
+
+    proxy.cancel_upgrade();
+    assert_eq!(proxy.get_pending_upgrade(), None);
+}
+
+#[test]
+fn test_delegate_call_forwards_original_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let proxy_id = env.register(Proxy, ());
+    let impl_id = env.register(ProxyLogicV1, ());
+
+    let proxy = ProxyClient::new(&env, &proxy_id);
+    proxy.initialize(&admin, &impl_id);
+
+    // `whoami` authenticates and returns the caller forwarded by the proxy.
+    // Passing `user` as the caller must make the implementation observe `user`,
+    // not the proxy's address. The proxy prepends the caller, so `args` is empty.
+    let args: Vec<Val> = Vec::new(&env);
+    let result = proxy.delegate_call(&user, &Symbol::new(&env, "whoami"), &args);
+    let observed = Address::try_from_val(&env, &result).unwrap();
+
+    assert_eq!(observed, user);
+    assert_ne!(observed, proxy_id);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_delegate_call_requires_original_caller_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let proxy_id = env.register(Proxy, ());
+    let impl_id = env.register(ProxyLogicV1, ());
+
+    let proxy = ProxyClient::new(&env, &proxy_id);
+    proxy.initialize(&admin, &impl_id);
+
+    // The implementation requires authorization from the forwarded caller, so
+    // an unauthenticated delegation must be rejected.
+    env.mock_auths(&[]);
+
+    let args: Vec<Val> = Vec::new(&env);
+    proxy.delegate_call(&user, &Symbol::new(&env, "whoami"), &args);
 }
